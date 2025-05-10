@@ -9,6 +9,13 @@ extern "C" void register_frame_callback(zm_plugin_t* plugin,
                                        void (*push_frame)(const zm_frame_hdr_t* hdr, const void* payload, size_t payload_size),
                                        void* callback_ctx);
 
+// Stub implementation to satisfy linking. Plugins may register a frame callback.
+extern "C" void register_frame_callback(zm_plugin_t* plugin,
+                                       void (*push_frame)(const zm_frame_hdr_t* hdr, const void* payload, size_t payload_size),
+                                       void* callback_ctx) {
+    // Placeholder: actual binding occurs inside plugin init or host_api
+}
+
 namespace zm {
 
 // Struct to combine frame header and buffer
