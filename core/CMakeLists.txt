@@ -16,8 +16,7 @@ find_package(SQLite3 REQUIRED)
 add_library(zmcore STATIC
     src/PluginManager.cpp
     src/host_api.cpp
-    # src/EventBus.cpp is now header-only; implementation in EventBus.hpp
-    # src/EventBus.cpp
+    src/EventBus.cpp
     src/ShmRing.cpp
     src/PipelineLoader.cpp
     src/monitor.cpp

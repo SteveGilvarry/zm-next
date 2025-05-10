@@ -1,7 +1,7 @@
 // RTSP input plugin test
 
 #include <gtest/gtest.h>
-#include "zm_plugin_v1.h"
+#include "zm_plugin.h"
 #include <cstring>
 #include <thread>
 #include <chrono>
@@ -95,7 +95,7 @@ bool is_rtsp_url_available(const char* url) {
 // Basic initialization test
 TEST_F(RtspPluginTest, InitializesCorrectly) {
     ASSERT_NE(plugin.instance, nullptr);
-    EXPECT_EQ(plugin.kind, ZM_PLUG_INPUT);
+    EXPECT_EQ(plugin.type, ZM_PLUGIN_INPUT);
     EXPECT_EQ(plugin.version, 1);
     EXPECT_NE(plugin.start, nullptr);
     EXPECT_NE(plugin.stop, nullptr);
@@ -121,35 +121,36 @@ TEST_F(RtspPluginTest, RejectsInvalidUrl) {
     EXPECT_EQ(frame_count, 0);
 }
 
-// Test with a real RTSP stream if available
+// Test with a real RTSP stream if available, or fallback to public test stream
 TEST_F(RtspPluginTest, ConnectsToRealStream) {
-    // Get URL from environment or use a default test URL
+    // Get URL from environment or use a default public test URL
     const char* url = getenv("RTSP_TEST_URL");
+    const char* fallback_url = "rtsp://wowzaec2demo.streamlock.net/vod/mp4:BigBuckBunny_115k.mov";
     if (!url) {
-        GTEST_SKIP() << "RTSP_TEST_URL environment variable not set";
-        return;
+        url = fallback_url;
+        printf("RTSP_TEST_URL not set, using public test stream: %s\n", url);
     }
-    
-    char config[256];
+
+    char config[512];
     snprintf(config, sizeof(config), "{\"url\": \"%s\", \"hw_decode\": false}", url);
-    
+
     int result = plugin.start(&plugin, &host, this, config);
     EXPECT_EQ(result, 0);
-    
-    // Wait for frames (up to 10 seconds)
-    const int max_wait_iterations = 100;
+
+    // Wait for frames (up to 15 seconds for public streams)
+    const int max_wait_iterations = 150;
     for (int i = 0; i < max_wait_iterations && !key_frame_received; i++) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    
+
     // Stop the plugin
     plugin.stop(&plugin);
-    
+
     // Should have received at least some frames and at least one keyframe
     EXPECT_TRUE(frame_received) << "No frames received";
     EXPECT_TRUE(key_frame_received) << "No keyframes received";
     EXPECT_GT(frame_count, 0) << "No frames counted";
-    
+
     // Print frame info
     printf("Received %d frames, last frame: %ux%u, stream %u, pts %" PRIu64 "\n",
            frame_count, last_frame_hdr.width, last_frame_hdr.height,

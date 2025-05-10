@@ -86,7 +86,10 @@ void CaptureThread::stop() {
 
 void CaptureThread::run() {
     // Start the plugin
-    inputPlugin_->start(inputPlugin_);
+    // The new plugin API expects: (plugin, host_api, host_ctx, json_cfg)
+    // For now, pass nullptrs for host_api, host_ctx, and json_cfg if not available
+    if (inputPlugin_->start)
+        inputPlugin_->start(inputPlugin_, nullptr, nullptr, nullptr);
     
     // Process frames from ring buffer
     const size_t headerSize = sizeof(zm_frame_hdr_t);
@@ -106,12 +109,13 @@ void CaptureThread::run() {
             // Extract header from buffer
             zm_frame_hdr_t* hdr = reinterpret_cast<zm_frame_hdr_t*>(buffer.data());
             const void* payload = buffer.data() + headerSize;
-            size_t payload_size = size - headerSize;
+            // size_t payload_size = size - headerSize; // unused
             
             // Fan out to all output plugins
             for (auto out : outputs_) {
                 if (out && out->on_frame) {
-                    out->on_frame(out, hdr, payload, payload_size);
+                    // The new API expects (plugin, hdr, payload)
+                    out->on_frame(out, hdr, payload);
                 }
             }
         } else {

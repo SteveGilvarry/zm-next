@@ -26,11 +26,11 @@ TEST(PluginManagerTest, LoadHelloPlugin) {
     ASSERT_TRUE(pm.loadPlugin(pluginPath.string()));
     EXPECT_EQ(pm.pluginCount(), 1);
 
-    // Retrieve handle and look up init_plugin symbol
+    // Retrieve handle and look up zm_plugin_init symbol
     void* handle = pm.getHandle(0);
     ASSERT_NE(handle, nullptr);
     using init_fn_t = void(*)(zm_plugin_t*);
-    auto init_fn = (init_fn_t)dlsym(handle, "init_plugin");
+    auto init_fn = (init_fn_t)dlsym(handle, "zm_plugin_init");
     ASSERT_NE(init_fn, nullptr) << dlerror();
 
     zm_plugin_t plugin;
@@ -39,10 +39,11 @@ TEST(PluginManagerTest, LoadHelloPlugin) {
     ASSERT_NE(plugin.instance, nullptr);
 
     // Test start/on_frame/stop
-    plugin.start(&plugin);
+    zm_host_api_t host = {0};
+    plugin.start(&plugin, &host, nullptr, "{}");
     // call on_frame twice
-    plugin.on_frame(&plugin, nullptr, nullptr, 0);
-    plugin.on_frame(&plugin, nullptr, nullptr, 0);
+    plugin.on_frame(&plugin, nullptr, nullptr);
+    plugin.on_frame(&plugin, nullptr, nullptr);
     plugin.stop(&plugin);
 
     // instance is int* counter

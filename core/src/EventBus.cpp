@@ -1,19 +1,12 @@
-// Stub implementation for EventBus
-#include <iostream>
+// Implementation for EventBus
+#include "zm/EventBus.hpp"
 
 namespace zm {
 
-class EventBus {
-public:
-    static EventBus& instance() {
-        static EventBus bus;
-        return bus;
-    }
-
-    void publish(const std::string& msg) {
-        std::cout << "EventBus publish: " << msg << std::endl;
-    }
-
-};
+// Implement publish for plugin API: forwards to std::string overload
+bool EventBus::publish(const char* topic, const char* payload) {
+    this->publish(std::string(topic), std::string(payload));
+    return true;
+}
 
 } // namespace zm

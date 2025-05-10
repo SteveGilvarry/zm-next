@@ -40,6 +40,9 @@ public:
         }
     }
 
+    // C API for plugins: publish event (returns true for now)
+    bool publish(const char* topic, const char* payload);
+
 private:
     EventBus() = default;
     ~EventBus() = default;

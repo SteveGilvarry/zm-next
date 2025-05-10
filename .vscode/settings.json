@@ -1,0 +1,14 @@
+{
+    "files.associations": {
+        "__hash_table": "cpp",
+        "__tree": "cpp",
+        "any": "cpp",
+        "array": "cpp",
+        "complex": "cpp",
+        "type_traits": "cpp",
+        "forward_list": "cpp",
+        "limits": "cpp",
+        "ratio": "cpp",
+        "variant": "cpp"
+    }
+}

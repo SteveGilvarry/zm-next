@@ -15,7 +15,8 @@ void startMonitor(int monitorId) {
     // Load plugin paths for this monitor
     PipelineLoader loader;
     if (!loader.load(monitorId)) {
-        host_log("startMonitor: no pipeline configured for monitor");
+        // Logging fallback: print to stderr if gHost is not available
+        fprintf(stderr, "startMonitor: no pipeline configured for monitor\n");
         return;
     }
     auto paths = loader.getPluginPaths();
@@ -24,14 +25,14 @@ void startMonitor(int monitorId) {
     std::vector<zm_plugin_t*> plugins;
     for (const auto &p : paths) {
         if (!pm.loadPlugin(p)) {
-            host_log("startMonitor: failed to load plugin");
+            fprintf(stderr, "startMonitor: failed to load plugin\n");
             continue;
         }
         void* handle = pm.getHandle(pm.pluginCount()-1);
         using init_fn_t = void(*)(zm_plugin_t*);
         auto init_fn = (init_fn_t)dlsym(handle, "init_plugin");
         if (!init_fn) {
-            host_log("startMonitor: init_plugin not found");
+            fprintf(stderr, "startMonitor: init_plugin not found\n");
             continue;
         }
         zm_plugin_t* plugin = new zm_plugin_t;
@@ -48,7 +49,7 @@ void startMonitor(int monitorId) {
             outputs.push_back(pl);
     }
     if (!inputPlugin) {
-        host_log("startMonitor: no INPUT plugin found");
+        fprintf(stderr, "startMonitor: no INPUT plugin found\n");
         return;
     }
     // Create shared-memory ring (256 slots, 1MiB each)

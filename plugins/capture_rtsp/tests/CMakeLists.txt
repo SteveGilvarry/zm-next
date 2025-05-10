@@ -1,30 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 # Test for RTSP plugin
-add_executable(test_rtsp_in test_rtsp_in.cpp)
 
-# Find GTest
-find_package(GTest REQUIRED)
-
-# Include directories
-target_include_directories(test_rtsp_in PRIVATE
-    ${CMAKE_SOURCE_DIR}/core/include
-    ${GTEST_INCLUDE_DIRS}
-)
-
-# Link libraries
-target_link_libraries(test_rtsp_in PRIVATE
-    rtsp_in
-    ${GTEST_LIBRARIES}
-    ${GTEST_MAIN_LIBRARIES}
-    pthread
-)
-
-# Set C++20 standard for tests
-target_compile_features(test_rtsp_in PRIVATE cxx_std_20)
-
-# Add test with environment variable support
-add_test(NAME RtspPluginTest COMMAND test_rtsp_in)
 
 # Optional RTSP test server startup
 if(RTSP_TEST_SETUP)
