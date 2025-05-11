@@ -62,9 +62,4 @@ add_executable(test_monitor tests/test_monitor.cpp)
 target_link_libraries(test_monitor PRIVATE zmcore GTest::gtest_main Threads::Threads)
 add_test(NAME MonitorTest COMMAND $<TARGET_FILE:test_monitor>)
   
-# Unit tests for capture_rtsp plugin
-add_executable(test_capture_rtsp tests/test_capture_rtsp.cpp)
-# Pass binary directory to tests for plugin lookup
-target_compile_definitions(test_capture_rtsp PRIVATE TEST_CMAKE_BINARY_DIR="${CMAKE_BINARY_DIR}")
-target_link_libraries(test_capture_rtsp PRIVATE zmcore GTest::gtest_main Threads::Threads dl)
-add_test(NAME CaptureRtspPluginTest COMMAND $<TARGET_FILE:test_capture_rtsp>)
+

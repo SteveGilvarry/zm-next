@@ -3,28 +3,48 @@
 
 set -e
 
-VIDEO_FILE="sample.mp4"
-RTSP_PORT=8554
-RTSP_URL="rtsp://localhost:$RTSP_PORT/test"
-FFMPEG_LOG="/tmp/ffmpeg_rtsp_test.log"
 
-# Download sample video if not present
-if [ ! -f "$VIDEO_FILE" ]; then
-  echo "Sample video $VIDEO_FILE not found. Downloading Big Buck Bunny sample..."
-  curl -L -o "$VIDEO_FILE" "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_1min.mp4"
-fi
 
-# Start ffmpeg RTSP server in background
-ffmpeg -re -stream_loop -1 -i "$VIDEO_FILE" -c copy -f rtsp -rtsp_transport tcp "$RTSP_URL" > "$FFMPEG_LOG" 2>&1 &
+
+
+
+# Start mediamtx with custom config (assumes mediamtx is installed and in PATH)
+mediamtx /opt/homebrew/etc/mediamtx/mediamtx.yml > /tmp/mediamtx.log 2>&1 &
+MTX_PID=$!
+
+# Wait for mediamtx to start (try up to 10s)
+for i in {1..20}; do
+  nc -z localhost 8554 && break
+  sleep 0.5
+done
+
+# Start ffmpeg to push a test pattern with regular keyframes to mediamtx
+# Keyframe every 30 frames (1s at 30fps)
+ffmpeg -re \
+  -f lavfi -i testsrc2=size=1280x720:rate=30 \
+  -f lavfi -i sine=frequency=1000:sample_rate=48000 \
+  -c:v libx264 -preset ultrafast -tune zerolatency -g 30 -keyint_min 30 \
+  -c:a aac -b:a 128k \
+  -f rtsp rtsp://localhost:8554/mystream > /tmp/ffmpeg_rtsp_test.log 2>&1 &
 FFMPEG_PID=$!
 
-# Wait for ffmpeg to start
+# Wait for ffmpeg to start streaming
 sleep 2
 
-# Set env var and run tests
-export RTSP_TEST_URL="$RTSP_URL"
-ctest -R RtspPluginTest --output-on-failure
+# Run the test binary from the build directory if present
+if [ -f "../../../build/plugins/capture_rtsp/tests/test_capture_rtsp" ]; then
+  TEST_BIN="../../../build/plugins/capture_rtsp/tests/test_capture_rtsp"
+elif [ -f "./test_capture_rtsp" ]; then
+  TEST_BIN="./test_capture_rtsp"
+else
+  echo "test_capture_rtsp binary not found!"
+  kill $FFMPEG_PID $MTX_PID
+  exit 1
+fi
 
-# Kill ffmpeg after tests
-kill $FFMPEG_PID
+$TEST_BIN
+
+# Clean up
+kill $FFMPEG_PID $MTX_PID
 wait $FFMPEG_PID 2>/dev/null || true
+wait $MTX_PID 2>/dev/null || true

@@ -1,5 +1,19 @@
 cmake_minimum_required(VERSION 3.16)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+# Option to always enable SIMD
+option(ZMP_USE_SIMD "Enable SIMD optimizations (xsimd)" ON)
+if(ZMP_USE_SIMD)
+  add_definitions(-DZMP_USE_SIMD)
+  # Find xsimd headers (Homebrew default and fallback)
+  find_path(XSIMD_INCLUDE_DIR xsimd/xsimd.hpp
+    PATHS /opt/homebrew/include /usr/local/include
+  )
+  if(NOT XSIMD_INCLUDE_DIR)
+    message(FATAL_ERROR "xsimd/xsimd.hpp not found. Please install xsimd (e.g., brew install xsimd).")
+  endif()
+  set(ZM_XSIMD_INCLUDES ${XSIMD_INCLUDE_DIR} CACHE INTERNAL "")
+endif()
+
 project(zm-next-core LANGUAGES CXX)
 # ---------- Require FFmpeg ≥ 7.0 ------------------------------------
 find_package(PkgConfig REQUIRED)
@@ -22,5 +36,4 @@ enable_testing()
 add_subdirectory(core)
 
 # Plugins
-add_subdirectory(plugins/capture_rtsp)
-add_subdirectory(plugins/hello)
+add_subdirectory(plugins)

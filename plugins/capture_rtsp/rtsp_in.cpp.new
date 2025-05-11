@@ -1,6 +1,4 @@
-// Export both zm_plugin_init and init_plugin for compatibility
-
-#include "zm_plugin.h"
+#include "zm_plugin_v1.h"
 
 // Ensure C linkage for FFmpeg headers
 #ifdef __cplusplus
@@ -112,8 +110,22 @@ struct RtspContext {
     // Frame publishing wrapper
     void publish_frame(const zm_frame_hdr_t* hdr, const void* data, size_t size) {
         if (host_api && host_api->on_frame) {
-            // CPU packets: pass header and payload size
-            host_api->on_frame(host_ctx, hdr, sizeof(zm_frame_hdr_t) + size);
+            // Callback expects the header followed by packet data in a contiguous buffer
+            if (hdr->bytes > 0 && data) {
+                // Allocate buffer for header + data
+                uint8_t* buffer = new uint8_t[sizeof(zm_frame_hdr_t) + size];
+                // Copy header
+                memcpy(buffer, hdr, sizeof(zm_frame_hdr_t));
+                // Copy packet data
+                memcpy(buffer + sizeof(zm_frame_hdr_t), data, size);
+                // Send to host
+                host_api->on_frame(host_ctx, buffer, sizeof(zm_frame_hdr_t) + size);
+                // Clean up
+                delete[] buffer;
+            } else {
+                // Only header (for zero-sized packets or GPU surfaces)
+                host_api->on_frame(host_ctx, hdr, sizeof(zm_frame_hdr_t));
+            }
         }
     }
 };
@@ -635,15 +647,18 @@ extern "C" void rtsp_stop(zm_plugin_t* plugin) {
 }
 
 // Plugin initialization function - called by the host to initialize the plugin interface
-extern "C" __attribute__((visibility("default"))) void zm_plugin_init(zm_plugin_t* plugin) {
+extern "C" void zm_plugin_init(zm_plugin_t* plugin) {
     if (!plugin) {
         return;
     }
+    
     // Fill in plugin interface
     plugin->version = 1;
-    plugin->type = ZM_PLUGIN_INPUT;
+    plugin->kind = ZM_PLUG_INPUT;
+    plugin->name = "rtsp_in";
+    plugin->desc = "RTSP input plugin";
     plugin->instance = nullptr;
-
+    
     // Set callbacks
     plugin->start = rtsp_start;
     plugin->stop = rtsp_stop;
