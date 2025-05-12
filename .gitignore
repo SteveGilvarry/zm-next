@@ -13,3 +13,4 @@ cmake-build-release/
 plugins/*.so
 plugins/*.dll
 plugins/*.dylib
+pipelines/cap_then_store.json

@@ -1,6 +1,6 @@
 // PipelineLoader.hpp
 #pragma once
-
+#include "zm/PluginManager.hpp" // for PluginConfig
 #include <string>
 #include <vector>
 
@@ -8,22 +8,24 @@ namespace zm {
 
 class PipelineLoader {
 public:
-    // Construct with path to SQLite DB ("": default to "pipelines.db")
-    // dbPath: path to SQLite DB, default "pipelines.db"
-    PipelineLoader(const std::string& dbPath = "pipelines.db");
+    // If isJson is true, treat path as JSON file, else as SQLite DB
+    PipelineLoader(const std::string& path, bool isJson = false);
     ~PipelineLoader();
 
-    // Load pipeline configuration for a given monitor ID
-    // Returns true on success, false on error or missing pipeline
-    bool load(int monitorId);
+    // For DB: load by monitorId. For JSON: monitorId ignored.
+    bool load(int monitorId = 0);
 
-    // Retrieve loaded plugin instance paths
-    // Returns the list of plugin shared-lib paths for the loaded monitor
-    const std::vector<std::string>& getPluginPaths() const;
+    // Get parsed pipeline (vector of PluginConfig)
+    const std::vector<PluginConfig>& getPipeline() const;
 
+    // Progress info for last load
+    void printProgress() const;
 private:
-    std::string dbPath_;
-    std::vector<std::string> pluginPaths_;
+    std::string path_;
+    bool isJson_;
+    std::vector<PluginConfig> pipeline_;
+    // For progress/debug
+    std::vector<std::string> progress_msgs_;
 };
 
 } // namespace zm

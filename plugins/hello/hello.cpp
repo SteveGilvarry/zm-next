@@ -18,10 +18,12 @@ static void hello_stop(zm_plugin_t* plugin) {
     // Logging is optional here
 }
 
-static void hello_on_frame(zm_plugin_t* plugin, const zm_frame_hdr_t* hdr, const void* payload) {
-    // Count frames in plugin-specific context
+// New single-buffer API
+static void hello_on_frame(zm_plugin_t* plugin, const void* buf, size_t size) {
     int* counter = static_cast<int*>(plugin->instance);
-    if (counter) (*counter)++;
+    if (!counter || !buf || size < sizeof(zm_frame_hdr_t)) return;
+    // Optionally parse header: const zm_frame_hdr_t* hdr = (const zm_frame_hdr_t*)buf;
+    (*counter)++;
 }
 
 extern "C" void zm_plugin_init(zm_plugin_t* plugin) {

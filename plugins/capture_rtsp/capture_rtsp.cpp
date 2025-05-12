@@ -112,8 +112,16 @@ struct RtspContext {
     // Frame publishing wrapper
     void publish_frame(const zm_frame_hdr_t* hdr, const void* data, size_t size) {
         if (host_api && host_api->on_frame) {
-            // CPU packets: pass header and payload size
-            host_api->on_frame(host_ctx, hdr, sizeof(zm_frame_hdr_t) + size);
+            // Allocate buffer for header + payload
+            std::vector<uint8_t> buf(sizeof(zm_frame_hdr_t) + size);
+            std::memcpy(buf.data(), hdr, sizeof(zm_frame_hdr_t));
+            if (size > 0 && data) {
+                std::memcpy(buf.data() + sizeof(zm_frame_hdr_t), data, size);
+            }
+            char logbuf[256];
+            snprintf(logbuf, sizeof(logbuf), "publish_frame: stream_id=%u, size=%zu, pts_usec=%" PRId64 ", flags=0x%x", hdr->stream_id, size, hdr->pts_usec, hdr->flags);
+            log(ZM_LOG_DEBUG, logbuf);
+            host_api->on_frame(host_ctx, buf.data(), buf.size());
         }
     }
 };
@@ -586,31 +594,36 @@ extern "C" int rtsp_start(zm_plugin_t* plugin, zm_host_api_t* host_api, void* ho
     if (!plugin || !host_api || !json_cfg) {
         return -1;
     }
-    
+
+    // Log host_api pointer and on_frame value for debugging
+    char dbg[256];
+    snprintf(dbg, sizeof(dbg), "rtsp_start: host_api=%p, on_frame=%p, log=%p, publish_evt=%p", (void*)host_api, host_api ? (void*)host_api->on_frame : nullptr, host_api ? (void*)host_api->log : nullptr, host_api ? (void*)host_api->publish_evt : nullptr);
+    if (host_api && host_api->log) host_api->log(host_ctx, ZM_LOG_INFO, dbg);
+
     // Create new context
     RtspContext* ctx = new RtspContext();
     ctx->host_api = host_api;
     ctx->host_ctx = host_ctx;
-    
+
     // Parse configuration
     if (!parse_json_config(json_cfg, ctx->url, ctx->transport, ctx->max_streams, 
                           ctx->hw_decode, host_api, host_ctx)) {
         delete ctx;
         return -1;
     }
-    
+
     // Log startup
     char buffer[256];
     snprintf(buffer, sizeof(buffer), "Starting RTSP plugin with URL: %s", ctx->url.c_str());
     ctx->log(ZM_LOG_INFO, buffer);
-    
+
     // Start capture thread
     ctx->running = true;
     ctx->worker = std::thread(capture_thread, ctx);
-    
+
     // Store context in plugin
     plugin->instance = ctx;
-    
+
     return 0;  // Success
 }
 

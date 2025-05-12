@@ -25,30 +25,25 @@ struct FrameData {
 };
 
 // Static callback for frame data from plugin to ShmRing
-static void frame_to_ring_callback(const zm_frame_hdr_t* hdr, const void* payload, size_t payload_size) {
-    // Get the ShmRing pointer from the context passed via hw_type (hack, but works for now)
-    ShmRing* ring = static_cast<ShmRing*>(reinterpret_cast<void*>(static_cast<uintptr_t>(hdr->hw_type)));
-    if (!ring) {
-        std::cerr << "CaptureThread: Invalid ring buffer in callback" << std::endl;
-        return;
-    }
-    
-    if (!payload || payload_size == 0) {
-        std::cerr << "CaptureThread: Empty frame payload" << std::endl;
-        return;
-    }
-    
+// Adapter to match zm_host_api_t::on_frame signature
+static void host_api_on_frame_adapter(void* host_ctx, const void* frame_buf, size_t frame_size) {
+    if (!host_ctx || !frame_buf || frame_size < sizeof(zm_frame_hdr_t)) return;
+    ShmRing* ring = static_cast<ShmRing*>(host_ctx);
+    const zm_frame_hdr_t* hdr = static_cast<const zm_frame_hdr_t*>(frame_buf);
+    const void* payload = static_cast<const uint8_t*>(frame_buf) + sizeof(zm_frame_hdr_t);
+    size_t payload_size = frame_size - sizeof(zm_frame_hdr_t);
+    // Log every API-level frame push
+    std::cerr << "CaptureThread: API on_frame: stream_id=" << hdr->stream_id
+              << ", bytes=" << hdr->bytes
+              << ", pts_usec=" << hdr->pts_usec
+              << ", flags=0x" << std::hex << hdr->flags << std::dec
+              << ", hw_type=" << hdr->hw_type
+              << ", payload_size=" << payload_size << std::endl;
     // Serialize the header and payload together
     const size_t headerSize = sizeof(zm_frame_hdr_t);
     std::vector<char> buffer(headerSize + payload_size);
-    
-    // Copy header to buffer
     std::memcpy(buffer.data(), hdr, headerSize);
-    
-    // Copy frame data
     std::memcpy(buffer.data() + headerSize, payload, payload_size);
-    
-    // Push combined data to ring
     ring->push(buffer.data(), buffer.size());
 }
 
@@ -58,13 +53,7 @@ CaptureThread::CaptureThread(zm_plugin_t* inputPlugin,
     : inputPlugin_(inputPlugin)
     , ring_(ring)
     , outputs_(outputs) {
-    // Try to register the frame callback with the plugin
-    try {
-        register_frame_callback(inputPlugin_, frame_to_ring_callback, &ring_);
-        std::cout << "CaptureThread: Successfully registered frame callback with plugin" << std::endl;
-    } catch (const std::exception& e) {
-        std::cerr << "CaptureThread: Failed to register frame callback: " << e.what() << std::endl;
-    }
+    // No need to register legacy frame callback; host_api->on_frame is used for input plugins
 }
 
 CaptureThread::~CaptureThread() {
@@ -85,11 +74,20 @@ void CaptureThread::stop() {
 }
 
 void CaptureThread::run() {
-    // Start the plugin
-    // The new plugin API expects: (plugin, host_api, host_ctx, json_cfg)
-    // For now, pass nullptrs for host_api, host_ctx, and json_cfg if not available
+    // Set up host API for input plugin, wiring on_frame to our ring buffer callback
+    zm_host_api_t host_api = {};
+    host_api.log = nullptr; // Optionally provide logging if desired
+    host_api.publish_evt = nullptr; // Optionally provide event publishing if desired
+    host_api.on_frame = host_api_on_frame_adapter;
+    // Pass the ring buffer as host_ctx so the callback can access it
+    void* host_ctx = &ring_;
+    // Log host_api pointer and on_frame value for debugging
+    std::cerr << "CaptureThread::run: host_api=" << (void*)&host_api
+              << ", on_frame=" << (void*)host_api.on_frame
+              << ", log=" << (void*)host_api.log
+              << ", publish_evt=" << (void*)host_api.publish_evt << std::endl;
     if (inputPlugin_->start)
-        inputPlugin_->start(inputPlugin_, nullptr, nullptr, nullptr);
+        inputPlugin_->start(inputPlugin_, &host_api, host_ctx, nullptr);
     
     // Process frames from ring buffer
     const size_t headerSize = sizeof(zm_frame_hdr_t);
@@ -106,16 +104,11 @@ void CaptureThread::run() {
                 continue;
             }
             
-            // Extract header from buffer
-            zm_frame_hdr_t* hdr = reinterpret_cast<zm_frame_hdr_t*>(buffer.data());
-            const void* payload = buffer.data() + headerSize;
-            // size_t payload_size = size - headerSize; // unused
-            
-            // Fan out to all output plugins
+            // Fan out to all output plugins using the new single-buffer API
             for (auto out : outputs_) {
                 if (out && out->on_frame) {
-                    // The new API expects (plugin, hdr, payload)
-                    out->on_frame(out, hdr, payload);
+                    // The new API expects (plugin, buf, size)
+                    out->on_frame(out, buffer.data(), size);
                 }
             }
         } else {

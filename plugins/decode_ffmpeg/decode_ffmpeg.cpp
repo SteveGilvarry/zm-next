@@ -91,16 +91,20 @@ static void process_stop(zm_plugin_t* plugin) {
     plugin->instance = nullptr;
 }
 
-static void process_on_frame(zm_plugin_t* plugin, const zm_frame_hdr_t* hdr, const void* frame, size_t size) {
-    if (!plugin || !plugin->instance || !hdr) return;
+
+// Standardized single-buffer on_frame: buf = [zm_frame_hdr_t][payload]
+static void process_on_frame(zm_plugin_t* plugin, const void* buf, size_t size) {
+    if (!plugin || !plugin->instance || !buf || size < sizeof(zm_frame_hdr_t)) return;
     auto ctx = static_cast<DecoderCtx*>(plugin->instance);
     std::lock_guard<std::mutex> lock(ctx->mtx);
+    const zm_frame_hdr_t* hdr = (const zm_frame_hdr_t*)buf;
     if (hdr->bytes == 0) return; // GPU surface handle not supported
-    // Treat payload after hdr as AVPacket
+    if (size < sizeof(zm_frame_hdr_t) + hdr->bytes) return;
+    const uint8_t* payload = (const uint8_t*)buf + sizeof(zm_frame_hdr_t);
     AVPacket pkt;
     av_init_packet(&pkt);
-    pkt.data = (uint8_t*)frame + sizeof(zm_frame_hdr_t);
-    pkt.size = (int)size - (int)sizeof(zm_frame_hdr_t);
+    pkt.data = (uint8_t*)payload;
+    pkt.size = hdr->bytes;
     int ret = avcodec_send_packet(ctx->codec_ctx, &pkt);
     if (ret < 0) return;
     AVFrame* avf = av_frame_alloc();
@@ -136,20 +140,15 @@ static void process_on_frame(zm_plugin_t* plugin, const zm_frame_hdr_t* hdr, con
             memcpy(ctx->yuv_buf.data() + ctx->out_width * ctx->out_height + (ctx->out_width/2)*(ctx->out_height/2), avf->data[2], (ctx->out_width/2)*(ctx->out_height/2));
         }
         // Allocate output buffer
-        void* out_buf = malloc(ctx->yuv_buf.size());
-        if (!out_buf) {
-            log(ctx->host, ctx->host_ctx, 3, "decode_ffmpeg: frame dropped – no output buf");
-            av_frame_free(&avf);
-            return;
-        }
-        memcpy(out_buf, ctx->yuv_buf.data(), ctx->yuv_buf.size());
+        std::vector<uint8_t> out_buf(sizeof(zm_frame_hdr_t) + ctx->yuv_buf.size());
         zm_frame_hdr_t out_hdr = *hdr;
         out_hdr.hw_type = 0;
         out_hdr.bytes = ctx->yuv_buf.size();
         out_hdr.pts_usec = avf->best_effort_timestamp;
+        memcpy(out_buf.data(), &out_hdr, sizeof(zm_frame_hdr_t));
+        memcpy(out_buf.data() + sizeof(zm_frame_hdr_t), ctx->yuv_buf.data(), ctx->yuv_buf.size());
         if (ctx->host && ctx->host->on_frame)
-            ctx->host->on_frame(ctx->host_ctx, &out_hdr, sizeof(zm_frame_hdr_t) + ctx->yuv_buf.size());
-        free(out_buf);
+            ctx->host->on_frame(ctx->host_ctx, out_buf.data(), out_buf.size());
     }
     av_frame_free(&avf);
 }
@@ -162,9 +161,5 @@ extern "C" __attribute__((visibility("default"))) void zm_plugin_init(zm_plugin_
     plugin->start = process_start;
     plugin->stop = process_stop;
     // Adapter for correct function pointer signature
-    plugin->on_frame = [](zm_plugin_t* p, const zm_frame_hdr_t* hdr, const void* frame) {
-        // Assume frame points to a buffer that is at least hdr->bytes in size after the header
-        // We don't know the real size, so pass a guessed size (hdr->bytes + sizeof(zm_frame_hdr_t))
-        process_on_frame(p, hdr, frame, hdr ? hdr->bytes + sizeof(zm_frame_hdr_t) : 0);
-    };
+    plugin->on_frame = process_on_frame;
 }

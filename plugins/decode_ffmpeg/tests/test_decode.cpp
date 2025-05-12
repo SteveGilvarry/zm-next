@@ -45,8 +45,15 @@ static void load_packets(const std::string& path) {
 TEST(DecodeFfmpeg, DecodesSampleH264) {
     // Load plugin
     std::string binDir = TEST_CMAKE_BINARY_DIR;
-    path buildPath = path(binDir) / "plugins" / "decode_ffmpeg" / "decode_ffmpeg.so";
-    path srcPath = path("plugins") / "decode_ffmpeg" / "decode_ffmpeg.so";
+#ifdef _WIN32
+    constexpr const char* PLUGIN_EXT = ".dll";
+#elif defined(__APPLE__)
+    constexpr const char* PLUGIN_EXT = ".dylib";
+#else
+    constexpr const char* PLUGIN_EXT = ".so";
+#endif
+    path buildPath = path(binDir) / "plugins" / "decode_ffmpeg" / (std::string("decode_ffmpeg") + PLUGIN_EXT);
+    path srcPath = path("plugins") / "decode_ffmpeg" / (std::string("decode_ffmpeg") + PLUGIN_EXT);
     path pluginPath;
     if (exists(buildPath)) pluginPath = buildPath;
     else if (exists(srcPath)) pluginPath = srcPath;
@@ -73,7 +80,7 @@ TEST(DecodeFfmpeg, DecodesSampleH264) {
         memset(hdr, 0, sizeof(zm_frame_hdr_t));
         hdr->bytes = pkt.size();
         memcpy(buf.data() + sizeof(zm_frame_hdr_t), pkt.data(), pkt.size());
-        plugin.on_frame(&plugin, hdr, buf.data());
+        plugin.on_frame(&plugin, buf.data(), buf.size());
     }
     ASSERT_NE(plugin.instance, nullptr);
     // Load sample packets (absolute path)
@@ -84,7 +91,7 @@ TEST(DecodeFfmpeg, DecodesSampleH264) {
         memset(hdr, 0, sizeof(zm_frame_hdr_t));
         hdr->bytes = pkt.size();
         memcpy(buf.data() + sizeof(zm_frame_hdr_t), pkt.data(), pkt.size());
-        plugin.on_frame(&plugin, hdr, buf.data());
+        plugin.on_frame(&plugin, buf.data(), buf.size());
     }
     plugin.stop(&plugin);
     EXPECT_GT(yuv_frames.load(), 0) << "No YUV frames decoded";

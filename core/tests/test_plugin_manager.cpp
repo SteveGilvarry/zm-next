@@ -23,10 +23,13 @@ TEST(PluginManagerTest, LoadHelloPlugin) {
     path pluginPath = path(TEST_CMAKE_BINARY_DIR) / "plugins" / "hello" / (std::string("hello") + PLUGIN_EXT);
     ASSERT_TRUE(exists(pluginPath)) << "Plugin not found at " << pluginPath;
 
-    ASSERT_TRUE(pm.loadPlugin(pluginPath.string()));
+    PluginConfig pcfg;
+    pcfg.path = pluginPath.string();
+    pcfg.config_json = "{}";
+    std::vector<PluginConfig> pipeline = {pcfg};
+    ASSERT_TRUE(pm.loadPipeline(pipeline));
     EXPECT_EQ(pm.pluginCount(), 1);
 
-    // Retrieve handle and look up zm_plugin_init symbol
     void* handle = pm.getHandle(0);
     ASSERT_NE(handle, nullptr);
     using init_fn_t = void(*)(zm_plugin_t*);
@@ -42,8 +45,9 @@ TEST(PluginManagerTest, LoadHelloPlugin) {
     zm_host_api_t host = {0};
     plugin.start(&plugin, &host, nullptr, "{}");
     // call on_frame twice
-    plugin.on_frame(&plugin, nullptr, nullptr);
-    plugin.on_frame(&plugin, nullptr, nullptr);
+    std::vector<uint8_t> buf(sizeof(zm_frame_hdr_t));
+    plugin.on_frame(&plugin, buf.data(), buf.size());
+    plugin.on_frame(&plugin, buf.data(), buf.size());
     plugin.stop(&plugin);
 
     // instance is int* counter

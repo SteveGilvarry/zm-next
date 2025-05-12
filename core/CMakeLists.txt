@@ -1,5 +1,8 @@
+
 cmake_minimum_required(VERSION 3.16)
 project(zmcore LANGUAGES CXX)
+
+include_directories("/opt/homebrew/include")
 
 # Core library
 include(FetchContent)
@@ -12,6 +15,7 @@ FetchContent_MakeAvailable(googletest)
 find_package(Boost REQUIRED)
 find_package(Threads REQUIRED)
 find_package(SQLite3 REQUIRED)
+find_package(nlohmann_json 3.2.0 REQUIRED)
 
 add_library(zmcore STATIC
     src/PluginManager.cpp
@@ -27,8 +31,10 @@ target_include_directories(zmcore PUBLIC include)
 
 # C++20 and optimization flags
 target_compile_features(zmcore PUBLIC cxx_std_20)
-target_compile_options(zmcore PRIVATE -O3 -march=native -flto -Wall -Werror)
-target_link_libraries(zmcore PRIVATE Threads::Threads)
+target_compile_options(zmcore PRIVATE -Wall -Werror)
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -flto")
+target_link_libraries(zmcore PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
 target_include_directories(zmcore PRIVATE ${Boost_INCLUDE_DIRS})
 target_link_libraries(zmcore PRIVATE SQLite::SQLite3)
 

@@ -30,6 +30,10 @@ target_compile_options(decode_ffmpeg PRIVATE "-fvisibility=hidden")
 target_compile_features(decode_ffmpeg PRIVATE cxx_std_20)
 target_link_libraries(decode_ffmpeg PRIVATE ${ZM_FFMPEG_LIBS} zmcore swscale)
 
-install(TARGETS decode_ffmpeg DESTINATION lib/zoneminder/plugins)
+if(APPLE)
+    install(TARGETS decode_ffmpeg DESTINATION ${CMAKE_BINARY_DIR}/plugins/decode_ffmpeg)
+else()
+    install(TARGETS decode_ffmpeg DESTINATION ${CMAKE_BINARY_DIR}/plugins/decode_ffmpeg)
+endif()
 
 add_subdirectory(tests)

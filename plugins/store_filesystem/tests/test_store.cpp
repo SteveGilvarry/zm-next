@@ -26,30 +26,35 @@ TEST(StoreFilesystem, SegmentAndEvent) {
     std::string lib = std::string(CMAKE_CURRENT_BINARY_DIR) + "/store_filesystem" + get_lib_ext();
     void* handle = dlopen(lib.c_str(), RTLD_NOW);
     ASSERT_TRUE(handle);
-    auto init = (int (*)(zm_plugin_t*))dlsym(handle, "zm_plugin_init");
+    using zm_plugin_init_fn = void (*)(zm_plugin_t*);
+    auto init = (zm_plugin_init_fn)dlsym(handle, "zm_plugin_init");
     ASSERT_TRUE(init);
     zm_plugin_t plug = {};
-    ASSERT_EQ(init(&plug), 0);
+    ASSERT_NO_THROW(init(&plug));
     std::string cfg = std::string("{\"root\":\"") + tmpdir + "\",\"max_secs\":2,\"monitor_id\":1}";
     std::vector<std::string> events;
-    auto event_cb = [&](const char* name, const char* data) {
-        if (std::string(name) == "FileClosed") events.push_back(data);
+    struct HostCtx { std::vector<std::string>* events; } host_ctx = { &events };
+    zm_host_api_t host_api = {};
+    host_api.publish_evt = [](void* ctx, const char* json_event) {
+        auto* h = static_cast<HostCtx*>(ctx);
+        h->events->push_back(json_event);
     };
-    void* inst = plug.start(cfg.c_str(), +[](const char* n, const char* d){ /* no-op */ });
-    ASSERT_TRUE(inst);
-    zm_frame_t frame = {};
-    frame.data = (uint8_t*)"dummy";
-    frame.size = 5;
-    frame.pts = 0;
-    frame.dts = 0;
-    frame.key = 1;
-    frame.hw_type = 0;
+    // Start plugin
+    ASSERT_EQ(plug.start(&plug, &host_api, &host_ctx, cfg.c_str()), 0);
+    // Simulate frames
+    zm_frame_hdr_t hdr = {};
+    hdr.hw_type = 0;
+    hdr.bytes = 5;
+    uint8_t payload[5] = {'d','u','m','m','y'};
     for (int i = 0; i < 50; ++i) {
-        frame.pts = frame.dts = i * 1000000;
-        plug.on_frame(inst, &frame, +[](const char*, const char*){});
+        hdr.pts_usec = hdr.pts_usec + 1000000;
+        uint8_t buf[sizeof(zm_frame_hdr_t) + sizeof(payload)];
+        memcpy(buf, &hdr, sizeof(zm_frame_hdr_t));
+        memcpy(buf + sizeof(zm_frame_hdr_t), payload, sizeof(payload));
+        plug.on_frame(&plug, buf, sizeof(buf));
         std::this_thread::sleep_for(std::chrono::milliseconds(120));
     }
-    plug.stop(inst, +[](const char*, const char*){});
+    plug.stop(&plug);
     fs::path root(tmpdir);
     int mkv_count = 0;
     for (auto& p : fs::recursive_directory_iterator(root)) {

@@ -12,27 +12,24 @@
 namespace zm {
 
 void startMonitor(int monitorId) {
-    // Load plugin paths for this monitor
-    PipelineLoader loader;
+    // Load plugin pipeline for this monitor (DB mode)
+    PipelineLoader loader("pipelines.db", false);
     if (!loader.load(monitorId)) {
         // Logging fallback: print to stderr if gHost is not available
         fprintf(stderr, "startMonitor: no pipeline configured for monitor\n");
         return;
     }
-    auto paths = loader.getPluginPaths();
+    const auto& pipeline = loader.getPipeline();
     // Load plugins
     PluginManager pm;
     std::vector<zm_plugin_t*> plugins;
-    for (const auto &p : paths) {
-        if (!pm.loadPlugin(p)) {
-            fprintf(stderr, "startMonitor: failed to load plugin\n");
-            continue;
-        }
-        void* handle = pm.getHandle(pm.pluginCount()-1);
+    pm.loadPipeline(pipeline);
+    for (size_t i = 0; i < pm.pluginCount(); ++i) {
+        void* handle = pm.getHandle(i);
         using init_fn_t = void(*)(zm_plugin_t*);
-        auto init_fn = (init_fn_t)dlsym(handle, "init_plugin");
+        auto init_fn = (init_fn_t)dlsym(handle, "zm_plugin_init");
         if (!init_fn) {
-            fprintf(stderr, "startMonitor: init_plugin not found\n");
+            fprintf(stderr, "startMonitor: zm_plugin_init not found\n");
             continue;
         }
         zm_plugin_t* plugin = new zm_plugin_t;

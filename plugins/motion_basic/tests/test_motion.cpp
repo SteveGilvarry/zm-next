@@ -25,13 +25,18 @@ struct MockHostApi : zm_host_api_t {
 typedef void (*zm_plugin_init_fn)(zm_plugin_t*);
 
 int main() {
-#ifndef PLUGIN_PATH
-#define PLUGIN_PATH "build/plugins/motion_basic/motion_basic.so"
+    std::string binDir = TEST_CMAKE_BINARY_DIR;
+#ifdef _WIN32
+    std::string ext = ".dll";
+#elif defined(__APPLE__)
+    std::string ext = ".dylib";
+#else
+    std::string ext = ".so";
 #endif
-    // Load the plugin .so dynamically
-    void* handle = dlopen(PLUGIN_PATH, RTLD_NOW);
+    std::string pluginPath = binDir + "/plugins/motion_basic/motion_basic" + ext;
+    void* handle = dlopen(pluginPath.c_str(), RTLD_NOW);
     if (!handle) {
-        std::cerr << "Failed to load plugin: " << dlerror() << " (tried: " << PLUGIN_PATH << ")" << std::endl;
+        std::cerr << "Failed to load plugin: " << dlerror() << " (tried: " << pluginPath << ")" << std::endl;
         return 1;
     }
     zm_plugin_init_fn init_fn = (zm_plugin_init_fn)dlsym(handle, "zm_plugin_init");
@@ -54,8 +59,15 @@ int main() {
     hdr.hw_type = 0;
     // Start plugin
     plugin.start(&plugin, &host, &host, "{\"threshold\":18,\"min_pixels\":800}");
-    plugin.on_frame(&plugin, &hdr, frame0.data());
-    plugin.on_frame(&plugin, &hdr, frame1.data());
+    std::vector<uint8_t> buf0(sizeof(zm_frame_hdr_t) + frame0.size());
+    memcpy(buf0.data(), &hdr, sizeof(zm_frame_hdr_t));
+    memcpy(buf0.data() + sizeof(zm_frame_hdr_t), frame0.data(), frame0.size());
+    plugin.on_frame(&plugin, buf0.data(), buf0.size());
+
+    std::vector<uint8_t> buf1(sizeof(zm_frame_hdr_t) + frame1.size());
+    memcpy(buf1.data(), &hdr, sizeof(zm_frame_hdr_t));
+    memcpy(buf1.data() + sizeof(zm_frame_hdr_t), frame1.data(), frame1.size());
+    plugin.on_frame(&plugin, buf1.data(), buf1.size());
     assert(host.evt_count == 1);
     assert(host.last_evt.find("pixels") != std::string::npos);
     size_t px = 0;

@@ -64,8 +64,8 @@ typedef struct zm_plugin_s {
     // Plugin lifecycle callbacks
     int (*start)(struct zm_plugin_s* plugin, zm_host_api_t* host, void* host_ctx, const char* json_cfg);
     void (*stop)(struct zm_plugin_s* plugin);
-    // Direct frame passing (not used by INPUT plugins)
-    void (*on_frame)(struct zm_plugin_s* plugin, const zm_frame_hdr_t* hdr, const void* payload);
+    // Direct frame passing: standardized single buffer [zm_frame_hdr_t][payload]
+    void (*on_frame)(struct zm_plugin_s* plugin, const void* buf, size_t size);
     // Plugin instance data
     void* instance;            // Plugin-specific context
     void* reserved[2];         // Reserved for future use

@@ -79,11 +79,15 @@ static void motion_basic_stop(zm_plugin_t* plugin) {
     plugin->instance = nullptr;
 }
 
-static void motion_basic_on_frame(zm_plugin_t* plugin, const zm_frame_hdr_t* hdr, const void* payload) {
+
+// Standardized single-buffer on_frame: buf = [zm_frame_hdr_t][payload]
+static void motion_basic_on_frame(zm_plugin_t* plugin, const void* buf, size_t size) {
     auto* ctx = static_cast<MotionBasicCtx*>(plugin->instance);
     auto& cfg = ctx->cfg;
     auto* host = ctx->host;
     void* host_ctx = ctx->host_ctx;
+    if (!buf || size < sizeof(zm_frame_hdr_t)) return;
+    const zm_frame_hdr_t* hdr = (const zm_frame_hdr_t*)buf;
     if (hdr->hw_type != 0) {
         if (host && host->log) host->log(host_ctx, ZM_LOG_WARN, "GPU frame ignored");
         return;
@@ -97,7 +101,8 @@ static void motion_basic_on_frame(zm_plugin_t* plugin, const zm_frame_hdr_t* hdr
         ctx->bg.assign(y_size, 0);
         ctx->bg_ready = false;
     }
-    const uint8_t* Y = static_cast<const uint8_t*>(payload);
+    if (size < sizeof(zm_frame_hdr_t) + y_size) return;
+    const uint8_t* Y = (const uint8_t*)buf + sizeof(zm_frame_hdr_t);
     std::vector<uint8_t> y_plane;
     if (cfg.downscale == 2) { // half
         int ow = w/2, oh = h/2;

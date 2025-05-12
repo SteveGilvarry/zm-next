@@ -34,10 +34,10 @@ TEST(PipelineLoaderTest, LoadFromFile) {
     // Load via PipelineLoader
     PipelineLoader loader(dbFile);
     ASSERT_TRUE(loader.load(42));
-    auto paths = loader.getPluginPaths();
-    ASSERT_EQ(paths.size(), 2);
-    EXPECT_EQ(paths[0], "foo.so");
-    EXPECT_EQ(paths[1], "bar.so");
+    const auto& pipeline = loader.getPipeline();
+    ASSERT_EQ(pipeline.size(), 2);
+    EXPECT_EQ(pipeline[0].path, "foo.so");
+    EXPECT_EQ(pipeline[1].path, "bar.so");
 
     // Clean up
     remove(dbFile.c_str());
