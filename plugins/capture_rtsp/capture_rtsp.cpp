@@ -11,6 +11,7 @@ extern "C" {
 #include <libavutil/hwcontext.h>
 #include <libavutil/dict.h>
 #include <libavutil/time.h>
+#include <libavutil/base64.h>    // for av_base64_encode
 #ifdef __cplusplus
 }
 #endif
@@ -427,6 +428,99 @@ static bool connect_to_stream(RtspContext* ctx) {
             "{\"event\":\"StreamConnected\",\"url\":\"%s\",\"video_streams\":%d,\"audio_streams\":%d}", 
             ctx->url.c_str(), video_count, audio_count);
     ctx->publish_event(json_event);
+    // Publish one-time stream metadata for each video stream
+    for (size_t si = 0; si < ctx->streams.size(); ++si) {
+        const auto& s = ctx->streams[si];
+        if (s.type != AVMEDIA_TYPE_VIDEO) continue;
+        AVCodecParameters* cp = ctx->fmt_ctx->streams[s.index]->codecpar;
+        // Log extradata size for diagnostics
+        char extradata_log[256];
+        snprintf(extradata_log, sizeof(extradata_log), "[RTSP] Stream %zu: codec_id=%d, width=%d, height=%d, pix_fmt=%d, profile=%d, level=%d, extradata_size=%d", si, cp->codec_id, cp->width, cp->height, cp->format, cp->profile, cp->level, cp->extradata_size);
+        ctx->log(ZM_LOG_INFO, extradata_log);
+        // If extradata is missing for H.264, try to extract SPS/PPS from the first keyframe
+        if (cp->codec_id == AV_CODEC_ID_H264 && cp->extradata_size == 0) {
+            ctx->log(ZM_LOG_WARN, "[RTSP] WARNING: extradata (SPS/PPS) is missing for this stream! Attempting to extract from first keyframe.");
+            // Wait for the first keyframe packet and extract SPS/PPS
+            bool found = false;
+            for (int pkt_idx = 0; pkt_idx < 100 && !found; ++pkt_idx) {
+                AVPacket* pkt = av_packet_alloc();
+                if (av_read_frame(ctx->fmt_ctx, pkt) >= 0) {
+                    if (pkt->stream_index == (int)s.index && (pkt->flags & AV_PKT_FLAG_KEY)) {
+                        // Try to extract SPS/PPS from this keyframe
+                        std::vector<uint8_t> sps, pps;
+                        const uint8_t* data = pkt->data;
+                        size_t size = pkt->size;
+                        size_t i = 0;
+                        while (i + 4 < size) {
+                            // Look for start code 0x00000001
+                            if (data[i] == 0x00 && data[i+1] == 0x00 && data[i+2] == 0x00 && data[i+3] == 0x01) {
+                                size_t nal_start = i + 4;
+                                uint8_t nal_type = data[nal_start] & 0x1F;
+                                size_t nal_end = nal_start;
+                                // Find next start code
+                                size_t j = nal_start;
+                                while (j + 4 < size) {
+                                    if (data[j] == 0x00 && data[j+1] == 0x00 && data[j+2] == 0x00 && data[j+3] == 0x01) break;
+                                    ++j;
+                                }
+                                nal_end = j;
+                                if (nal_type == 7) { // SPS
+                                    sps.assign(data + nal_start, data + nal_end);
+                                } else if (nal_type == 8) { // PPS
+                                    pps.assign(data + nal_start, data + nal_end);
+                                }
+                                i = nal_end;
+                            } else {
+                                ++i;
+                            }
+                        }
+                        if (!sps.empty() && !pps.empty()) {
+                            // Build extradata: [start][SPS][start][PPS]
+                            std::vector<uint8_t> extradata;
+                            static const uint8_t start_code[4] = {0x00, 0x00, 0x00, 0x01};
+                            extradata.insert(extradata.end(), start_code, start_code+4);
+                            extradata.insert(extradata.end(), sps.begin(), sps.end());
+                            extradata.insert(extradata.end(), start_code, start_code+4);
+                            extradata.insert(extradata.end(), pps.begin(), pps.end());
+                            cp->extradata = (uint8_t*)av_mallocz(extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE);
+                            memcpy(cp->extradata, extradata.data(), extradata.size());
+                            cp->extradata_size = extradata.size();
+                            ctx->log(ZM_LOG_INFO, "[RTSP] Successfully extracted SPS/PPS from first keyframe and set extradata.");
+                            found = true;
+                        }
+                    }
+                }
+                av_packet_free(&pkt);
+            }
+            if (!found) {
+                ctx->log(ZM_LOG_ERROR, "[RTSP] Failed to extract SPS/PPS from first 100 packets. Filesystem plugin will not be able to mux H.264.");
+            }
+        }
+        // calculate base64 buffer size: 4 * ceil(n/3) + 1 for nul
+        int b64len = 4 * ((cp->extradata_size + 2) / 3) + 1;
+        std::vector<char> b64buf(b64len);
+        av_base64_encode(b64buf.data(), b64len, cp->extradata, cp->extradata_size);
+        char meta[1024];
+        snprintf(meta, sizeof(meta),
+            "{\"event\":\"StreamMetadata\","  \
+            "\"stream_id\":%zu,"
+            "\"codec_id\":%d,"
+            "\"width\":%d,"
+            "\"height\":%d,"
+            "\"pix_fmt\":%d,"
+            "\"profile\":%d,"
+            "\"level\":%d,"
+            "\"extradata\":\"%s\"}",
+            si,
+            cp->codec_id,
+            cp->width,
+            cp->height,
+            cp->format,
+            cp->profile,
+            cp->level,
+            b64buf.data());
+        ctx->publish_event(meta);
+    }
     
     // Reset frame counter and reconnection delay on successful connection
     ctx->frame_count = 0;

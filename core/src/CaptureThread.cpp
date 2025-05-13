@@ -26,6 +26,14 @@ struct FrameData {
 
 // Static callback for frame data from plugin to ShmRing
 // Adapter to match zm_host_api_t::on_frame signature
+// Adapter for host_api.publish_evt to push JSON events into ring
+static void host_api_publish_evt_adapter(void* host_ctx, const char* json_event) {
+    if (!host_ctx || !json_event) return;
+    ShmRing* ring = static_cast<ShmRing*>(host_ctx);
+    size_t len = strlen(json_event);
+    ring->push(json_event, len);
+}
+// Adapter to match zm_host_api_t::on_frame signature
 static void host_api_on_frame_adapter(void* host_ctx, const void* frame_buf, size_t frame_size) {
     if (!host_ctx || !frame_buf || frame_size < sizeof(zm_frame_hdr_t)) return;
     ShmRing* ring = static_cast<ShmRing*>(host_ctx);
@@ -47,12 +55,15 @@ static void host_api_on_frame_adapter(void* host_ctx, const void* frame_buf, siz
     ring->push(buffer.data(), buffer.size());
 }
 
+
 CaptureThread::CaptureThread(zm_plugin_t* inputPlugin,
                              ShmRing& ring,
-                             const std::vector<zm_plugin_t*>& outputs)
+                             const std::vector<zm_plugin_t*>& outputs,
+                             const std::string& inputConfig)
     : inputPlugin_(inputPlugin)
     , ring_(ring)
-    , outputs_(outputs) {
+    , outputs_(outputs)
+    , inputConfig_(inputConfig) {
     // No need to register legacy frame callback; host_api->on_frame is used for input plugins
 }
 
@@ -77,7 +88,7 @@ void CaptureThread::run() {
     // Set up host API for input plugin, wiring on_frame to our ring buffer callback
     zm_host_api_t host_api = {};
     host_api.log = nullptr; // Optionally provide logging if desired
-    host_api.publish_evt = nullptr; // Optionally provide event publishing if desired
+    host_api.publish_evt = host_api_publish_evt_adapter; // forward events into ring
     host_api.on_frame = host_api_on_frame_adapter;
     // Pass the ring buffer as host_ctx so the callback can access it
     void* host_ctx = &ring_;
@@ -87,7 +98,7 @@ void CaptureThread::run() {
               << ", log=" << (void*)host_api.log
               << ", publish_evt=" << (void*)host_api.publish_evt << std::endl;
     if (inputPlugin_->start)
-        inputPlugin_->start(inputPlugin_, &host_api, host_ctx, nullptr);
+        inputPlugin_->start(inputPlugin_, &host_api, host_ctx, inputConfig_.c_str());
     
     // Process frames from ring buffer
     const size_t headerSize = sizeof(zm_frame_hdr_t);

@@ -13,7 +13,8 @@ class CaptureThread {
 public:
     CaptureThread(zm_plugin_t* inputPlugin,
                   ShmRing& ring,
-                  const std::vector<zm_plugin_t*>& outputs);
+                  const std::vector<zm_plugin_t*>& outputs,
+                  const std::string& inputConfig);
     ~CaptureThread();
 
     // Start capture loop
@@ -27,6 +28,7 @@ private:
     zm_plugin_t* inputPlugin_;
     ShmRing& ring_;
     std::vector<zm_plugin_t*> outputs_;
+    std::string inputConfig_;
 
     std::thread thread_;
     std::atomic<bool> running_{false};

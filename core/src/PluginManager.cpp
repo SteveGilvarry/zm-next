@@ -101,7 +101,7 @@ void PluginManager::startAll() {
     // Create ring buffer (256 slots, 1MiB each)
     ring_ = std::make_unique<ShmRing>(256, 1024*1024);
     // Start capture thread for input plugin
-    captureThread_ = std::make_unique<CaptureThread>(&pipeline_[inputIdx].plugin, *ring_, outputs);
+    captureThread_ = std::make_unique<CaptureThread>(&pipeline_[inputIdx].plugin, *ring_, outputs, pipeline_[inputIdx].config.config_json);
     captureThread_->start();
 
     // Start output/process plugins directly

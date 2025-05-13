@@ -52,7 +52,7 @@ void startMonitor(int monitorId) {
     // Create shared-memory ring (256 slots, 1MiB each)
     ShmRing ring(256, 1024*1024);
     // Start capture thread
-    CaptureThread capture(inputPlugin, ring, outputs);
+    CaptureThread capture(inputPlugin, ring, outputs, "{}");
     capture.start();
 }
 

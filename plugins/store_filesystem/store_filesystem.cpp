@@ -1,12 +1,17 @@
 
 #include <zm_plugin.h>
 #include <nlohmann/json.hpp>
+#ifdef __cplusplus
 extern "C" {
+#endif
 #include <libavformat/avformat.h>
 #include <libavutil/time.h>
 #include <libavutil/avutil.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/base64.h>
+#ifdef __cplusplus
 }
+#endif
 #include <filesystem>
 #include <fstream>
 #include <chrono>
@@ -35,8 +40,9 @@ struct StoreInstance {
     std::mutex mtx;
     bool header_written = false;
     AVStream* video_stream = nullptr;
-    std::vector<uint8_t> sps;
-    std::vector<uint8_t> pps;
+    // metadata from input plugin
+    AVCodecParameters* metadata_codecpar = nullptr;
+    // buffer raw packets until header is written
     std::vector<std::vector<uint8_t>> pending_packets;
     zm_host_api_t* host = nullptr;
     void* host_ctx = nullptr;
@@ -141,9 +147,53 @@ extern "C" __attribute__((visibility("default"))) void zm_plugin_init(zm_plugin_
     plug->on_frame = [](zm_plugin_t* plugin, const void* buf, size_t size) {
         auto inst = static_cast<StoreInstance*>(plugin->instance);
         log(inst, ZM_LOG_DEBUG, "on_frame: inst=%p, buf=%p, size=%zu", inst, buf, size);
-        if (!inst) return;
-        if (!buf || size < sizeof(zm_frame_hdr_t)) {
-            log(inst, ZM_LOG_DEBUG, "on_frame: buffer too small or null (size=%zu)", size);
+        if (!inst || !buf) return;
+        // Detect JSON metadata event (buffer starts with '{')
+        if (size > 0 && static_cast<const char*>(buf)[0] == '{') {
+            try {
+                std::string js(static_cast<const char*>(buf), size);
+                auto j = json::parse(js);
+                if (j.value("event", "") == "StreamMetadata") {
+                    if (inst->metadata_codecpar)
+                        avcodec_parameters_free(&inst->metadata_codecpar);
+                    inst->metadata_codecpar = avcodec_parameters_alloc();
+                    inst->metadata_codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+                    inst->metadata_codecpar->codec_id   = j["codec_id"];
+                    inst->metadata_codecpar->width      = j["width"];
+                    inst->metadata_codecpar->height     = j["height"];
+                    inst->metadata_codecpar->format     = j["pix_fmt"];
+                    inst->metadata_codecpar->profile    = j["profile"];
+                    inst->metadata_codecpar->level      = j["level"];
+                    auto ed_b64 = j["extradata"].get<std::string>();
+                    int ed_len = av_base64_decode(nullptr, ed_b64.c_str(), 0);
+                    if (ed_len > 0) {
+                        std::vector<uint8_t> ed(ed_len);
+                        av_base64_decode(ed.data(), ed_b64.c_str(), ed_len);
+                        inst->metadata_codecpar->extradata = (uint8_t*)av_mallocz(ed_len + AV_INPUT_BUFFER_PADDING_SIZE);
+                        if (inst->metadata_codecpar->extradata) {
+                            memcpy(inst->metadata_codecpar->extradata, ed.data(), ed_len);
+                            // Padding is already zeroed by av_mallocz
+                            inst->metadata_codecpar->extradata_size = ed_len;
+                        } else {
+                            inst->metadata_codecpar->extradata_size = 0;
+                        }
+                    } else {
+                        inst->metadata_codecpar->extradata = nullptr;
+                        inst->metadata_codecpar->extradata_size = 0;
+                    }
+                    log(inst, ZM_LOG_INFO, "Received StreamMetadata, codec %d %dx%d",
+                        inst->metadata_codecpar->codec_id,
+                        inst->metadata_codecpar->width,
+                        inst->metadata_codecpar->height);
+                }
+            } catch (...) {
+                log(inst, ZM_LOG_WARN, "Failed to parse JSON event in on_frame");
+            }
+            return;
+        }
+        // Must have a full frame header
+        if (size < sizeof(zm_frame_hdr_t)) {
+            log(inst, ZM_LOG_ERROR, "on_frame: invalid data size %zu", size);
             return;
         }
         const zm_frame_hdr_t* hdr = (const zm_frame_hdr_t*)buf;
@@ -166,135 +216,97 @@ extern "C" __attribute__((visibility("default"))) void zm_plugin_init(zm_plugin_
             return;
         }
 
-        // Helper: extract SPS/PPS from H264 bytestream (handles 3- and 4-byte start codes)
-        auto extract_sps_pps = [](const uint8_t* data, size_t len, std::vector<uint8_t>& sps, std::vector<uint8_t>& pps, StoreInstance* inst) {
-            size_t i = 0;
-            while (i + 3 < len) {
-                size_t start = 0;
-                if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 1) {
-                    start = 3;
-                } else if (i + 4 < len && data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1) {
-                    start = 4;
-                } else {
-                    ++i;
-                    continue;
-                }
-                size_t nal_start = i + start;
-                if (nal_start >= len) break;
-                uint8_t nal_type = data[nal_start] & 0x1F;
-                size_t nal_end = nal_start;
-                size_t j = nal_start;
-                while (j + 3 < len) {
-                    if ((data[j] == 0 && data[j+1] == 0 && data[j+2] == 1) ||
-                        (j + 4 < len && data[j] == 0 && data[j+1] == 0 && data[j+2] == 0 && data[j+3] == 1)) {
-                        break;
-                    }
-                    ++j;
-                }
-                nal_end = (j < len) ? j : len;
-                if (nal_type == 7 && sps.empty()) {
-                    sps.assign(data + nal_start, data + nal_end);
-                    log(inst, ZM_LOG_INFO, "Detected SPS (len=%zu)", sps.size());
-                }
-                if (nal_type == 8 && pps.empty()) {
-                    pps.assign(data + nal_start, data + nal_end);
-                    log(inst, ZM_LOG_INFO, "Detected PPS (len=%zu)", pps.size());
-                }
-                i = nal_end;
+        // If header not written but we have metadata, initialize stream and write header
+        if (!inst->header_written && inst->metadata_codecpar) {
+            // H.264 requires extradata (SPS/PPS) for muxing
+            if (inst->metadata_codecpar->codec_id == AV_CODEC_ID_H264 &&
+                (inst->metadata_codecpar->extradata == nullptr || inst->metadata_codecpar->extradata_size == 0)) {
+                log(inst, ZM_LOG_ERROR, "H.264 extradata (SPS/PPS) missing or empty! Cannot write header.");
+                return;
             }
-        };
-
-        // If header not written, try to extract SPS/PPS and buffer packets
-        if (!inst->header_written) {
-            extract_sps_pps(payload, hdr->bytes, inst->sps, inst->pps, inst);
-            // Buffer this packet for later (up to 50 packets)
-            if (inst->pending_packets.size() < 50)
-                inst->pending_packets.emplace_back(payload, payload + hdr->bytes);
-            // Only proceed if we have both SPS and PPS
-            if (!inst->sps.empty() && !inst->pps.empty()) {
-                AVFormatContext* ctx = inst->fmt_ctx.get();
-                AVStream* st = avformat_new_stream(ctx, nullptr);
-                if (!st) {
-                    log(inst, ZM_LOG_ERROR, "Failed to create new stream");
-                    return;
-                }
-                inst->video_stream = st;
-                st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
-                st->codecpar->codec_id = AV_CODEC_ID_H264;
-                st->codecpar->format = 0;
-                st->codecpar->width = hdr->stream_id;
-                st->codecpar->height = hdr->flags;
-                st->time_base = AVRational{1, 1000000};
-                // Compose extradata (Annex B -> AVCC)
-                std::vector<uint8_t> extradata;
-                // AVCC header
-                extradata.push_back(1); // version
-                extradata.push_back(inst->sps[1]); // profile
-                extradata.push_back(inst->sps[2]); // compat
-                extradata.push_back(inst->sps[3]); // level
-                extradata.push_back(0xFC | 3); // reserved (6 bits) + nalu length size - 1 (2 bits)
-                extradata.push_back(0xE0 | 1); // reserved (3 bits) + num of SPS (5 bits)
-                extradata.push_back((inst->sps.size() >> 8) & 0xFF);
-                extradata.push_back(inst->sps.size() & 0xFF);
-                extradata.insert(extradata.end(), inst->sps.begin(), inst->sps.end());
-                extradata.push_back(1); // num of PPS
-                extradata.push_back((inst->pps.size() >> 8) & 0xFF);
-                extradata.push_back(inst->pps.size() & 0xFF);
-                extradata.insert(extradata.end(), inst->pps.begin(), inst->pps.end());
-                st->codecpar->extradata_size = extradata.size();
-                st->codecpar->extradata = (uint8_t*)av_mallocz(extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE);
-                memcpy(st->codecpar->extradata, extradata.data(), extradata.size());
-                int ret = avformat_write_header(ctx, nullptr);
-                if (ret < 0) {
-                    log(inst, ZM_LOG_ERROR, "Failed to write header for %s (ret=%d)", inst->cur_path.c_str(), ret);
-                    return;
-                }
-                inst->header_written = true;
-                log(inst, ZM_LOG_INFO, "Header written, writing %zu buffered packets", inst->pending_packets.size());
-                // Write all buffered packets
-                for (const auto& pktbuf : inst->pending_packets) {
-                    AVPacket pkt;
-                    av_init_packet(&pkt);
-                    pkt.data = (uint8_t*)pktbuf.data();
-                    pkt.size = pktbuf.size();
-                    pkt.pts = hdr->pts_usec;
-                    pkt.dts = hdr->pts_usec;
-                    pkt.stream_index = 0;
-                    pkt.flags = (hdr->flags & 1) ? AV_PKT_FLAG_KEY : 0;
-                    if (inst->start_ts == 0) inst->start_ts = pkt.pts;
-                    inst->last_pts = pkt.pts;
-                    log(inst, ZM_LOG_DEBUG, "Writing buffered frame: pts=%ld, size=%d", (long)pkt.pts, pkt.size);
-                    int ret2 = av_write_frame(inst->fmt_ctx.get(), &pkt);
-                    if (ret2 < 0) {
-                        log(inst, ZM_LOG_ERROR, "Failed to write frame (buffered), ret=%d", ret2);
-                    }
-                }
-                inst->pending_packets.clear();
+            // Fix deprecated YUVJ420P to YUV420P for muxer compatibility
+            if (inst->metadata_codecpar->format == AV_PIX_FMT_YUVJ420P) {
+                log(inst, ZM_LOG_WARN, "YUVJ420P is deprecated, forcing to YUV420P for muxer");
+                inst->metadata_codecpar->format = AV_PIX_FMT_YUV420P;
             }
-            if (inst->pending_packets.size() >= 50) {
-                log(inst, ZM_LOG_ERROR, "SPS/PPS not found after 50 packets, giving up on this segment");
-                inst->pending_packets.clear();
+            // Diagnostic: log all AVCodecParameters fields before copying
+            log(inst, ZM_LOG_DEBUG,
+                "metadata_codecpar: codec_type=%d, codec_id=%d, width=%d, height=%d, format=%d, profile=%d, level=%d, extradata_size=%d, extradata_ptr=%p",
+                inst->metadata_codecpar->codec_type,
+                inst->metadata_codecpar->codec_id,
+                inst->metadata_codecpar->width,
+                inst->metadata_codecpar->height,
+                inst->metadata_codecpar->format,
+                inst->metadata_codecpar->profile,
+                inst->metadata_codecpar->level,
+                inst->metadata_codecpar->extradata_size,
+                inst->metadata_codecpar->extradata);
+            AVFormatContext* oc = inst->fmt_ctx.get();
+            // find encoder for the stream codec, to initialize muxer correctly
+            const AVCodec* enc = avcodec_find_encoder(inst->metadata_codecpar->codec_id);
+            if (!enc) {
+                log(inst, ZM_LOG_WARN, "No encoder found for codec id %d, using default stream creation", inst->metadata_codecpar->codec_id);
             }
+            AVStream* st = avformat_new_stream(oc, enc);
+            if (!st) {
+                log(inst, ZM_LOG_ERROR, "Failed to create new stream for metadata");
+                return;
+            }
+            inst->video_stream = st;
+            // copy full codec parameters from metadata
+            avcodec_parameters_copy(st->codecpar, inst->metadata_codecpar);
+            // ensure video stream type
+            st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+            st->time_base = AVRational{1, 1000000};
+            oc->streams[st->index]->time_base = st->time_base;
+            // diagnostic: log codec parameters before header
+            log(inst, ZM_LOG_DEBUG,
+                "Writing header: codec_id=%d, width=%d, height=%d, pix_fmt=%d, extradata_size=%d, extradata_ptr=%p",
+                st->codecpar->codec_id,
+                st->codecpar->width,
+                st->codecpar->height,
+                st->codecpar->format,
+                st->codecpar->extradata_size,
+                st->codecpar->extradata);
+            int ret = avformat_write_header(oc, nullptr);
+            if (ret < 0) {
+                log(inst, ZM_LOG_ERROR, "Failed to write header for %s (ret=%d)", inst->cur_path.c_str(), ret);
+                return;
+            }
+            inst->header_written = true;
+            // Prevent double-free: clear extradata pointer before freeing metadata_codecpar
+            if (inst->metadata_codecpar) {
+                inst->metadata_codecpar->extradata = nullptr;
+                inst->metadata_codecpar->extradata_size = 0;
+            }
+            avcodec_parameters_free(&inst->metadata_codecpar);
+            log(inst, ZM_LOG_INFO, "Header written via metadata, dropping %zu buffered packets", inst->pending_packets.size());
+            // drop buffered packets (no timestamps available)
+            inst->pending_packets.clear();
             return;
         }
 
         // Normal write after header
-        AVPacket pkt;
-        av_init_packet(&pkt);
-        pkt.data = (uint8_t*)payload;
-        pkt.size = hdr->bytes;
-        pkt.pts = hdr->pts_usec;
-        pkt.dts = hdr->pts_usec;
-        pkt.stream_index = 0;
-        pkt.flags = (hdr->flags & 1) ? AV_PKT_FLAG_KEY : 0;
-        if (inst->start_ts == 0) inst->start_ts = pkt.pts;
-        inst->last_pts = pkt.pts;
-        log(inst, ZM_LOG_DEBUG, "Writing frame: pts=%ld, size=%d", (long)pkt.pts, pkt.size);
-        int ret3 = av_write_frame(inst->fmt_ctx.get(), &pkt);
-        if (ret3 < 0) {
-            log(inst, ZM_LOG_ERROR, "Failed to write frame, ret=%d", ret3);
+        // write packet using stack AVPacket
+        {
+            AVPacket pkt;
+            av_init_packet(&pkt);
+            pkt.data = (uint8_t*)payload;
+            pkt.size = hdr->bytes;
+            pkt.pts = hdr->pts_usec;
+            pkt.dts = hdr->pts_usec;
+            pkt.stream_index = inst->video_stream ? inst->video_stream->index : 0;
+            pkt.flags = (hdr->flags & 1) ? AV_PKT_FLAG_KEY : 0;
+            if (inst->start_ts == 0) inst->start_ts = pkt.pts;
+            inst->last_pts = pkt.pts;
+            log(inst, ZM_LOG_DEBUG, "Writing frame: pts=%ld, size=%d, stream=%d", (long)pkt.pts, pkt.size, pkt.stream_index);
+            int ret3 = av_interleaved_write_frame(inst->fmt_ctx.get(), &pkt);
+            if (ret3 < 0) {
+                log(inst, ZM_LOG_ERROR, "Failed to write frame, ret=%d", ret3);
+            }
         }
-        int64_t elapsed = (pkt.pts - inst->start_ts) / 1000000;
+        // compute elapsed based on recorded timestamps
+        int64_t elapsed = (inst->last_pts - inst->start_ts) / 1000000;
         std::time_t now = std::time(nullptr);
         std::tm tm = *std::localtime(&now);
         if (elapsed >= inst->max_secs || (tm.tm_hour == 0 && tm.tm_min == 0 && tm.tm_sec < 2)) {
