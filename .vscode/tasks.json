@@ -11,6 +11,15 @@
 			]
 		},
 		{
+			"label": "Clean, Build & Test zm-next",
+			"type": "shell",
+			"command": "rm -rf build && mkdir -p build && cd build && cmake -DCMAKE_BUILD_TYPE=Debug .. && make -j && ctest --output-on-failure",
+			"group": "build",
+			"problemMatcher": [
+				"$gcc"
+			]
+		},
+		{
 			"label": "Test RTSP Plugin with Local ffmpeg RTSP Server",
 			"type": "shell",
 			"command": "cd plugins/capture_rtsp/tests && ./run_gtest_with_local_rtsp.sh",

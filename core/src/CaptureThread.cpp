@@ -40,13 +40,7 @@ static void host_api_on_frame_adapter(void* host_ctx, const void* frame_buf, siz
     const zm_frame_hdr_t* hdr = static_cast<const zm_frame_hdr_t*>(frame_buf);
     const void* payload = static_cast<const uint8_t*>(frame_buf) + sizeof(zm_frame_hdr_t);
     size_t payload_size = frame_size - sizeof(zm_frame_hdr_t);
-    // Log every API-level frame push
-    std::cerr << "CaptureThread: API on_frame: stream_id=" << hdr->stream_id
-              << ", bytes=" << hdr->bytes
-              << ", pts_usec=" << hdr->pts_usec
-              << ", flags=0x" << std::hex << hdr->flags << std::dec
-              << ", hw_type=" << hdr->hw_type
-              << ", payload_size=" << payload_size << std::endl;
+    // Optionally, use zm_log here if available (but for now, suppress or replace with zm_log if needed)
     // Serialize the header and payload together
     const size_t headerSize = sizeof(zm_frame_hdr_t);
     std::vector<char> buffer(headerSize + payload_size);
@@ -87,7 +81,14 @@ void CaptureThread::stop() {
 void CaptureThread::run() {
     // Set up host API for input plugin, wiring on_frame to our ring buffer callback
     zm_host_api_t host_api = {};
-    host_api.log = nullptr; // Optionally provide logging if desired
+    // Route plugin logs to stdout so VS Code Debug Console captures them
+    host_api.log = [](void* /*ctx*/, zm_log_level_t level, const char* msg) {
+        const char* lvl = "INFO";
+        if (level == ZM_LOG_DEBUG) lvl = "DEBUG";
+        else if (level == ZM_LOG_WARN) lvl = "WARN";
+        else if (level == ZM_LOG_ERROR) lvl = "ERROR";
+        std::cout << "[PLUGIN][" << lvl << "] " << (msg ? msg : "(null)") << std::endl;
+    };
     host_api.publish_evt = host_api_publish_evt_adapter; // forward events into ring
     host_api.on_frame = host_api_on_frame_adapter;
     // Pass the ring buffer as host_ctx so the callback can access it

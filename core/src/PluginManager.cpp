@@ -9,14 +9,16 @@
 #include <cstring>
 
 // Global host API for v1 plugins
+// Route plugin logs to stdout so VS Code Debug Console can capture them
+extern "C" void host_log(void* /*host_ctx*/, zm_log_level_t level, const char* msg) {
+    const char* lvl = "INFO";
+    if (level == ZM_LOG_DEBUG) lvl = "DEBUG";
+    else if (level == ZM_LOG_WARN) lvl = "WARN";
+    else if (level == ZM_LOG_ERROR) lvl = "ERROR";
+    std::cout << "[PLUGIN][" << lvl << "] " << (msg ? msg : "(null)") << std::endl;
+}
 zm_host_api_t gHost = {
-    /* log */ [](void*, zm_log_level_t level, const char* msg) {
-        const char* lvl = "INFO";
-        if (level == ZM_LOG_DEBUG) lvl = "DEBUG";
-        else if (level == ZM_LOG_WARN) lvl = "WARN";
-        else if (level == ZM_LOG_ERROR) lvl = "ERROR";
-        std::cerr << "[PLUGIN][" << lvl << "] " << (msg ? msg : "(null)") << std::endl;
-    },
+    /* log */ host_log,
     /* publish_evt */ [](void* host_ctx, const char* json_event) -> void {
         zm::EventBus::instance().publish("plugin_event", json_event);
     },
