@@ -11,7 +11,7 @@
             "program": "${workspaceFolder}/build/zm-core",
             "args": [
                 "--pipeline",
-                "${workspaceFolder}/pipelines/cap_then_store.json"
+                "${workspaceFolder}/pipelines/multi_rtsp_to_filesystem.json"
             ],
             "cwd": "${workspaceFolder}/build",
             "stopAtEntry": false,
