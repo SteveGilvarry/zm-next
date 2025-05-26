@@ -13,4 +13,7 @@ cmake-build-release/
 plugins/*.so
 plugins/*.dll
 plugins/*.dylib
-pipelines/cap_then_store.json
+
+# Pipeline configuration files (may contain sensitive data)
+pipelines/
+!pipelines/*.template.json
