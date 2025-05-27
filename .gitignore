@@ -17,3 +17,9 @@ plugins/*.dylib
 # Pipeline configuration files (may contain sensitive data)
 pipelines/
 !pipelines/*.template.json
+
+# Signaling files
+signaling/
+webrtc_client.html
+WebRTC_Guide.md
+.gitignore
