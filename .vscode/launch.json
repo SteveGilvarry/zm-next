@@ -18,6 +18,21 @@
             "environment": [],
             "externalConsole": false,
             "MIMode": "lldb"
+        },
+        {
+            "name": "Debug zm-core webrtc",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/zm-core",
+            "args": [
+                "--pipeline",
+                "${workspaceFolder}/pipelines/rtsp_to_webrtc_direct.json"
+            ],
+            "cwd": "${workspaceFolder}/build",
+            "stopAtEntry": false,
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "lldb"
         }
     ]
 }

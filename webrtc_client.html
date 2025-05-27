@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZM-Next WebRTC Stream Viewer</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .controls {
+            margin-bottom: 20px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 5px;
+        }
+        .controls input, .controls button {
+            margin: 5px;
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .controls button {
+            background: #007bff;
+            color: white;
+            cursor: pointer;
+        }
+        .controls button:hover {
+            background: #0056b3;
+        }
+        .controls button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        #videoContainer {
+            text-align: center;
+            margin: 20px 0;
+        }
+        #remoteVideo {
+            max-width: 100%;
+            max-height: 600px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            background: #000;
+        }
+        .status {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        .status.connected { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .status.connecting { background: #fff3cd; color: #856404; border: 1px solid #ffeaa7; }
+        .status.disconnected { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .logs {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 5px;
+            padding: 10px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎥 ZM-Next WebRTC Stream Viewer</h1>
+        
+        <div class="controls">
+            <label>
+                Server URL: 
+                <input type="text" id="serverUrl" value="ws://localhost:8080" placeholder="ws://your-server:8080">
+            </label>
+            <label>
+                Stream ID: 
+                <input type="number" id="streamId" value="0" min="0">
+            </label>
+            <button id="connectBtn" onclick="connect()">Connect</button>
+            <button id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
+        </div>
+
+        <div id="status" class="status disconnected">Disconnected</div>
+
+        <div id="videoContainer">
+            <video id="remoteVideo" autoplay playsinline controls muted></video>
+        </div>
+
+        <h3>Connection Logs</h3>
+        <div id="logs" class="logs"></div>
+    </div>
+
+    <script>
+        let pc = null;
+        let ws = null;
+        let isConnecting = false;
+
+        const log = (message) => {
+            const logs = document.getElementById('logs');
+            const timestamp = new Date().toLocaleTimeString();
+            logs.innerHTML += `[${timestamp}] ${message}\n`;
+            logs.scrollTop = logs.scrollHeight;
+            console.log(message);
+        };
+
+        const updateStatus = (status, message) => {
+            const statusEl = document.getElementById('status');
+            statusEl.className = `status ${status}`;
+            statusEl.textContent = message;
+        };
+
+        const setupPeerConnection = () => {
+            const config = {
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' }
+                ]
+            };
+
+            pc = new RTCPeerConnection(config);
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
+                    log('Sending ICE candidate');
+                    ws.send(JSON.stringify({
+                        type: 'ice-candidate',
+                        candidate: event.candidate
+                    }));
+                }
+            };
+
+            pc.ontrack = (event) => {
+                log('Received remote stream');
+                const remoteVideo = document.getElementById('remoteVideo');
+                remoteVideo.srcObject = event.streams[0];
+                updateStatus('connected', 'Connected - Receiving Video');
+            };
+
+            pc.onconnectionstatechange = () => {
+                log(`WebRTC connection state: ${pc.connectionState}`);
+                if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+                    updateStatus('disconnected', 'Connection Lost');
+                }
+            };
+
+            pc.oniceconnectionstatechange = () => {
+                log(`ICE connection state: ${pc.iceConnectionState}`);
+            };
+        };
+
+        const connect = async () => {
+            if (isConnecting) return;
+            
+            isConnecting = true;
+            document.getElementById('connectBtn').disabled = true;
+            
+            try {
+                const serverUrl = document.getElementById('serverUrl').value;
+                const streamId = document.getElementById('streamId').value;
+                
+                log(`Connecting to ${serverUrl} for stream ${streamId}`);
+                updateStatus('connecting', 'Connecting...');
+
+                // Setup WebSocket connection
+                ws = new WebSocket(serverUrl);
+                
+                ws.onopen = async () => {
+                    log('WebSocket connected');
+                    setupPeerConnection();
+                    
+                    // Create offer
+                    log('Creating WebRTC offer');
+                    const offer = await pc.createOffer({
+                        offerToReceiveVideo: true,
+                        offerToReceiveAudio: false
+                    });
+                    
+                    await pc.setLocalDescription(offer);
+                    
+                    // Send offer with stream request
+                    ws.send(JSON.stringify({
+                        type: 'offer',
+                        sdp: offer,
+                        stream_id: parseInt(streamId)
+                    }));
+                };
+
+                ws.onmessage = async (event) => {
+                    const message = JSON.parse(event.data);
+                    log(`Received message: ${message.type}`);
+                    
+                    if (message.type === 'answer') {
+                        await pc.setRemoteDescription(new RTCSessionDescription(message.sdp));
+                        log('Set remote description from answer');
+                    } else if (message.type === 'ice-candidate') {
+                        await pc.addIceCandidate(new RTCIceCandidate(message.candidate));
+                        log('Added ICE candidate');
+                    } else if (message.type === 'error') {
+                        log(`Server error: ${message.message}`);
+                        updateStatus('disconnected', `Error: ${message.message}`);
+                    }
+                };
+
+                ws.onerror = (error) => {
+                    log(`WebSocket error: ${error}`);
+                    updateStatus('disconnected', 'Connection Error');
+                    isConnecting = false;
+                    document.getElementById('connectBtn').disabled = false;
+                };
+
+                ws.onclose = () => {
+                    log('WebSocket disconnected');
+                    updateStatus('disconnected', 'Disconnected');
+                    isConnecting = false;
+                    document.getElementById('connectBtn').disabled = false;
+                    document.getElementById('disconnectBtn').disabled = true;
+                };
+
+                document.getElementById('disconnectBtn').disabled = false;
+
+            } catch (error) {
+                log(`Connection error: ${error.message}`);
+                updateStatus('disconnected', `Error: ${error.message}`);
+                isConnecting = false;
+                document.getElementById('connectBtn').disabled = false;
+            }
+        };
+
+        const disconnect = () => {
+            log('Disconnecting...');
+            
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+            
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+
+            const remoteVideo = document.getElementById('remoteVideo');
+            remoteVideo.srcObject = null;
+            
+            updateStatus('disconnected', 'Disconnected');
+            document.getElementById('connectBtn').disabled = false;
+            document.getElementById('disconnectBtn').disabled = true;
+            isConnecting = false;
+        };
+
+        // Initialize
+        log('WebRTC client ready');
+        updateStatus('disconnected', 'Ready to connect');
+    </script>
+</body>
+</html>

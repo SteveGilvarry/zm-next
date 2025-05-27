@@ -9,3 +9,4 @@ add_subdirectory(decode_ffmpeg)
 
 add_subdirectory(motion_basic)
 add_subdirectory(store_filesystem)
+add_subdirectory(output_webrtc)

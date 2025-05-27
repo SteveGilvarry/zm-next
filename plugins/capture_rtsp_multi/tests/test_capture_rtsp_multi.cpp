@@ -53,11 +53,11 @@ protected:
         test_running = false;
         
         // Load the plugin library
-        const char* plugin_path = "plugins/capture_rtsp_multi/libcapture_rtsp_multi.so";
+        const char* plugin_path = "plugins/capture_rtsp_multi/capture_rtsp_multi.so";
         handle = dlopen(plugin_path, RTLD_LAZY);
         if (!handle) {
             // Try macOS naming
-            plugin_path = "plugins/capture_rtsp_multi/libcapture_rtsp_multi.dylib";
+            plugin_path = "plugins/capture_rtsp_multi/capture_rtsp_multi.dylib";
             handle = dlopen(plugin_path, RTLD_LAZY);
         }
         
