@@ -588,7 +588,7 @@ void StreamManager::process_and_publish_frame(StreamState* state, const StreamCo
     // Create frame header
     zm_frame_hdr_t hdr = {};
     hdr.stream_id = config.stream_id;
-    hdr.hw_type = config.hw_decode ? (uint32_t)preferred_hw_type_ : ZM_HW_CPU;
+    hdr.hw_type = ZM_FRAME_COMPRESSED;  // Mark as compressed H.264 frame
     hdr.handle = reinterpret_cast<uint64_t>(state->packet->data);
     hdr.bytes = state->packet->size;
     hdr.flags = (state->packet->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
@@ -643,9 +643,11 @@ void StreamManager::process_and_publish_frame(StreamState* state, const StreamCo
     if (hdr.flags & 1) {
         log_stream(config.stream_id, ZM_LOG_DEBUG, "Publishing keyframe: size=%u, pts=%" PRId64, 
                    hdr.bytes, hdr.pts_usec);
-    } else if (state->frames_captured % 300 == 0) {
-        log_stream(config.stream_id, ZM_LOG_DEBUG, "Progress: captured %d frames", 
-                   static_cast<int>(state->frames_captured));
+    } else {
+        if (state->frames_captured % 300 == 0) {
+            log_stream(config.stream_id, ZM_LOG_DEBUG, "Progress: captured %d frames", 
+                       static_cast<int>(state->frames_captured));
+        }
     }
     
     // Publish validated frame to pipeline

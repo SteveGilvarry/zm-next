@@ -1,4 +1,3 @@
-
 cmake_minimum_required(VERSION 3.16)
 project(zmcore LANGUAGES CXX)
 
@@ -25,6 +24,7 @@ add_library(zmcore STATIC
     src/PipelineLoader.cpp
     src/monitor.cpp
     src/CaptureThread.cpp
+    src/plugin_utils.cpp
 )
 
 target_include_directories(zmcore PUBLIC include)
@@ -67,5 +67,5 @@ add_test(NAME PipelineLoaderTest COMMAND $<TARGET_FILE:test_pipeloader>)
 add_executable(test_monitor tests/test_monitor.cpp)
 target_link_libraries(test_monitor PRIVATE zmcore GTest::gtest_main Threads::Threads)
 add_test(NAME MonitorTest COMMAND $<TARGET_FILE:test_monitor>)
-  
+
 

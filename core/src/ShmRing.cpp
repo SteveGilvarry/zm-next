@@ -6,19 +6,26 @@ namespace zm {
 ShmRing::ShmRing(size_t slotCount, size_t slotSize)
     : shm_(boost::interprocess::open_or_create, "zm_shmring", boost::interprocess::read_write),
       region_(), header_(nullptr), buffer_(nullptr) {
-    // Calculate total size: header + slots
-    size_t totalSize = sizeof(Header) + slotCount * slotSize;
+    // Calculate total size: header + slot sizes array + slots
+    size_t totalSize = sizeof(Header) + slotCount * sizeof(size_t) + slotCount * slotSize;
     // Set size and map region
     shm_.truncate(totalSize);
     region_ = boost::interprocess::mapped_region(shm_, boost::interprocess::read_write);
     void* addr = region_.get_address();
     header_ = static_cast<Header*>(addr);
-    buffer_ = reinterpret_cast<char*>(addr) + sizeof(Header);
+    // Slot sizes array comes after header
+    size_t* slotSizes = reinterpret_cast<size_t*>(reinterpret_cast<char*>(addr) + sizeof(Header));
+    // Buffer comes after slot sizes array
+    buffer_ = reinterpret_cast<char*>(addr) + sizeof(Header) + slotCount * sizeof(size_t);
     // Initialize header (idempotent if already set)
     header_->slotCount = slotCount;
     header_->slotSize = slotSize;
     header_->head.store(0);
     header_->tail.store(0);
+    // Initialize slot sizes to 0
+    for (size_t i = 0; i < slotCount; ++i) {
+        slotSizes[i] = 0;
+    }
 }
 
 bool ShmRing::push(const void* data, size_t size) {
@@ -28,6 +35,10 @@ bool ShmRing::push(const void* data, size_t size) {
     size_t next = (tail + 1) % header_->slotCount;
     // ring full
     if (next == head) return false;
+    // Get slot sizes array
+    size_t* slotSizes = reinterpret_cast<size_t*>(reinterpret_cast<char*>(header_) + sizeof(Header));
+    // Store actual size for this slot
+    slotSizes[tail] = size;
     // copy data into slot
     char* dst = buffer_ + tail * header_->slotSize;
     std::memcpy(dst, data, size);
@@ -45,10 +56,14 @@ bool ShmRing::pop(void* data, size_t& size) {
         header_->tail.wait(tail, std::memory_order_relaxed);
         tail = header_->tail.load(std::memory_order_acquire);
     }
+    // Get slot sizes array
+    size_t* slotSizes = reinterpret_cast<size_t*>(reinterpret_cast<char*>(header_) + sizeof(Header));
+    // Get actual size for this slot
+    size_t actualSize = slotSizes[head];
     // read from slot
     char* src = buffer_ + head * header_->slotSize;
-    std::memcpy(data, src, header_->slotSize);
-    size = header_->slotSize;
+    std::memcpy(data, src, actualSize);
+    size = actualSize;
     // advance head
     size_t next = (head + 1) % header_->slotCount;
     header_->head.store(next, std::memory_order_release);

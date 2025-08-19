@@ -1,6 +1,6 @@
 #pragma once
-#include <stdint.h>
-#include <stddef.h>
+
+#include "zm_plugin.h"
 #include <stdarg.h>
 #include <stdio.h>
 
@@ -8,87 +8,12 @@
 extern "C" {
 #endif
 
-// Simple JSON library for configuration
-typedef struct zm_json_s zm_json_t;
-
-// Logging levels
-typedef enum {
-    ZM_LOG_DEBUG,
-    ZM_LOG_INFO,
-    ZM_LOG_WARN,
-    ZM_LOG_ERROR
-} zm_log_level_t;
-
-// Unified Plugin interface type
-typedef enum zm_plugin_type_e {
-    ZM_PLUGIN_INPUT,
-    ZM_PLUGIN_PROCESS,
-    ZM_PLUGIN_DETECT,
-    ZM_PLUGIN_OUTPUT,
-    ZM_PLUGIN_STORE
-} zm_plugin_type_t;
-
-// Hardware surface types
-typedef enum zm_hw_type_e {
-    ZM_HW_CPU = 0,
-    ZM_HW_CUDA = 1,
-    ZM_HW_VAAPI = 2,
-    ZM_HW_VTB = 3,   // VideoToolbox (Apple)
-    ZM_HW_DXVA = 4,  // DirectX Video Acceleration
-    
-    // Frame format types (using high values to avoid conflicts)
-    ZM_FRAME_COMPRESSED = 100,  // Compressed video (H.264, etc.)
-    ZM_FRAME_RGB24 = 101,       // Uncompressed RGB24
-    ZM_FRAME_GRAYSCALE = 102,   // Uncompressed grayscale
-    ZM_FRAME_YUV420P = 103      // Uncompressed YUV420P
-} zm_hw_type_t;
-
-// Host API for plugins to call
-typedef struct zm_host_api_s {
-    // Logger with different severity levels
-    void (*log)(void* host_ctx, zm_log_level_t level, const char* msg);
-    // Event publishing for metadata events
-    void (*publish_evt)(void* host_ctx, const char* json_event);
-    // Frame callback for input plugins to forward frames to pipeline
-    void (*on_frame)(void* host_ctx, const void* frame_hdr, size_t frame_size);
-    // Reserved for future extensions of the API
-    void* reserved[4];
-} zm_host_api_t;
-
-// Frame header prefixed to each media packet/frame
-typedef struct zm_frame_hdr_s {
-    uint32_t stream_id;        // Stream identifier (0=first video, 1=second video, etc.)
-    uint32_t hw_type;          // 0=CPU, 1=CUDA, 2=VAAPI, 3=VTB
-    uint64_t handle;           // CPU: packet data pointer; GPU: surface ID
-    uint32_t bytes;            // For CPU: size of packet following this header
-    uint32_t flags;            // Keyframe flag, etc.
-    uint64_t pts_usec;         // Presentation timestamp in microseconds
-} zm_frame_hdr_t;
-
-// Plugin definition
-typedef struct zm_plugin_s {
-    uint32_t version;          // API version, currently 1
-    zm_plugin_type_t type;     // Plugin type: input, process, detect, etc.
-    // Plugin lifecycle callbacks
-    int (*start)(struct zm_plugin_s* plugin, zm_host_api_t* host, void* host_ctx, const char* json_cfg);
-    void (*stop)(struct zm_plugin_s* plugin);
-    // Direct frame passing: standardized single buffer [zm_frame_hdr_t][payload]
-    void (*on_frame)(struct zm_plugin_s* plugin, const void* buf, size_t size);
-    // Plugin instance data
-    void* instance;            // Plugin-specific context
-    void* reserved[2];         // Reserved for future use
-} zm_plugin_t;
-
-// Export this symbol from your plugin
-#define ZM_PLUGIN_EXPORT_SYMBOL "zm_plugin_init"
-typedef void (*zm_plugin_init_fn)(zm_plugin_t*);
-
 // =============================================================================
 // PLUGIN LOGGING UTILITIES
 // =============================================================================
 
 /**
- * Global plugin logging context - set during plugin start
+ * Global plugin logging context - must be set during plugin start
  */
 typedef struct zm_plugin_log_ctx_s {
     zm_host_api_t* host_api;
@@ -123,7 +48,7 @@ void zm_plugin_log_info_throttled(int interval_sec, const char* format, ...);
 void zm_plugin_log_with_prefix(zm_log_level_t level, const char* prefix, const char* format, ...);
 
 // =============================================================================
-// PLUGIN EVENT AND STATISTICS UTILITIES
+// PLUGIN EVENT UTILITIES
 // =============================================================================
 
 /**
@@ -131,6 +56,10 @@ void zm_plugin_log_with_prefix(zm_log_level_t level, const char* prefix, const c
  */
 void zm_plugin_publish_event(const char* event_type, const char* json_data);
 void zm_plugin_publish_simple_event(const char* event_type, const char* key, const char* value);
+
+// =============================================================================
+// PLUGIN STATISTICS HELPERS
+// =============================================================================
 
 /**
  * Common statistics reporting structure
@@ -151,10 +80,13 @@ void zm_plugin_publish_stats(const zm_plugin_stats_t* stats);
 
 #ifdef __cplusplus
 }
+#endif
 
 // =============================================================================
-// C++ CONVENIENCE WRAPPERS
+// C++ CONVENIENCE MACROS AND WRAPPERS
 // =============================================================================
+
+#ifdef __cplusplus
 
 /**
  * C++ RAII logging context manager

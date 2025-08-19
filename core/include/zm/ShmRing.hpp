@@ -20,6 +20,8 @@ private:
         std::atomic<size_t> tail;
         size_t slotCount;
         size_t slotSize;
+        // Array of actual sizes for each slot (immediately follows header)
+        // size_t slotSizes[slotCount];
     };
 
     boost::interprocess::shared_memory_object shm_;

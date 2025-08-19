@@ -3,11 +3,6 @@
 
 set -e
 
-
-
-
-
-
 # Start mediamtx with custom config (assumes mediamtx is installed and in PATH)
 mediamtx /opt/homebrew/etc/mediamtx/mediamtx.yml > /tmp/mediamtx.log 2>&1 &
 MTX_PID=$!
@@ -32,12 +27,12 @@ FFMPEG_PID=$!
 sleep 2
 
 # Run the test binary from the build directory if present
-if [ -f "../../../build/plugins/capture_rtsp/tests/test_capture_rtsp" ]; then
-  TEST_BIN="../../../build/plugins/capture_rtsp/tests/test_capture_rtsp"
-elif [ -f "./test_capture_rtsp" ]; then
-  TEST_BIN="./test_capture_rtsp"
+if [ -f "../../../build/plugins/capture_rtsp_multi/tests/test_capture_rtsp_multi" ]; then
+  TEST_BIN="../../../build/plugins/capture_rtsp_multi/tests/test_capture_rtsp_multi"
+elif [ -f "./test_capture_rtsp_multi" ]; then
+  TEST_BIN="./test_capture_rtsp_multi"
 else
-  echo "test_capture_rtsp binary not found!"
+  echo "test_capture_rtsp_multi binary not found!"
   kill $FFMPEG_PID $MTX_PID
   exit 1
 fi

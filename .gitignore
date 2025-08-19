@@ -22,4 +22,4 @@ pipelines/
 signaling/
 webrtc_client.html
 WebRTC_Guide.md
-.gitignore
+.vscode/

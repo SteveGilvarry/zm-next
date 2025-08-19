@@ -1,0 +1,51 @@
+{
+  "algorithm": "pixel_difference",
+  "algorithm_config": {
+    "threshold": 25,
+    "background_learning_rate": 0.03125,
+    "enable_noise_reduction": true
+  },
+  "zones": [
+    {
+      "id": 1,
+      "name": "Main Entry",
+      "type": "Active",
+      "coords": "0,0 640,0 640,200 0,200",
+      "checkMethod": "Blobs",
+      "minPixelThreshold": 25,
+      "minAlarmPixels": 500,
+      "maxAlarmPixels": 10000,
+      "filterX": 3,
+      "filterY": 3,
+      "minBlobPixels": 200,
+      "maxBlobPixels": 5000,
+      "minBlobs": 1,
+      "maxBlobs": 3,
+      "alarmRGB": 16711680
+    },
+    {
+      "id": 2,
+      "name": "Parking Area",
+      "type": "Active", 
+      "coords": "0,200 640,200 640,480 0,480",
+      "checkMethod": "AlarmedPixels",
+      "minPixelThreshold": 30,
+      "minAlarmPixels": 1000,
+      "maxAlarmPixels": 20000,
+      "alarmRGB": 65280
+    },
+    {
+      "id": 3,
+      "name": "Privacy Zone",
+      "type": "Preclusive",
+      "coords": "500,0 640,0 640,100 500,100",
+      "alarmRGB": 255
+    }
+  ],
+  "debug": {
+    "enable_motion_map": false,
+    "save_debug_frames": false,
+    "log_zone_stats": true,
+    "performance_metrics": false
+  }
+}

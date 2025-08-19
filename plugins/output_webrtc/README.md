@@ -76,9 +76,13 @@ The WebRTC output plugin can be integrated into pipelines to stream video in rea
 {
   "plugins": {
     "cap": {
-      "kind": "capture_rtsp",
+      "kind": "capture_rtsp_multi",
       "cfg": {
-        "url": "rtsp://camera.local/stream1"
+        "streams": [
+          {
+            "url": "rtsp://camera.local/stream1"
+          }
+        ]
       }
     },
     "webrtc": {

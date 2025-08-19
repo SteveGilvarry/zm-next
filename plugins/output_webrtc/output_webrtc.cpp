@@ -1,823 +1,1056 @@
 #include <zm_plugin.h>
 #include <nlohmann/json.hpp>
 #include <rtc/rtc.hpp>
-#include <rtc/rtppacketizationconfig.hpp>
-#include <rtc/h264rtppacketizer.hpp>
-#include <rtc/rtcpsrreporter.hpp>
-#include <rtc/nalunit.hpp>
-#include <sstream>
-#include <iomanip>
+#include <boost/asio.hpp>
+#include <boost/thread.hpp>
+#include <boost/thread/shared_mutex.hpp>
 #include <string>
-#include <vector>
 #include <memory>
-#include <mutex>
-#include <thread>
-#include <condition_variable>
-#include <queue>
 #include <unordered_map>
-#include <chrono>
+#include <queue>
 #include <atomic>
+#include <chrono>
 #include <fstream>
-#include <filesystem>
+#include <sstream>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <cstring>
 
-#ifdef __cplusplus
 extern "C" {
-#endif
 #include <libavformat/avformat.h>
-#include <libavutil/time.h>
-#include <libavutil/base64.h>
 #include <libavcodec/avcodec.h>
-#ifdef __cplusplus
+#include <libavutil/time.h>
 }
-#endif
 
 using json = nlohmann::json;
+using namespace boost::asio;
+using boost::asio::ip::tcp;
 
-struct WebRTCClient {
-    std::string id;
-    std::shared_ptr<rtc::PeerConnection> peer_connection;
-    std::shared_ptr<rtc::Track> video_track;
-    std::shared_ptr<rtc::RtcpSrReporter> sr_reporter;
-    std::shared_ptr<rtc::H264RtpPacketizer> h264_packetizer;
-    std::chrono::steady_clock::time_point last_activity;
-    bool is_connected = false;
-    uint32_t ssrc;
-    uint16_t sequence_number = 0;
-    uint32_t timestamp_offset = 0;
-};
+// =============================================================================
+// LOGGING HELPER
+// =============================================================================
 
-struct WebRTCInstance {
-    // Configuration
-    std::string bind_address = "0.0.0.0";
-    int port = 8080;
-    std::string ice_servers;
-    std::vector<uint32_t> stream_filter;  // If empty, accept all streams
-    int max_clients = 10;
-    int client_timeout_seconds = 30;
-    bool enable_simulcast = false;
-    
-    // Bridge communication
-    std::string bridge_event_dir = "signaling/plugin-events";
-    std::string bridge_response_dir = "signaling/plugin-responses";
-    std::thread bridge_thread;
-    std::atomic<bool> bridge_running{false};
-    
-    // WebRTC components
-    std::shared_ptr<rtc::Configuration> rtc_config;
-    
-    // Client management
-    std::unordered_map<std::string, std::unique_ptr<WebRTCClient>> clients;
-    std::mutex clients_mutex;
-    
-    // Frame processing
-    std::queue<std::vector<uint8_t>> frame_queue;
-    std::mutex frame_mutex;
-    std::condition_variable frame_cv;
-    std::thread processing_thread;
-    bool should_stop = false;
-    
-    // Stream metadata
-    AVCodecParameters* metadata_codecpar = nullptr;
-    bool has_metadata = false;
-    std::mutex metadata_mutex;
-    
-    // Host API
-    zm_host_api_t* host = nullptr;
-    void* host_ctx = nullptr;
-    
-    // Statistics
-    uint64_t frames_sent = 0;
-    uint64_t bytes_sent = 0;
-    uint64_t clients_connected = 0;
-    uint64_t clients_disconnected = 0;
-};
+// Global host API pointer for logging (set during plugin start)
+static zm_host_api_t* g_host_api = nullptr;
+static void* g_host_ctx = nullptr;
 
-static void log(WebRTCInstance* inst, zm_log_level_t level, const char* fmt, ...) {
-    if (!inst || !inst->host || !inst->host->log) return;
-    va_list ap;
-    va_start(ap, fmt);
-    char buf[512];
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    inst->host->log(inst->host_ctx, level, buf);
+static void log_info(const char* format, ...) {
+    if (!g_host_api || !g_host_api->log) return;
+    
+    va_list args;
+    va_start(args, format);
+    char buffer[1024];
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    g_host_api->log(g_host_ctx, ZM_LOG_INFO, buffer);
 }
 
-static void cleanup_disconnected_clients(WebRTCInstance* inst) {
-    std::lock_guard<std::mutex> lock(inst->clients_mutex);
-    auto now = std::chrono::steady_clock::now();
+static void log_error(const char* format, ...) {
+    if (!g_host_api || !g_host_api->log) return;
     
-    auto it = inst->clients.begin();
-    while (it != inst->clients.end()) {
-        auto& client = it->second;
-        auto duration = std::chrono::duration_cast<std::chrono::seconds>(
-            now - client->last_activity).count();
+    va_list args;
+    va_start(args, format);
+    char buffer[1024];
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    g_host_api->log(g_host_ctx, ZM_LOG_ERROR, buffer);
+}
+
+static void log_debug(const char* format, ...) {
+    if (!g_host_api || !g_host_api->log) return;
+    
+    va_list args;
+    va_start(args, format);
+    char buffer[1024];
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    g_host_api->log(g_host_ctx, ZM_LOG_DEBUG, buffer);
+}
+
+// =============================================================================
+// FORWARD DECLARATIONS
+// =============================================================================
+
+class WebRTCService;
+class PeerConnectionManager;
+class ControlServer;
+
+// =============================================================================
+// DATA STRUCTURES
+// =============================================================================
+
+struct StreamInfo {
+    uint32_t camera_id;
+    uint32_t stream_id;
+    std::string codec;
+    int width = 0;
+    int height = 0;
+    AVCodecParameters* codec_params = nullptr;
+    std::atomic<uint64_t> frame_count{0};
+    std::atomic<uint64_t> bytes_sent{0};
+    
+    StreamInfo(uint32_t cam_id, uint32_t str_id, const std::string& c) 
+        : camera_id(cam_id), stream_id(str_id), codec(c) {}
+    
+    ~StreamInfo() {
+        if (codec_params) {
+            avcodec_parameters_free(&codec_params);
+        }
+    }
+};
+
+struct ViewerSession {
+    std::string viewer_id;
+    uint32_t camera_id;
+    std::shared_ptr<rtc::PeerConnection> peer_connection;
+    std::shared_ptr<rtc::Track> video_track;
+    std::chrono::steady_clock::time_point last_activity;
+    std::atomic<bool> is_connected{false};
+    uint32_t ssrc;
+    uint16_t sequence_number = 0;
+    
+    ViewerSession(const std::string& id, uint32_t cam_id, uint32_t ssrc_val)
+        : viewer_id(id), camera_id(cam_id), ssrc(ssrc_val), 
+          last_activity(std::chrono::steady_clock::now()) {}
+};
+
+struct FrameData {
+    std::vector<uint8_t> data;
+    uint64_t timestamp;
+    bool is_keyframe;
+    uint32_t camera_id;
+    uint32_t stream_id;
+    
+    FrameData(const uint8_t* frame_data, size_t size, uint64_t ts, bool keyframe, 
+              uint32_t cam_id, uint32_t str_id)
+        : data(frame_data, frame_data + size), timestamp(ts), is_keyframe(keyframe),
+          camera_id(cam_id), stream_id(str_id) {}
+};
+
+// =============================================================================
+// PEER CONNECTION MANAGER
+// =============================================================================
+
+class PeerConnectionManager {
+public:
+    PeerConnectionManager(std::shared_ptr<rtc::Configuration> config) : rtc_config_(config) {}
+    
+    std::shared_ptr<rtc::PeerConnection> createPeerConnection(const std::string& viewer_id);
+    void addVideoTrack(std::shared_ptr<rtc::PeerConnection> pc, uint32_t ssrc);
+    void sendFrame(const std::string& viewer_key, const FrameData& frame);
+    
+private:
+    std::shared_ptr<rtc::Configuration> rtc_config_;
+    std::unordered_map<std::string, std::shared_ptr<rtc::Track>> tracks_;
+    mutable std::mutex tracks_mutex_;
+};
+
+std::shared_ptr<rtc::PeerConnection> PeerConnectionManager::createPeerConnection(const std::string& viewer_id) {
+    auto pc = std::make_shared<rtc::PeerConnection>(*rtc_config_);
+    
+    pc->onStateChange([viewer_id](rtc::PeerConnection::State state) {
+        // Only log significant state changes to reduce verbosity
+        if (state == rtc::PeerConnection::State::Connected || 
+            state == rtc::PeerConnection::State::Failed ||
+            state == rtc::PeerConnection::State::Disconnected) {
+            log_info("Viewer %s connection state: %d", viewer_id.c_str(), static_cast<int>(state));
+        }
+    });
+    
+    pc->onDataChannel([](std::shared_ptr<rtc::DataChannel> dc) {
+        // DataChannel opened
+    });
+    
+    return pc;
+}
+
+void PeerConnectionManager::addVideoTrack(std::shared_ptr<rtc::PeerConnection> pc, uint32_t ssrc) {
+    rtc::Description::Video video("video", rtc::Description::Direction::SendOnly);
+    video.addH264Codec(96);
+    video.addSSRC(ssrc, "video-stream");
+    
+    auto track = pc->addTrack(video);
+    
+    // Create H.264 RTP packetizer for this track
+    auto rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(ssrc, "video", 96, rtc::H264RtpPacketizer::defaultClockRate);
+    auto h264_packetizer = std::make_shared<rtc::H264RtpPacketizer>(rtc::NalUnit::Separator::StartSequence, rtpConfig);
+    track->setMediaHandler(h264_packetizer);
+    
+    std::lock_guard<std::mutex> lock(tracks_mutex_);
+    tracks_[std::to_string(ssrc)] = track;
+}
+
+void PeerConnectionManager::sendFrame(const std::string& viewer_key, const FrameData& frame) {
+    std::lock_guard<std::mutex> lock(tracks_mutex_);
+    auto it = tracks_.find(viewer_key);
+    if (it != tracks_.end() && it->second) {
+        try {
+            // Convert uint8_t data to std::byte for libdatachannel
+            rtc::binary nal_data;
+            nal_data.reserve(frame.data.size());
+            for (uint8_t byte : frame.data) {
+                nal_data.push_back(static_cast<std::byte>(byte));
+            }
             
-        if (!client->is_connected || duration > inst->client_timeout_seconds) {
-            log(inst, ZM_LOG_INFO, "Removing client %s (timeout or disconnected)", 
-                client->id.c_str());
-            inst->clients_disconnected++;
-            it = inst->clients.erase(it);
+            // Send H.264 NAL unit - timestamps will be managed by RTP packetizer
+            it->second->send(nal_data);
+            
+        } catch (const std::exception& e) {
+            // Filter out "Track is closed" errors as they're expected during disconnection
+            std::string error_msg = e.what();
+            if (error_msg.find("Track is closed") == std::string::npos) {
+                log_error("Failed to send frame: %s", e.what());
+            }
+            // Note: Track closed errors are normal during viewer disconnection
+        }
+    }
+}
+
+// =============================================================================
+// CONTROL SERVER
+// =============================================================================
+
+class ControlServer {
+public:
+    ControlServer(io_context& io_ctx, class WebRTCService& service);
+    
+    void start(const std::string& address, uint16_t port);
+    void stop();
+    
+private:
+    void accept_connections();
+    void handle_client(std::shared_ptr<tcp::socket> socket);
+    void process_command(const json& cmd, std::shared_ptr<tcp::socket> socket);
+    
+    io_context& io_context_;
+    class WebRTCService& webrtc_service_;
+    tcp::acceptor acceptor_;
+    std::atomic<bool> running_{false};
+};
+
+// =============================================================================
+// WEBRTC SERVICE (SINGLETON)
+// =============================================================================
+
+class WebRTCService {
+public:
+    static WebRTCService& getInstance() {
+        static WebRTCService instance;
+        return instance;
+    }
+    
+    void initialize();
+    void shutdown();
+    
+    // Stream management
+    void registerStream(uint32_t camera_id, uint32_t stream_id, const std::string& codec, 
+                       AVCodecParameters* codec_params);
+    void unregisterStream(uint32_t camera_id, uint32_t stream_id);
+    void pushFrame(const zm_frame_hdr_t* frame_hdr, const uint8_t* frame_data, size_t data_size);
+    
+    // Viewer management
+    std::string createOffer(uint32_t camera_id, const std::string& viewer_id);
+    bool setAnswer(uint32_t camera_id, const std::string& viewer_id, const std::string& answer);
+    bool addIceCandidate(uint32_t camera_id, const std::string& viewer_id, 
+                        const std::string& candidate, const std::string& sdp_mid);
+    bool dropViewer(uint32_t camera_id, const std::string& viewer_id);
+    
+    // Control server
+    void startControlServer(const std::string& bind_address, uint16_t port);
+    void stopControlServer();
+    
+    // Statistics
+    json getStatistics() const;
+    
+private:
+    WebRTCService() = default;
+    ~WebRTCService() = default;
+    WebRTCService(const WebRTCService&) = delete;
+    WebRTCService& operator=(const WebRTCService&) = delete;
+    
+    void processFrameQueue();
+    void cleanupStaleConnections();
+    std::shared_ptr<ViewerSession> createViewerSession(uint32_t camera_id, const std::string& viewer_id);
+    
+    std::unique_ptr<PeerConnectionManager> peer_manager_;
+    std::unique_ptr<ControlServer> control_server_;
+    std::unique_ptr<io_context> io_context_;
+    std::unique_ptr<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> work_guard_;
+    
+    // Stream management
+    std::unordered_map<std::string, std::shared_ptr<StreamInfo>> streams_; // "camera_id:stream_id" -> StreamInfo
+    mutable boost::shared_mutex streams_mutex_;
+    
+    // Viewer management
+    std::unordered_map<std::string, std::shared_ptr<ViewerSession>> viewers_; // "camera_id:viewer_id" -> ViewerSession
+    mutable boost::shared_mutex viewers_mutex_;
+    
+    // Frame processing
+    std::queue<std::shared_ptr<FrameData>> frame_queue_;
+    mutable std::mutex frame_queue_mutex_;
+    std::condition_variable frame_queue_cv_;
+    
+    // Threading
+    std::unique_ptr<std::thread> frame_processor_thread_;
+    std::unique_ptr<std::thread> cleanup_thread_;
+    std::unique_ptr<std::thread> io_thread_;
+    std::atomic<bool> running_{false};
+    
+    // Statistics
+    std::atomic<uint64_t> total_frames_processed_{0};
+    std::atomic<uint64_t> total_bytes_processed_{0};
+    std::atomic<uint64_t> total_connections_created_{0};
+    std::atomic<uint64_t> total_connections_dropped_{0};
+    
+    // Configuration
+    std::shared_ptr<rtc::Configuration> rtc_config_;
+    std::atomic<uint32_t> next_ssrc_{1000};
+};
+
+// =============================================================================
+// CONTROL SERVER IMPLEMENTATION
+// =============================================================================
+
+ControlServer::ControlServer(io_context& io_ctx, WebRTCService& service) 
+    : io_context_(io_ctx), webrtc_service_(service), acceptor_(io_ctx) {}
+
+void ControlServer::start(const std::string& address, uint16_t port) {
+    try {
+        tcp::endpoint endpoint(boost::asio::ip::make_address(address), port);
+        acceptor_.open(endpoint.protocol());
+        acceptor_.set_option(tcp::acceptor::reuse_address(true));
+        acceptor_.bind(endpoint);
+        acceptor_.listen();
+        
+        running_ = true;
+        log_info("Control server listening on %s:%d", address.c_str(), port);
+        
+        accept_connections();
+    } catch (const std::exception& e) {
+        log_error("Failed to start control server: %s", e.what());
+    }
+}
+
+void ControlServer::stop() {
+    running_ = false;
+    if (acceptor_.is_open()) {
+        acceptor_.close();
+    }
+}
+
+void ControlServer::accept_connections() {
+    auto socket = std::make_shared<tcp::socket>(io_context_);
+    
+    acceptor_.async_accept(*socket,
+        [this, socket](boost::system::error_code ec) {
+            if (!ec && running_) {
+                log_info("WebRTC Control Server: New connection accepted, starting client handler thread");
+                std::thread([this, socket]() {
+                    handle_client(socket);
+                }).detach();
+                
+                accept_connections();
+            } else if (ec && running_) {
+                log_info("WebRTC Control Server: Accept error: %s", ec.message().c_str());
+                // Continue accepting connections unless server is shutting down
+                if (running_) {
+                    accept_connections();
+                }
+            }
+        });
+}
+
+void ControlServer::handle_client(std::shared_ptr<tcp::socket> socket) {
+    // Get client endpoint information for logging
+    std::string client_endpoint = "unknown";
+    try {
+        auto remote_endpoint = socket->remote_endpoint();
+        client_endpoint = remote_endpoint.address().to_string() + ":" + std::to_string(remote_endpoint.port());
+        // Reduce verbosity for new connections
+        // log_info("WebRTC Control Server: Client connected from %s", client_endpoint.c_str());
+    } catch (const std::exception& e) {
+        log_info("WebRTC Control Server: Unable to get client endpoint: %s", e.what());
+    }
+    
+    try {
+        boost::asio::streambuf buffer;
+        
+        while (running_ && socket->is_open()) {
+            boost::system::error_code ec;
+            size_t bytes = boost::asio::read_until(*socket, buffer, '\n', ec);
+            
+            if (ec) {
+                if (ec != boost::asio::error::eof) {
+            // log_info only for errors, not normal read operations
+            if (ec != boost::asio::error::eof) {
+                log_info("WebRTC Control Server: Read error from %s: %s", client_endpoint.c_str(), ec.message().c_str());
+            }
+                }
+                break;
+            }
+            
+            std::istream is(&buffer);
+            std::string line;
+            std::getline(is, line);
+            
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            
+            // Remove verbose command logging - keep only for debugging
+            // log_info("WebRTC Control Server: Received command from %s: %s", client_endpoint.c_str(), line.c_str());
+            
+            try {
+                json cmd = json::parse(line);
+                process_command(cmd, socket);
+            } catch (const json::exception& e) {
+                log_error("WebRTC Control Server: Invalid JSON command from %s: %s", client_endpoint.c_str(), e.what());
+                json error_response = {{"error", "Invalid JSON"}};
+                std::string response = error_response.dump() + "\n";
+                socket->write_some(boost::asio::buffer(response));
+            }
+        }
+    } catch (const std::exception& e) {
+        log_error("WebRTC Control Server: Client handling error for %s: %s", client_endpoint.c_str(), e.what());
+    }
+    
+    // Reduce verbosity for disconnections
+    // log_info("WebRTC Control Server: Client %s disconnected", client_endpoint.c_str());
+}
+
+void ControlServer::process_command(const json& cmd, std::shared_ptr<tcp::socket> socket) {
+    try {
+        std::string command = cmd.at("command");
+        uint32_t camera_id = cmd.at("camera_id");
+        std::string viewer_id = cmd.at("viewer_id");
+        
+        // Reduce verbosity - log only important operations
+        // log_info("WebRTC Control Server: Processing command '%s' for camera %u, viewer %s", 
+        //          command.c_str(), camera_id, viewer_id.c_str());
+        
+        json response;
+        response["command"] = command;
+        response["camera_id"] = camera_id;
+        response["viewer_id"] = viewer_id;
+        
+        if (command == "create_offer") {
+            std::string offer = webrtc_service_.createOffer(camera_id, viewer_id);
+            response["offer"] = offer;
+            response["success"] = !offer.empty();
+            // Reduce logging verbosity
+            // log_info("WebRTC Control Server: Created offer for camera %u, viewer %s (success: %s, offer size: %zu)", 
+            //          camera_id, viewer_id.c_str(), response["success"].get<bool>() ? "true" : "false", offer.length());
+            
+        } else if (command == "set_answer") {
+            std::string answer = cmd.at("answer");
+            bool success = webrtc_service_.setAnswer(camera_id, viewer_id, answer);
+            response["success"] = success;
+            // log_info("WebRTC Control Server: Set answer for camera %u, viewer %s (success: %s, answer size: %zu)", 
+            //          camera_id, viewer_id.c_str(), success ? "true" : "false", answer.length());
+            
+        } else if (command == "add_ice_candidate") {
+            std::string candidate = cmd.at("candidate");
+            std::string sdp_mid = cmd.value("sdp_mid", "");
+            bool success = webrtc_service_.addIceCandidate(camera_id, viewer_id, candidate, sdp_mid);
+            response["success"] = success;
+            // log_info("WebRTC Control Server: Added ICE candidate for camera %u, viewer %s (success: %s, sdp_mid: %s)", 
+            //          camera_id, viewer_id.c_str(), success ? "true" : "false", sdp_mid.c_str());
+            
+        } else if (command == "drop_viewer") {
+            bool success = webrtc_service_.dropViewer(camera_id, viewer_id);
+            response["success"] = success;
+            // log_info("WebRTC Control Server: Dropped viewer %s for camera %u (success: %s)", 
+            //          viewer_id.c_str(), camera_id, success ? "true" : "false");
+            
+        } else if (command == "get_stats") {
+            response = webrtc_service_.getStatistics();
+            response["success"] = true;
+            // log_info("WebRTC Control Server: Retrieved statistics (response size: %zu bytes)", 
+            //          response.dump().length());
+            
+        } else {
+            response["error"] = "Unknown command";
+            response["success"] = false;
+            // log_info("WebRTC Control Server: Unknown command '%s' for camera %u, viewer %s", 
+            //          command.c_str(), camera_id, viewer_id.c_str());
+        }
+        
+        std::string response_str = response.dump() + "\n";
+        socket->write_some(boost::asio::buffer(response_str));
+        // log_info("WebRTC Control Server: Sent response for command '%s' (size: %zu bytes)", 
+        //          command.c_str(), response_str.length());
+        
+    } catch (const std::exception& e) {
+        log_error("WebRTC Control Server: Command processing error: %s", e.what());
+        json error_response = {
+            {"error", e.what()},
+            {"success", false}
+        };
+        std::string response = error_response.dump() + "\n";
+        socket->write_some(boost::asio::buffer(response));
+        // log_info("WebRTC Control Server: Sent error response (size: %zu bytes)", response.length());
+    }
+}
+
+// =============================================================================
+// WEBRTC SERVICE IMPLEMENTATION
+// =============================================================================
+
+void WebRTCService::initialize() {
+    if (running_) return;
+    
+    // Initialize WebRTC configuration
+    rtc_config_ = std::make_shared<rtc::Configuration>();
+    rtc_config_->iceServers.emplace_back("stun:stun.l.google.com:19302");
+    
+    // Initialize peer connection manager
+    peer_manager_ = std::make_unique<PeerConnectionManager>(rtc_config_);
+    
+    // Initialize IO context
+    io_context_ = std::make_unique<io_context>();
+    
+    // Create work guard to keep IO context alive
+    work_guard_ = std::make_unique<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>>(
+        boost::asio::make_work_guard(*io_context_));
+    
+    // Start processing threads
+    running_ = true;
+    
+    frame_processor_thread_ = std::make_unique<std::thread>([this]() {
+        processFrameQueue();
+    });
+    
+    cleanup_thread_ = std::make_unique<std::thread>([this]() {
+        while (running_) {
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            cleanupStaleConnections();
+        }
+    });
+    
+    // Start IO context thread AFTER work guard is created
+    io_thread_ = std::make_unique<std::thread>([this]() {
+        io_context_->run();
+    });
+    
+    log_info("WebRTC Service initialized");
+}
+
+void WebRTCService::shutdown() {
+    running_ = false;
+    
+    if (control_server_) {
+        control_server_->stop();
+    }
+    
+    // Release work guard to allow IO context to exit
+    if (work_guard_) {
+        work_guard_.reset();
+    }
+    
+    if (io_context_) {
+        io_context_->stop();
+    }
+    
+    frame_queue_cv_.notify_all();
+    
+    if (frame_processor_thread_ && frame_processor_thread_->joinable()) {
+        frame_processor_thread_->join();
+    }
+    
+    if (cleanup_thread_ && cleanup_thread_->joinable()) {
+        cleanup_thread_->join();
+    }
+    
+    if (io_thread_ && io_thread_->joinable()) {
+        io_thread_->join();
+    }
+    
+    {
+        boost::unique_lock<boost::shared_mutex> lock(viewers_mutex_);
+        viewers_.clear();
+    }
+    
+    {
+        boost::unique_lock<boost::shared_mutex> lock(streams_mutex_);
+        streams_.clear();
+    }
+    
+    log_info("WebRTC Service shutdown");
+}
+
+void WebRTCService::registerStream(uint32_t camera_id, uint32_t stream_id, const std::string& codec, 
+                                  AVCodecParameters* codec_params) {
+    std::string stream_key = std::to_string(camera_id) + ":" + std::to_string(stream_id);
+    
+    boost::unique_lock<boost::shared_mutex> lock(streams_mutex_);
+    
+    auto stream_info = std::make_shared<StreamInfo>(camera_id, stream_id, codec);
+    if (codec_params) {
+        stream_info->codec_params = avcodec_parameters_alloc();
+        avcodec_parameters_copy(stream_info->codec_params, codec_params);
+        stream_info->width = codec_params->width;
+        stream_info->height = codec_params->height;
+    }
+    
+    streams_[stream_key] = stream_info;
+    
+    log_info("Registered stream %u:%u (%s, %dx%d)", 
+           camera_id, stream_id, codec.c_str(), stream_info->width, stream_info->height);
+}
+
+void WebRTCService::unregisterStream(uint32_t camera_id, uint32_t stream_id) {
+    std::string stream_key = std::to_string(camera_id) + ":" + std::to_string(stream_id);
+    
+    boost::unique_lock<boost::shared_mutex> lock(streams_mutex_);
+    streams_.erase(stream_key);
+    
+    log_info("Unregistered stream %u:%u", camera_id, stream_id);
+}
+
+void WebRTCService::pushFrame(const zm_frame_hdr_t* frame_hdr, const uint8_t* frame_data, size_t data_size) {
+    if (!running_ || !frame_hdr || !frame_data || data_size == 0) return;
+    
+    uint32_t stream_id = frame_hdr->stream_id;
+    bool is_keyframe = (frame_hdr->flags & 1) != 0;
+    
+    // Minimal logging for keyframes only and frame rate monitoring
+    static uint64_t frame_count = 0;
+    static auto last_rate_check = std::chrono::steady_clock::now();
+    frame_count++;
+    
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_rate_check);
+    if (elapsed.count() >= 5) {  // Check frame rate every 5 seconds
+        double fps = static_cast<double>(frame_count) / elapsed.count();
+        log_info("WebRTC: Receiving %.1f fps for stream %u (total frames: %llu)", fps, stream_id, frame_count);
+        last_rate_check = now;
+        frame_count = 0;
+    }
+    
+    if (is_keyframe && frame_count % 500 == 0) {  // Log keyframes more frequently for debugging
+        log_info("WebRTC: Keyframe processed for stream %u", stream_id);
+    }
+    
+    // Find camera_id for this stream_id from stream configuration
+    uint32_t camera_id = 0;
+    {
+        boost::shared_lock<boost::shared_mutex> streams_lock(streams_mutex_);
+        for (const auto& [stream_key, stream_info] : streams_) {
+            if (stream_info->stream_id == stream_id) {
+                camera_id = stream_info->camera_id;
+                break;
+            }
+        }
+    }
+    
+    // If no stream found, log error and skip frame
+    if (camera_id == 0) {
+        log_error("WebRTC: Received frame for unknown stream_id %u, skipping", stream_id);
+        return;
+    }
+    
+    auto frame = std::make_shared<FrameData>(
+        frame_data, data_size, frame_hdr->pts_usec, is_keyframe, camera_id, stream_id
+    );
+    
+    {
+        std::lock_guard<std::mutex> lock(frame_queue_mutex_);
+        // Increase frame queue size for 25fps video (25fps * 10 seconds = 250 frames)
+        if (frame_queue_.size() > 250) { 
+            frame_queue_.pop();
+            // Log frame drops to identify bottlenecks
+            static uint64_t dropped_frames = 0;
+            if (++dropped_frames % 100 == 0) {
+                log_info("WebRTC: Dropped %llu frames due to queue overflow", dropped_frames);
+            }
+        }
+        frame_queue_.push(frame);
+    }
+    
+    frame_queue_cv_.notify_one();
+    total_frames_processed_++;
+    total_bytes_processed_ += data_size;
+
+}
+
+std::string WebRTCService::createOffer(uint32_t camera_id, const std::string& viewer_id) {
+    try {
+        auto session = createViewerSession(camera_id, viewer_id);
+        if (!session) return "";
+        
+        // Set local description to generate offer
+        session->peer_connection->setLocalDescription();
+        auto local_desc = session->peer_connection->localDescription();
+        
+        total_connections_created_++;
+        log_info("Created offer for viewer %s on camera %u", viewer_id.c_str(), camera_id);
+        
+        return local_desc ? std::string(*local_desc) : "";
+        
+    } catch (const std::exception& e) {
+        log_error("Failed to create offer: %s", e.what());
+        return "";
+    }
+}
+
+bool WebRTCService::setAnswer(uint32_t camera_id, const std::string& viewer_id, const std::string& answer) {
+    try {
+        std::string viewer_key = std::to_string(camera_id) + ":" + viewer_id;
+        
+        boost::shared_lock<boost::shared_mutex> lock(viewers_mutex_);
+        auto it = viewers_.find(viewer_key);
+        if (it == viewers_.end()) return false;
+        
+        auto session = it->second;
+        rtc::Description answer_desc(answer, "answer");
+        session->peer_connection->setRemoteDescription(answer_desc);
+        session->is_connected = true;
+        session->last_activity = std::chrono::steady_clock::now();
+        
+        log_info("Set answer for viewer %s on camera %u", viewer_id.c_str(), camera_id);
+        return true;
+        
+    } catch (const std::exception& e) {
+        log_error("Failed to set answer: %s", e.what());
+        return false;
+    }
+}
+
+bool WebRTCService::addIceCandidate(uint32_t camera_id, const std::string& viewer_id, 
+                                   const std::string& candidate, const std::string& sdp_mid) {
+    try {
+        std::string viewer_key = std::to_string(camera_id) + ":" + viewer_id;
+        
+        boost::shared_lock<boost::shared_mutex> lock(viewers_mutex_);
+        auto it = viewers_.find(viewer_key);
+        if (it == viewers_.end()) return false;
+        
+        auto session = it->second;
+        rtc::Candidate ice_candidate(candidate, sdp_mid);
+        session->peer_connection->addRemoteCandidate(ice_candidate);
+        session->last_activity = std::chrono::steady_clock::now();
+        
+        return true;
+        
+    } catch (const std::exception& e) {
+        log_error("Failed to add ICE candidate: %s", e.what());
+        return false;
+    }
+}
+
+bool WebRTCService::dropViewer(uint32_t camera_id, const std::string& viewer_id) {
+    std::string viewer_key = std::to_string(camera_id) + ":" + viewer_id;
+    
+    boost::unique_lock<boost::shared_mutex> lock(viewers_mutex_);
+    auto it = viewers_.find(viewer_key);
+    if (it != viewers_.end()) {
+        viewers_.erase(it);
+        total_connections_dropped_++;
+        log_info("Dropped viewer %s on camera %u", viewer_id.c_str(), camera_id);
+        return true;
+    }
+    return false;
+}
+
+void WebRTCService::startControlServer(const std::string& bind_address, uint16_t port) {
+    if (!io_context_) return;
+    
+    control_server_ = std::make_unique<ControlServer>(*io_context_, *this);
+    control_server_->start(bind_address, port);
+}
+
+std::shared_ptr<ViewerSession> WebRTCService::createViewerSession(uint32_t camera_id, const std::string& viewer_id) {
+    std::string viewer_key = std::to_string(camera_id) + ":" + viewer_id;
+    
+    boost::unique_lock<boost::shared_mutex> lock(viewers_mutex_);
+    
+    // Remove existing session if any
+    viewers_.erase(viewer_key);
+    
+    // Create new session
+    uint32_t ssrc = next_ssrc_++;
+    auto session = std::make_shared<ViewerSession>(viewer_id, camera_id, ssrc);
+    session->peer_connection = peer_manager_->createPeerConnection(viewer_id);
+    
+    peer_manager_->addVideoTrack(session->peer_connection, ssrc);
+    
+    viewers_[viewer_key] = session;
+    return session;
+}
+
+void WebRTCService::processFrameQueue() {
+    while (running_) {
+        std::unique_lock<std::mutex> lock(frame_queue_mutex_);
+        frame_queue_cv_.wait(lock, [this] { return !frame_queue_.empty() || !running_; });
+        
+        if (!running_) break;
+        
+        while (!frame_queue_.empty()) {
+            auto frame = frame_queue_.front();
+            frame_queue_.pop();
+            lock.unlock();
+            
+            // Send frame to all viewers of this camera
+            boost::shared_lock<boost::shared_mutex> viewers_lock(viewers_mutex_);
+            int active_viewers = 0;
+            auto now = std::chrono::steady_clock::now();
+            for (const auto& [viewer_key, session] : viewers_) {
+                if (session->camera_id == frame->camera_id && session->is_connected) {
+                    peer_manager_->sendFrame(std::to_string(session->ssrc), *frame);
+                    // Update last_activity to prevent stale cleanup of active viewers
+                    session->last_activity = now;
+                    active_viewers++;
+                }
+            }
+            viewers_lock.unlock();
+            
+            if (active_viewers == 0) {
+                // Reduce logging frequency - only log every 10 seconds worth of frames
+                static auto last_no_viewers_log = std::chrono::steady_clock::now();
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::seconds>(now - last_no_viewers_log).count() >= 10) {
+                    log_debug("WebRTC: No active viewers for camera %u, frames being discarded", frame->camera_id);
+                    last_no_viewers_log = now;
+                }
+            } else {
+                // Track outbound fps for performance monitoring
+                static uint64_t frames_sent = 0;
+                static auto last_outbound_fps_check = std::chrono::steady_clock::now();
+                frames_sent += active_viewers;  // Count total frames sent to all viewers
+                
+                auto now_fps = std::chrono::steady_clock::now();
+                auto elapsed_fps = std::chrono::duration_cast<std::chrono::seconds>(now_fps - last_outbound_fps_check);
+                if (elapsed_fps.count() >= 5) {  // Check outbound fps every 5 seconds
+                    double outbound_fps = static_cast<double>(frames_sent) / elapsed_fps.count() / active_viewers;
+                    log_info("WebRTC: Sending %.1f fps to %d viewers for camera %u (total frames sent: %llu)", 
+                             outbound_fps, active_viewers, frame->camera_id, frames_sent);
+                    last_outbound_fps_check = now_fps;
+                    frames_sent = 0;
+                }
+                
+                // Reduce logging frequency - only log every 5 seconds worth of frames when viewers are active
+                static auto last_viewers_log = std::chrono::steady_clock::now();
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::seconds>(now - last_viewers_log).count() >= 5) {
+                    log_info("WebRTC: Frame sent to %d viewers for camera %u", active_viewers, frame->camera_id);
+                    last_viewers_log = now;
+                }
+            }
+            
+            // Update stream statistics
+            std::string stream_key = std::to_string(frame->camera_id) + ":" + std::to_string(frame->stream_id);
+            boost::shared_lock<boost::shared_mutex> streams_lock(streams_mutex_);
+            auto it = streams_.find(stream_key);
+            if (it != streams_.end()) {
+                it->second->frame_count++;
+                it->second->bytes_sent += frame->data.size();
+            }
+            
+            lock.lock();
+        }
+    }
+}
+
+void WebRTCService::cleanupStaleConnections() {
+    auto now = std::chrono::steady_clock::now();
+    auto timeout = std::chrono::minutes(5);
+    
+    boost::unique_lock<boost::shared_mutex> lock(viewers_mutex_);
+    
+    auto it = viewers_.begin();
+    while (it != viewers_.end()) {
+        auto& session = it->second;
+        if (!session->is_connected || (now - session->last_activity) > timeout) {
+            log_info("Cleaning up stale viewer %s", session->viewer_id.c_str());
+            it = viewers_.erase(it);
+            total_connections_dropped_++;
         } else {
             ++it;
         }
     }
 }
 
-static std::string generate_client_id() {
-    static std::atomic<uint32_t> counter{0};
-    auto now = std::chrono::system_clock::now();
-    auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now.time_since_epoch()).count();
-    std::ostringstream oss;
-    oss << "client_" << timestamp << "_" << counter.fetch_add(1);
-    return oss.str();
-}
-
-static void setup_ice_servers(WebRTCInstance* inst) {
-    inst->rtc_config = std::make_shared<rtc::Configuration>();
+json WebRTCService::getStatistics() const {
+    json stats;
     
-    if (!inst->ice_servers.empty()) {
-        try {
-            auto ice_config = json::parse(inst->ice_servers);
-            if (ice_config.is_array()) {
-                for (const auto& server : ice_config) {
-                    if (server.contains("urls")) {
-                        std::string url = server["urls"];
-                        inst->rtc_config->iceServers.emplace_back(url);
-                        log(inst, ZM_LOG_INFO, "Added ICE server: %s", url.c_str());
-                    }
-                }
-            }
-        } catch (const std::exception& e) {
-            log(inst, ZM_LOG_WARN, "Failed to parse ICE servers config: %s", e.what());
+    stats["total_frames_processed"] = total_frames_processed_.load();
+    stats["total_bytes_processed"] = total_bytes_processed_.load();
+    stats["total_connections_created"] = total_connections_created_.load();
+    stats["total_connections_dropped"] = total_connections_dropped_.load();
+    
+    // Stream statistics
+    json streams_stats = json::array();
+    {
+        boost::shared_lock<boost::shared_mutex> lock(streams_mutex_);
+        for (const auto& [stream_key, stream] : streams_) {
+            json stream_stat;
+            stream_stat["camera_id"] = stream->camera_id;
+            stream_stat["stream_id"] = stream->stream_id;
+            stream_stat["codec"] = stream->codec;
+            stream_stat["width"] = stream->width;
+            stream_stat["height"] = stream->height;
+            stream_stat["frame_count"] = stream->frame_count.load();
+            stream_stat["bytes_sent"] = stream->bytes_sent.load();
+            streams_stats.push_back(stream_stat);
         }
     }
+    stats["streams"] = streams_stats;
     
-    // Add default STUN servers if none configured
-    if (inst->rtc_config->iceServers.empty()) {
-        inst->rtc_config->iceServers.emplace_back("stun:stun.l.google.com:19302");
-        inst->rtc_config->iceServers.emplace_back("stun:stun1.l.google.com:19302");
-        log(inst, ZM_LOG_INFO, "Using default STUN servers");
+    // Active viewers
+    json viewers_stats = json::array();
+    {
+        boost::shared_lock<boost::shared_mutex> lock(viewers_mutex_);
+        for (const auto& [viewer_key, session] : viewers_) {
+            json viewer_stat;
+            viewer_stat["viewer_id"] = session->viewer_id;
+            viewer_stat["camera_id"] = session->camera_id;
+            viewer_stat["is_connected"] = session->is_connected.load();
+            viewer_stat["ssrc"] = session->ssrc;
+            viewers_stats.push_back(viewer_stat);
+        }
     }
+    stats["viewers"] = viewers_stats;
+    
+    return stats;
 }
 
-static std::shared_ptr<WebRTCClient> create_webrtc_client(WebRTCInstance* inst, const std::string& client_id) {
-    auto client = std::make_unique<WebRTCClient>();
-    client->id = client_id;
-    client->last_activity = std::chrono::steady_clock::now();
-    client->ssrc = std::hash<std::string>{}(client_id) & 0x7FFFFFFF; // Ensure positive
+// =============================================================================
+// PLUGIN INSTANCE
+// =============================================================================
+
+struct WebRTCPluginInstance {
+    uint32_t camera_id;
+    uint32_t stream_id;
+    std::string codec;
+    bool initialized = false;
     
+    WebRTCPluginInstance() = default;
+    WebRTCPluginInstance(uint32_t cam_id, uint32_t str_id, const std::string& codec_type)
+        : camera_id(cam_id), stream_id(str_id), codec(codec_type), initialized(true) {}
+    
+    ~WebRTCPluginInstance() {
+        if (initialized) {
+            WebRTCService::getInstance().unregisterStream(camera_id, stream_id);
+        }
+    }
+};
+
+// =============================================================================
+// PLUGIN LIFECYCLE FUNCTIONS
+// =============================================================================
+
+static void* webrtc_init(const char* config_json) {
     try {
-        client->peer_connection = std::make_shared<rtc::PeerConnection>(*inst->rtc_config);
+        auto instance = std::make_unique<WebRTCPluginInstance>();
         
-        // Set up callbacks
-        client->peer_connection->onStateChange([inst, client_id](rtc::PeerConnection::State state) {
-            std::lock_guard<std::mutex> lock(inst->clients_mutex);
-            auto it = inst->clients.find(client_id);
-            if (it != inst->clients.end()) {
-                auto& client = it->second;
-                switch (state) {
-                    case rtc::PeerConnection::State::Connected:
-                        client->is_connected = true;
-                        inst->clients_connected++;
-                        log(inst, ZM_LOG_INFO, "Client %s connected", client_id.c_str());
-                        break;
-                    case rtc::PeerConnection::State::Disconnected:
-                    case rtc::PeerConnection::State::Failed:
-                    case rtc::PeerConnection::State::Closed:
-                        client->is_connected = false;
-                        log(inst, ZM_LOG_INFO, "Client %s disconnected", client_id.c_str());
-                        break;
-                    default:
-                        break;
-                }
-                
-                // Send connection state to bridge
-                std::string state_str;
-                switch (state) {
-                    case rtc::PeerConnection::State::New: state_str = "new"; break;
-                    case rtc::PeerConnection::State::Connecting: state_str = "connecting"; break;
-                    case rtc::PeerConnection::State::Connected: state_str = "connected"; break;
-                    case rtc::PeerConnection::State::Disconnected: state_str = "disconnected"; break;
-                    case rtc::PeerConnection::State::Failed: state_str = "failed"; break;
-                    case rtc::PeerConnection::State::Closed: state_str = "closed"; break;
-                }
-                
-                json state_response = {
-                    {"type", "webrtc_connection_state"},
-                    {"client_id", client_id},
-                    {"state", state_str}
-                };
-                write_bridge_response(inst, state_response);
-            }
-        });
-        
-        client->peer_connection->onGatheringStateChange([inst, client_id](rtc::PeerConnection::GatheringState state) {
-            if (state == rtc::PeerConnection::GatheringState::Complete) {
-                log(inst, ZM_LOG_DEBUG, "ICE gathering complete for client %s", client_id.c_str());
-            }
-        });
-        
-        client->peer_connection->onLocalCandidate([inst, client_id](rtc::Candidate candidate) {
-            log(inst, ZM_LOG_DEBUG, "Generated ICE candidate for client %s", client_id.c_str());
+        if (config_json) {
+            json config = json::parse(config_json);
+            instance->camera_id = config.value("camera_id", 0);
+            instance->stream_id = config.value("stream_id", 0);
+            instance->codec = config.value("codec", "h264");
             
-            json candidate_response = {
-                {"type", "webrtc_ice_candidate"},
-                {"client_id", client_id},
-                {"candidate", {
-                    {"candidate", candidate.candidate()},
-                    {"sdpMid", candidate.mid()}
-                }}
-            };
-            write_bridge_response(inst, candidate_response);
-        });
-        });
+            // Start control server on first instance
+            static std::once_flag server_started;
+            std::call_once(server_started, []() {
+                WebRTCService::getInstance().initialize();
+                WebRTCService::getInstance().startControlServer("127.0.0.1", 9050);
+            });
+        }
         
-        // Create video track with H.264 description
-        auto video_desc = rtc::Description::Video("video", rtc::Description::Direction::SendOnly);
-        video_desc.addH264Codec(96, "profile-level-id=42e01f;level-asymmetry-allowed=1");
+        instance->initialized = true;
+        log_info("WebRTC plugin initialized for camera %u, stream %u", 
+               instance->camera_id, instance->stream_id);
         
-        auto video_track = client->peer_connection->addTrack(video_desc);
-        client->video_track = video_track;
-        
-        // Create RTP packetization config
-        auto rtp_config = std::make_shared<rtc::RtpPacketizationConfig>(
-            client->ssrc, "video", 96, 90000); // H.264 standard clock rate
-        
-        // Create RTCP SR reporter
-        client->sr_reporter = std::make_shared<rtc::RtcpSrReporter>(rtp_config);
-        
-        // Create H264 RTP packetizer
-        client->h264_packetizer = std::make_shared<rtc::H264RtpPacketizer>(
-            rtc::NalUnit::Separator::Length, rtp_config);
-        
-        // Chain the media handlers: H264 Packetizer -> RTCP SR Reporter
-        video_track->setMediaHandler(client->h264_packetizer);
-        client->h264_packetizer->addToChain(client->sr_reporter);
-        
-        log(inst, ZM_LOG_INFO, "Created WebRTC client %s with SSRC %u", client_id.c_str(), client->ssrc);
-        
-        return std::shared_ptr<WebRTCClient>(client.release());
+        return instance.release();
         
     } catch (const std::exception& e) {
-        log(inst, ZM_LOG_ERROR, "Failed to create WebRTC client %s: %s", client_id.c_str(), e.what());
+        log_error("Failed to initialize WebRTC plugin: %s", e.what());
         return nullptr;
     }
 }
 
-// Bridge communication functions
-static void write_bridge_response(WebRTCInstance* inst, const json& response) {
-    try {
-        // Ensure response directory exists
-        std::filesystem::create_directories(inst->bridge_response_dir);
-        
-        // Generate unique filename
-        auto now = std::chrono::system_clock::now();
-        auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-        
-        std::string filename = "response-" + std::to_string(timestamp) + "-" + 
-                              std::to_string(rand() % 10000) + ".json";
-        std::string filepath = inst->bridge_response_dir + "/" + filename;
-        
-        // Write response
-        std::ofstream file(filepath);
-        if (file.is_open()) {
-            file << response.dump(2);
-            file.close();
-            log(inst, ZM_LOG_DEBUG, "Wrote bridge response: %s", filename.c_str());
-        } else {
-            log(inst, ZM_LOG_ERROR, "Failed to write bridge response: %s", filepath.c_str());
-        }
-    } catch (const std::exception& e) {
-        log(inst, ZM_LOG_ERROR, "Error writing bridge response: %s", e.what());
+static void webrtc_shutdown(void* instance_ptr) {
+    if (instance_ptr) {
+        auto instance = static_cast<WebRTCPluginInstance*>(instance_ptr);
+        delete instance;
+        log_info("WebRTC plugin shutdown");
     }
 }
 
-static void handle_bridge_peer_request(WebRTCInstance* inst, const json& request) {
-    try {
-        std::string client_id = request["client_id"];
-        uint32_t stream_id = request.value("stream_id", 0);
-        std::string offer_sdp = request["offer_sdp"];
-        
-        log(inst, ZM_LOG_INFO, "Bridge: Creating peer for client %s, stream %u", 
-            client_id.c_str(), stream_id);
-        
-        // Create WebRTC client
-        auto client = create_webrtc_client(inst, client_id);
-        if (!client) {
-            json error_response = {
-                {"type", "webrtc_error"},
-                {"client_id", client_id},
-                {"error", "Failed to create WebRTC client"}
-            };
-            write_bridge_response(inst, error_response);
-            return;
-        }
-        
-        // Store client
-        {
-            std::lock_guard<std::mutex> lock(inst->clients_mutex);
-            inst->clients[client_id] = std::move(client);
-        }
-        
-        // Set remote description (offer)
-        auto pc = inst->clients[client_id]->peer_connection;
-        pc->setRemoteDescription(rtc::Description(offer_sdp, "offer"));
-        
-        // Create and set local description (answer)
-        auto local_desc = pc->localDescription();
-        if (local_desc) {
-            json answer_response = {
-                {"type", "webrtc_answer"},
-                {"client_id", client_id},
-                {"answer_sdp", std::string(*local_desc)}
-            };
-            write_bridge_response(inst, answer_response);
-            log(inst, ZM_LOG_INFO, "Bridge: Generated answer for client %s", client_id.c_str());
-        } else {
-            json error_response = {
-                {"type", "webrtc_error"},
-                {"client_id", client_id},
-                {"error", "Failed to generate answer"}
-            };
-            write_bridge_response(inst, error_response);
-        }
-        
-    } catch (const std::exception& e) {
-        log(inst, ZM_LOG_ERROR, "Error handling bridge peer request: %s", e.what());
-        
-        json error_response = {
-            {"type", "webrtc_error"},
-            {"client_id", request.value("client_id", "unknown")},
-            {"error", e.what()}
-        };
-        write_bridge_response(inst, error_response);
-    }
-}
-
-static void handle_bridge_ice_candidate(WebRTCInstance* inst, const json& request) {
-    try {
-        std::string client_id = request["client_id"];
-        auto candidate_data = request["candidate"];
-        
-        log(inst, ZM_LOG_DEBUG, "Bridge: Received ICE candidate for client %s", client_id.c_str());
-        
-        std::lock_guard<std::mutex> lock(inst->clients_mutex);
-        auto it = inst->clients.find(client_id);
-        if (it != inst->clients.end() && it->second->peer_connection) {
-            // Add remote ICE candidate
-            rtc::Candidate candidate(candidate_data["candidate"], candidate_data["sdpMid"]);
-            it->second->peer_connection->addRemoteCandidate(candidate);
-            log(inst, ZM_LOG_DEBUG, "Added ICE candidate for client %s", client_id.c_str());
-        } else {
-            log(inst, ZM_LOG_WARN, "Bridge: Client %s not found for ICE candidate", client_id.c_str());
-        }
-        
-    } catch (const std::exception& e) {
-        log(inst, ZM_LOG_ERROR, "Error handling bridge ICE candidate: %s", e.what());
-    }
-}
-
-static void handle_bridge_peer_remove(WebRTCInstance* inst, const json& request) {
-    try {
-        std::string client_id = request["client_id"];
-        
-        log(inst, ZM_LOG_INFO, "Bridge: Removing peer for client %s", client_id.c_str());
-        
-        std::lock_guard<std::mutex> lock(inst->clients_mutex);
-        auto it = inst->clients.find(client_id);
-        if (it != inst->clients.end()) {
-            if (it->second->peer_connection) {
-                it->second->peer_connection->close();
-            }
-            inst->clients.erase(it);
-            inst->clients_disconnected++;
-            log(inst, ZM_LOG_INFO, "Removed client %s", client_id.c_str());
-        }
-        
-    } catch (const std::exception& e) {
-        log(inst, ZM_LOG_ERROR, "Error handling bridge peer remove: %s", e.what());
-    }
-}
-
-static void process_bridge_event_file(WebRTCInstance* inst, const std::string& filepath) {
-    try {
-        std::ifstream file(filepath);
-        if (!file.is_open()) {
-            log(inst, ZM_LOG_ERROR, "Failed to open bridge event file: %s", filepath.c_str());
-            return;
-        }
-        
-        json event;
-        file >> event;
-        file.close();
-        
-        std::string event_type = event.value("type", "unknown");
-        log(inst, ZM_LOG_DEBUG, "Processing bridge event: %s", event_type.c_str());
-        
-        if (event_type == "webrtc_peer_request") {
-            handle_bridge_peer_request(inst, event);
-        } else if (event_type == "webrtc_ice_candidate") {
-            handle_bridge_ice_candidate(inst, event);
-        } else if (event_type == "webrtc_peer_remove") {
-            handle_bridge_peer_remove(inst, event);
-        } else {
-            log(inst, ZM_LOG_WARN, "Unknown bridge event type: %s", event_type.c_str());
-        }
-        
-        // Remove processed event file
-        std::filesystem::remove(filepath);
-        
-    } catch (const std::exception& e) {
-        log(inst, ZM_LOG_ERROR, "Error processing bridge event file: %s", e.what());
-    }
-}
-
-static void bridge_communication_thread(WebRTCInstance* inst) {
-    log(inst, ZM_LOG_INFO, "Bridge communication thread started");
+static int webrtc_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx, const char* json_cfg) {
+    if (!plugin || !host || !json_cfg) return -1;
     
-    // Ensure event directory exists
+    // Set global host API for logging
+    g_host_api = host;
+    g_host_ctx = host_ctx;
+    
     try {
-        std::filesystem::create_directories(inst->bridge_event_dir);
-        std::filesystem::create_directories(inst->bridge_response_dir);
-    } catch (const std::exception& e) {
-        log(inst, ZM_LOG_ERROR, "Failed to create bridge directories: %s", e.what());
-        return;
-    }
-    
-    while (inst->bridge_running) {
-        try {
-            // Check for new event files
-            for (const auto& entry : std::filesystem::directory_iterator(inst->bridge_event_dir)) {
-                if (entry.is_regular_file() && entry.path().extension() == ".json") {
-                    process_bridge_event_file(inst, entry.path().string());
-                }
-            }
-            
-            // Sleep for a short time before checking again
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            
-        } catch (const std::exception& e) {
-            log(inst, ZM_LOG_ERROR, "Error in bridge communication thread: %s", e.what());
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-    }
-    
-    log(inst, ZM_LOG_INFO, "Bridge communication thread stopped");
-}
-
-static void process_metadata_json(WebRTCInstance* inst, const char* buf, size_t size) {
-    try {
-        std::string js(buf, size);
-        auto j = json::parse(js);
-        if (j.value("event", "") == "StreamMetadata") {
-            uint32_t metadata_stream_id = j.value("stream_id", 0);
-            
-            // Filter metadata based on stream_filter (if configured)
-            if (!inst->stream_filter.empty()) {
-                bool should_accept = std::find(inst->stream_filter.begin(), 
-                                             inst->stream_filter.end(), 
-                                             metadata_stream_id) != inst->stream_filter.end();
-                if (!should_accept) {
-                    log(inst, ZM_LOG_DEBUG, "Ignoring metadata for stream_id=%u (not in filter list)", metadata_stream_id);
-                    return;
-                }
-            }
-            
-            std::lock_guard<std::mutex> lock(inst->metadata_mutex);
-            
-            log(inst, ZM_LOG_INFO, "Processing WebRTC metadata for stream_id=%u", metadata_stream_id);
-            
-            if (inst->metadata_codecpar)
-                avcodec_parameters_free(&inst->metadata_codecpar);
-            inst->metadata_codecpar = avcodec_parameters_alloc();
-            inst->metadata_codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
-            inst->metadata_codecpar->codec_id   = j["codec_id"];
-            inst->metadata_codecpar->width      = j["width"];
-            inst->metadata_codecpar->height     = j["height"];
-            inst->metadata_codecpar->format     = j["pix_fmt"];
-            inst->metadata_codecpar->profile    = j["profile"];
-            inst->metadata_codecpar->level      = j["level"];
-            
-            auto ed_b64 = j["extradata"].get<std::string>();
-            if (!ed_b64.empty()) {
-                size_t max_out_size = (ed_b64.length() * 3) / 4 + 1;
-                uint8_t* out_buf = (uint8_t*)av_mallocz(max_out_size + AV_INPUT_BUFFER_PADDING_SIZE);
-                
-                if (out_buf) {
-                    int decoded_size = av_base64_decode(out_buf, ed_b64.c_str(), max_out_size);
-                    
-                    if (decoded_size > 0) {
-                        inst->metadata_codecpar->extradata = out_buf;
-                        inst->metadata_codecpar->extradata_size = decoded_size;
-                        log(inst, ZM_LOG_DEBUG, "WebRTC: decoded %d bytes of extradata", decoded_size);
-                    } else {
-                        av_free(out_buf);
-                        inst->metadata_codecpar->extradata = nullptr;
-                        inst->metadata_codecpar->extradata_size = 0;
-                    }
-                }
-            }
-            
-            inst->has_metadata = true;
-            log(inst, ZM_LOG_INFO, "WebRTC: received metadata, codec %d %dx%d",
-                inst->metadata_codecpar->codec_id,
-                inst->metadata_codecpar->width,
-                inst->metadata_codecpar->height);
-        }
-    } catch (const std::exception& e) {
-        log(inst, ZM_LOG_WARN, "Failed to parse JSON metadata in WebRTC: %s", e.what());
-    }
-}
-
-static void send_frame_to_clients(WebRTCInstance* inst, const std::vector<uint8_t>& frame_data, 
-                                 uint64_t timestamp, bool is_keyframe) {
-    std::lock_guard<std::mutex> lock(inst->clients_mutex);
-    
-    if (inst->clients.empty()) {
-        return;
-    }
-    
-    auto now = std::chrono::steady_clock::now();
-    
-    for (auto& [client_id, client] : inst->clients) {
-        if (!client->is_connected || !client->video_track) {
-            continue;
-        }
+        // Parse configuration
+        json config = json::parse(json_cfg);
+        uint32_t camera_id = config.value("camera_id", 0);
+        uint32_t stream_id = config.value("stream_id", 0);
+        std::string codec = config.value("codec", "h264");
         
-        try {
-            // Update activity timestamp
-            client->last_activity = now;
-            
-            // Create RTP packet - convert unsigned char to std::byte
-            rtc::binary rtp_data;
-            rtp_data.reserve(frame_data.size());
-            for (unsigned char byte : frame_data) {
-                rtp_data.push_back(static_cast<std::byte>(byte));
-            }
-            
-            // Send via video track
-            if (client->video_track->send(rtp_data)) {
-                inst->frames_sent++;
-                inst->bytes_sent += frame_data.size();
-                
-                if (is_keyframe) {
-                    log(inst, ZM_LOG_DEBUG, "Sent keyframe to client %s (%zu bytes)", 
-                        client_id.c_str(), frame_data.size());
-                }
-            } else {
-                log(inst, ZM_LOG_WARN, "Failed to send frame to client %s", client_id.c_str());
-            }
-            
-        } catch (const std::exception& e) {
-            log(inst, ZM_LOG_ERROR, "Error sending frame to client %s: %s", 
-                client_id.c_str(), e.what());
-        }
-    }
-}
-
-static void frame_processing_thread(WebRTCInstance* inst) {
-    log(inst, ZM_LOG_INFO, "WebRTC frame processing thread started");
-    
-    while (!inst->should_stop) {
-        std::unique_lock<std::mutex> lock(inst->frame_mutex);
-        inst->frame_cv.wait(lock, [inst] { 
-            return !inst->frame_queue.empty() || inst->should_stop; 
+        // Create plugin instance
+        auto instance = new WebRTCPluginInstance(camera_id, stream_id, codec);
+        plugin->instance = instance;
+        
+        // Initialize the WebRTC service singleton and start control server (once)
+        static std::once_flag server_started;
+        std::call_once(server_started, []() {
+            WebRTCService::getInstance().initialize();
+            WebRTCService::getInstance().startControlServer("127.0.0.1", 9050);
         });
         
-        if (inst->should_stop) {
-            break;
-        }
+        // Register stream
+        WebRTCService::getInstance().registerStream(camera_id, stream_id, codec, nullptr);
         
-        while (!inst->frame_queue.empty()) {
-            auto frame_data = std::move(inst->frame_queue.front());
-            inst->frame_queue.pop();
-            lock.unlock();
-            
-            // Parse frame header
-            if (frame_data.size() < sizeof(zm_frame_hdr_t)) {
-                lock.lock();
-                continue;
-            }
-            
-            const zm_frame_hdr_t* hdr = reinterpret_cast<const zm_frame_hdr_t*>(frame_data.data());
-            const uint8_t* payload = frame_data.data() + sizeof(zm_frame_hdr_t);
-            
-            bool is_keyframe = (hdr->flags & 1) != 0;
-            
-            // Send to all connected clients
-            std::vector<uint8_t> payload_data(payload, payload + hdr->bytes);
-            send_frame_to_clients(inst, payload_data, hdr->pts_usec, is_keyframe);
-            
-            lock.lock();
-        }
-        
-        // Cleanup disconnected clients periodically
-        static auto last_cleanup = std::chrono::steady_clock::now();
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_cleanup).count() > 10) {
-            lock.unlock();
-            cleanup_disconnected_clients(inst);
-            last_cleanup = now;
-            lock.lock();
-        }
-    }
-    
-    log(inst, ZM_LOG_INFO, "WebRTC frame processing thread stopped");
-}
-
-static int handle_plugin_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx, const char* json_cfg) {
-    auto inst = new WebRTCInstance;
-    inst->host = host;
-    inst->host_ctx = host_ctx;
-    
-    try {
-        auto j = json::parse(json_cfg);
-        inst->bind_address = j.value("bind_address", "0.0.0.0");
-        inst->port = j.value("port", 8080);
-        inst->ice_servers = j.value("ice_servers", "");
-        inst->max_clients = j.value("max_clients", 10);
-        inst->client_timeout_seconds = j.value("client_timeout_seconds", 30);
-        inst->enable_simulcast = j.value("enable_simulcast", false);
-        
-        // Parse stream filter if provided
-        if (j.contains("stream_filter") && j["stream_filter"].is_array()) {
-            for (const auto& sid : j["stream_filter"]) {
-                if (sid.is_number_unsigned()) {
-                    inst->stream_filter.push_back(sid.get<uint32_t>());
-                }
-            }
-            log(inst, ZM_LOG_INFO, "WebRTC stream filter configured for %zu streams", 
-                inst->stream_filter.size());
-        }
+        log_info("WebRTC plugin started for camera %u, stream %u", camera_id, stream_id);
+        return 0;
         
     } catch (const std::exception& e) {
-        log(inst, ZM_LOG_ERROR, "Invalid WebRTC config JSON: %s", e.what());
-        delete inst;
+        log_error("Failed to start WebRTC plugin: %s", e.what());
         return -1;
     }
-    
-    // Initialize libdatachannel
-    try {
-        rtc::InitLogger(rtc::LogLevel::Warning);
-        setup_ice_servers(inst);
-        
-        // Start frame processing thread
-        inst->processing_thread = std::thread(frame_processing_thread, inst);
-        
-        // Start bridge communication thread
-        inst->bridge_running = true;
-        inst->bridge_thread = std::thread(bridge_communication_thread, inst);
-        
-        log(inst, ZM_LOG_INFO, "WebRTC output plugin started on %s:%d (max_clients=%d)", 
-            inst->bind_address.c_str(), inst->port, inst->max_clients);
-        log(inst, ZM_LOG_INFO, "Bridge communication enabled: events=%s, responses=%s",
-            inst->bridge_event_dir.c_str(), inst->bridge_response_dir.c_str());
-            
-        // Publish status event
-        json status_event = {
-            {"event", "WebRTCStarted"},
-            {"bind_address", inst->bind_address},
-            {"port", inst->port},
-            {"max_clients", inst->max_clients},
-            {"bridge_enabled", true}
-        };
-        if (inst->host && inst->host->publish_evt) {
-            inst->host->publish_evt(inst->host_ctx, status_event.dump().c_str());
-        }
-        
-    } catch (const std::exception& e) {
-        log(inst, ZM_LOG_ERROR, "Failed to initialize WebRTC: %s", e.what());
-        delete inst;
-        return -1;
-    }
-    
-    plugin->instance = inst;
-    return 0;
 }
 
-static void handle_plugin_stop(zm_plugin_t* plugin) {
+static void webrtc_stop(zm_plugin_t* plugin) {
     if (!plugin || !plugin->instance) return;
     
-    auto inst = static_cast<WebRTCInstance*>(plugin->instance);
+    auto instance = static_cast<WebRTCPluginInstance*>(plugin->instance);
+    WebRTCService::getInstance().unregisterStream(instance->camera_id, instance->stream_id);
     
-    log(inst, ZM_LOG_INFO, "Stopping WebRTC output plugin");
+    log_info("WebRTC plugin stopped for camera %u, stream %u", 
+           instance->camera_id, instance->stream_id);
     
-    // Signal threads to stop
-    inst->should_stop = true;
-    inst->bridge_running = false;
-    inst->frame_cv.notify_all();
-    
-    // Wait for threads to finish
-    if (inst->processing_thread.joinable()) {
-        inst->processing_thread.join();
-    }
-    if (inst->bridge_thread.joinable()) {
-        inst->bridge_thread.join();
-    }
-    
-    // Cleanup clients
-    {
-        std::lock_guard<std::mutex> lock(inst->clients_mutex);
-        for (auto& [client_id, client] : inst->clients) {
-            if (client->peer_connection) {
-                client->peer_connection->close();
-            }
-        }
-        inst->clients.clear();
-    }
-    
-    // Cleanup metadata
-    if (inst->metadata_codecpar) {
-        avcodec_parameters_free(&inst->metadata_codecpar);
-    }
-    
-    // Publish final statistics
-    json stats_event = {
-        {"event", "WebRTCStats"},
-        {"frames_sent", inst->frames_sent},
-        {"bytes_sent", inst->bytes_sent},
-        {"clients_connected", inst->clients_connected},
-        {"clients_disconnected", inst->clients_disconnected}
-    };
-    if (inst->host && inst->host->publish_evt) {
-        inst->host->publish_evt(inst->host_ctx, stats_event.dump().c_str());
-    }
-    
-    log(inst, ZM_LOG_INFO, "WebRTC plugin stopped. Stats: frames=%lu, bytes=%lu, clients=%lu", 
-        inst->frames_sent, inst->bytes_sent, inst->clients_connected);
-    
-    delete inst;
+    delete instance;
     plugin->instance = nullptr;
 }
 
-static void handle_on_frame(zm_plugin_t* plugin, const void* buf, size_t size) {
-    if (!plugin || !plugin->instance || !buf || size < sizeof(zm_frame_hdr_t)) {
-        return;
-    }
+static void webrtc_on_frame(zm_plugin_t* plugin, const void* buf, size_t size) {
+    if (!plugin || !plugin->instance || !buf || size < sizeof(zm_frame_hdr_t)) return;
     
-    auto inst = static_cast<WebRTCInstance*>(plugin->instance);
-    const zm_frame_hdr_t* hdr = static_cast<const zm_frame_hdr_t*>(buf);
-    const char* payload = static_cast<const char*>(buf) + sizeof(zm_frame_hdr_t);
+    auto instance = static_cast<WebRTCPluginInstance*>(plugin->instance);
+    const zm_frame_hdr_t* frame_hdr = static_cast<const zm_frame_hdr_t*>(buf);
+    const uint8_t* frame_data = static_cast<const uint8_t*>(buf) + sizeof(zm_frame_hdr_t);
+    size_t frame_size = size - sizeof(zm_frame_hdr_t);
     
-    // Check if this is JSON metadata
-    if (hdr->bytes > 0 && payload[0] == '{') {
-        process_metadata_json(inst, payload, hdr->bytes);
-        return;
-    }
-    
-    // Filter streams if configured
-    if (!inst->stream_filter.empty()) {
-        bool should_accept = std::find(inst->stream_filter.begin(), 
-                                     inst->stream_filter.end(), 
-                                     hdr->stream_id) != inst->stream_filter.end();
-        if (!should_accept) {
-            return;
-        }
-    }
-    
-    // Only process if we have connected clients
-    {
-        std::lock_guard<std::mutex> lock(inst->clients_mutex);
-        if (inst->clients.empty()) {
-            return;
-        }
-    }
-    
-    // Only process if we have metadata
-    {
-        std::lock_guard<std::mutex> lock(inst->metadata_mutex);
-        if (!inst->has_metadata) {
-            return;
-        }
-    }
-    
-    // Queue frame for processing
-    {
-        std::lock_guard<std::mutex> lock(inst->frame_mutex);
-        
-        // Limit queue size to prevent memory issues
-        if (inst->frame_queue.size() > 100) {
-            inst->frame_queue.pop(); // Remove oldest frame
-        }
-        
-        // Copy frame data
-        std::vector<uint8_t> frame_data(static_cast<const uint8_t*>(buf), 
-                                       static_cast<const uint8_t*>(buf) + size);
-        inst->frame_queue.push(std::move(frame_data));
-    }
-    
-    inst->frame_cv.notify_one();
+    WebRTCService::getInstance().pushFrame(frame_hdr, frame_data, frame_size);
 }
 
-// Export plugin interface
+// =============================================================================
+// PLUGIN EXPORT
+// =============================================================================
+
 extern "C" {
-    void zm_plugin_init(zm_plugin_t* plugin) {
+    __attribute__((visibility("default"))) void zm_plugin_init(zm_plugin_t* plugin) {
+        if (!plugin) return;
         plugin->version = 1;
         plugin->type = ZM_PLUGIN_OUTPUT;
-        plugin->start = handle_plugin_start;
-        plugin->stop = handle_plugin_stop;
-        plugin->on_frame = handle_on_frame;
+        plugin->start = webrtc_start;
+        plugin->stop = webrtc_stop;
+        plugin->on_frame = webrtc_on_frame;
         plugin->instance = nullptr;
     }
 }
