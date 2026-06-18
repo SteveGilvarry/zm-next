@@ -707,26 +707,24 @@ void StreamManager::publish_stream_metadata(uint32_t stream_id, const AVCodecPar
 
     // Create StreamMetadata JSON event. "media" ("video"/"audio") lets the core
     // route this to a video or audio Hello; audio carries sample_rate/channels.
-    char metadata_json[1024];
-    snprintf(metadata_json, sizeof(metadata_json),
-             "{\"event\":\"StreamMetadata\",\"media\":\"%s\",\"stream_id\":%u,"
-             "\"codec_id\":%d,\"width\":%d,\"height\":%d,"
-             "\"pix_fmt\":%d,\"profile\":%d,\"level\":%d,"
-             "\"sample_rate\":%d,\"channels\":%d,"
-             "\"extradata\":\"%s\"}",
-             media ? media : "video",
-             stream_id,
-             codecpar->codec_id,
-             codecpar->width,
-             codecpar->height,
-             codecpar->format,
-             codecpar->profile,
-             codecpar->level,
-             codecpar->sample_rate,
-             codecpar->ch_layout.nb_channels,
-             extradata_b64.c_str());
+    // Built as a dynamic std::string (NOT a fixed snprintf buffer): HEVC/AV1
+    // extradata base64 routinely exceeds a kilobyte, and a truncated buffer yields
+    // invalid JSON that every consumer's json::parse silently rejects — losing the
+    // codec id and extradata. base64 and integers need no JSON escaping.
+    const std::string metadata_json =
+        std::string("{\"event\":\"StreamMetadata\",\"media\":\"") + (media ? media : "video") + "\","
+        + "\"stream_id\":" + std::to_string(stream_id) + ","
+        + "\"codec_id\":" + std::to_string(static_cast<int>(codecpar->codec_id)) + ","
+        + "\"width\":" + std::to_string(codecpar->width) + ","
+        + "\"height\":" + std::to_string(codecpar->height) + ","
+        + "\"pix_fmt\":" + std::to_string(codecpar->format) + ","
+        + "\"profile\":" + std::to_string(codecpar->profile) + ","
+        + "\"level\":" + std::to_string(codecpar->level) + ","
+        + "\"sample_rate\":" + std::to_string(codecpar->sample_rate) + ","
+        + "\"channels\":" + std::to_string(codecpar->ch_layout.nb_channels) + ","
+        + "\"extradata\":\"" + extradata_b64 + "\"}";
 
-    host_api_->publish_evt(host_ctx_, metadata_json);
+    host_api_->publish_evt(host_ctx_, metadata_json.c_str());
 
     log(ZM_LOG_INFO, "Published %s metadata for stream %u: codec=%s",
         media ? media : "video", stream_id,

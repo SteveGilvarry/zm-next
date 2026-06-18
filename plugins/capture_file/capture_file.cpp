@@ -51,6 +51,14 @@ struct CaptureFileContext {
 
     uint64_t frames_emitted = 0;
 
+    // Loop replay must present a MONOTONIC timeline: seeking back to the start
+    // resets packet PTS to ~0, which would make downstream PTS go backwards (and
+    // e.g. the muxer reject every frame with EINVAL). We add this accumulating
+    // offset so each loop continues where the previous pass ended.
+    int64_t pts_offset_usec = 0;
+    int64_t last_emitted_pts_usec = 0;
+    int64_t frame_dur_usec = 33333;  // refined from the stream's frame rate at open
+
     void log(zm_log_level_t level, const char* fmt, ...) {
         if (!host_api || !host_api->log) return;
         char buf[1024];
@@ -78,22 +86,21 @@ void publish_stream_metadata(CaptureFileContext* ctx, const AVCodecParameters* c
         extradata_b64 = std::string(b64buf.data());
     }
 
-    char metadata_json[2048];
-    snprintf(metadata_json, sizeof(metadata_json),
-             "{\"event\":\"StreamMetadata\",\"stream_id\":%u,"
-             "\"codec_id\":%d,\"width\":%d,\"height\":%d,"
-             "\"pix_fmt\":%d,\"profile\":%d,\"level\":%d,"
-             "\"extradata\":\"%s\"}",
-             ctx->stream_id,
-             static_cast<int>(codecpar->codec_id),
-             codecpar->width,
-             codecpar->height,
-             codecpar->format,
-             codecpar->profile,
-             codecpar->level,
-             extradata_b64.c_str());
-
-    ctx->host_api->publish_evt(ctx->host_ctx, metadata_json);
+    // Build with nlohmann/json (NOT a fixed snprintf buffer): HEVC/AV1 extradata
+    // base64 can exceed a kilobyte, and a truncated buffer yields invalid JSON that
+    // every consumer's json::parse silently rejects (codec + extradata lost).
+    nlohmann::json meta = {
+        {"event", "StreamMetadata"},
+        {"stream_id", ctx->stream_id},
+        {"codec_id", static_cast<int>(codecpar->codec_id)},
+        {"width", codecpar->width},
+        {"height", codecpar->height},
+        {"pix_fmt", codecpar->format},
+        {"profile", codecpar->profile},
+        {"level", codecpar->level},
+        {"extradata", extradata_b64},
+    };
+    ctx->host_api->publish_evt(ctx->host_ctx, meta.dump().c_str());
 
     ctx->log(ZM_LOG_INFO, "Published metadata for stream %u: %dx%d, codec=%s",
              ctx->stream_id, codecpar->width, codecpar->height,
@@ -112,13 +119,17 @@ void emit_packet(CaptureFileContext* ctx, AVPacket* pkt, AVStream* stream) {
     hdr.bytes = static_cast<uint32_t>(pkt->size);
     hdr.flags = (pkt->flags & AV_PKT_FLAG_KEY) ? 1u : 0u;
 
+    int64_t base_usec;
     if (pkt->pts != AV_NOPTS_VALUE && stream->time_base.den > 0) {
-        hdr.pts_usec = av_rescale_q(pkt->pts, stream->time_base, AVRational{1, 1000000});
+        base_usec = av_rescale_q(pkt->pts, stream->time_base, AVRational{1, 1000000});
     } else if (pkt->dts != AV_NOPTS_VALUE && stream->time_base.den > 0) {
-        hdr.pts_usec = av_rescale_q(pkt->dts, stream->time_base, AVRational{1, 1000000});
+        base_usec = av_rescale_q(pkt->dts, stream->time_base, AVRational{1, 1000000});
     } else {
-        hdr.pts_usec = static_cast<uint64_t>(av_gettime());
+        base_usec = av_gettime();
     }
+    // Apply the loop offset so the timeline never runs backwards across replays.
+    hdr.pts_usec = static_cast<uint64_t>(base_usec + ctx->pts_offset_usec);
+    ctx->last_emitted_pts_usec = base_usec + ctx->pts_offset_usec;
 
     std::vector<uint8_t> frame_buf(sizeof(zm_frame_hdr_t) + pkt->size);
     std::memcpy(frame_buf.data(), &hdr, sizeof(zm_frame_hdr_t));
@@ -203,6 +214,9 @@ void replay_loop(CaptureFileContext* ctx) {
                     ctx->log(ZM_LOG_ERROR, "Seek to start failed: %s, stopping", err_buf);
                     break;
                 }
+                // Continue the emitted timeline past the last frame of this pass so
+                // downstream PTS stays monotonic across the loop boundary.
+                ctx->pts_offset_usec = ctx->last_emitted_pts_usec + ctx->frame_dur_usec;
                 // Re-anchor pacing for the new pass through the file.
                 pace_origin = std::chrono::steady_clock::now();
                 first_pts_usec = -1;
@@ -258,6 +272,11 @@ bool open_input(CaptureFileContext* ctx) {
     }
 
     AVStream* video_stream = ctx->fmt_ctx->streams[ctx->video_stream_index];
+    // Frame duration (for the loop-continuity offset) from the stream's frame rate.
+    if (video_stream->avg_frame_rate.num > 0 && video_stream->avg_frame_rate.den > 0) {
+        ctx->frame_dur_usec = av_rescale_q(1, av_inv_q(video_stream->avg_frame_rate),
+                                           AVRational{1, 1000000});
+    }
     publish_stream_metadata(ctx, video_stream->codecpar);
     // Note: packets are forwarded in their native container form (AVCC for
     // MP4/MOV, Annex-B for MPEG-TS/RTSP). The StreamMetadata carries the codec
