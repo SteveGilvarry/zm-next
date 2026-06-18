@@ -205,6 +205,16 @@ static void close_file(StoreInstance* inst) {
 static bool open_file(StoreInstance* inst, std::time_t t) {
     inst->cur_path = make_path(inst->root, inst->monitor_id, t);
     fs::create_directories(fs::path(inst->cur_path).parent_path());
+    // The filename has 1-second resolution; if a previous segment rotated within
+    // the same wall-clock second (small max_secs, or fast replay) the path would
+    // collide and silently overwrite. Disambiguate with a -N suffix.
+    if (fs::exists(inst->cur_path)) {
+        const auto stem = inst->cur_path.substr(0, inst->cur_path.size() - 4);  // strip ".mkv"
+        for (int n = 2;; ++n) {
+            std::string cand = stem + "-" + std::to_string(n) + ".mkv";
+            if (!fs::exists(cand)) { inst->cur_path = cand; break; }
+        }
+    }
     AVFormatContext* ctx = nullptr;
     if (avformat_alloc_output_context2(&ctx, nullptr, "matroska", inst->cur_path.c_str()) < 0 || !ctx) {
         log(inst, ZM_LOG_ERROR, "Failed to alloc output context for %s", inst->cur_path.c_str());
@@ -239,7 +249,7 @@ static void add_audio_stream_if_available(StoreInstance* inst);
 static bool initialize_video_stream(StoreInstance* inst);
 static void cache_keyframe(StoreInstance* inst, const zm_frame_hdr_t* hdr, const uint8_t* payload);
 static void write_frame_to_file(StoreInstance* inst, const zm_frame_hdr_t* hdr, const uint8_t* payload);
-static void check_segment_rotation(StoreInstance* inst);
+static bool maybe_rotate_segment(StoreInstance* inst, const zm_frame_hdr_t* hdr);
 
 // The main plugin initialization function
 extern "C" __attribute__((visibility("default"))) void zm_plugin_init(zm_plugin_t* plug) {
@@ -598,27 +608,31 @@ static void write_frame_to_file(StoreInstance* inst,
 }
 
 
-// Check if segment needs rotation
-static void check_segment_rotation(StoreInstance* inst, const zm_frame_hdr_t* hdr) {
-    if (!inst->file_open) {
-        return; // Can't rotate if file isn't open
-    }
-    
-    inst->last_pts = hdr->pts_usec;   // keep this fresh for rotation
-    // compute elapsed based on recorded timestamps
-    int64_t elapsed = (inst->last_pts - inst->start_ts) / 1000000;
+// Rotate the segment at a keyframe boundary once it reaches max_secs (or at
+// midnight). Called BEFORE writing the current frame and ONLY for keyframes, so
+// each new file starts cleanly at a keyframe — no frames dropped waiting for the
+// next IDR, and no empty trailing segment. Returns true if a rotation occurred
+// (the caller must then (re)write the header for the new file).
+static bool maybe_rotate_segment(StoreInstance* inst, const zm_frame_hdr_t* hdr) {
+    if (!inst->file_open || !inst->header_written) return false;
+    if (!(hdr->flags & 1)) return false;          // only split on keyframes
+    // NB: do not gate on start_ts==0 — file replay legitimately starts at pts 0,
+    // so that sentinel would disable rotation entirely. header_written already
+    // means the segment is active with a valid start_ts.
+
+    int64_t elapsed = (hdr->pts_usec - inst->start_ts) / 1000000;
     std::time_t now = std::time(nullptr);
     std::tm tm = *std::localtime(&now);
-    
-    if (elapsed >= inst->max_secs || (tm.tm_hour == 0 && tm.tm_min == 0 && tm.tm_sec < 2)) {
-        log(inst, ZM_LOG_INFO, "Segment duration reached or midnight, closing and opening new file");
-        
-        close_file(inst);
-        open_file(inst, now);
-        
-        inst->header_written = false;
-        inst->waiting_for_keyframe = false;
-    }
+    if (elapsed < inst->max_secs && !(tm.tm_hour == 0 && tm.tm_min == 0 && tm.tm_sec < 2))
+        return false;
+
+    log(inst, ZM_LOG_INFO, "Segment boundary (elapsed=%llds) — rotating at keyframe",
+        (long long)elapsed);
+    close_file(inst);
+    if (!open_file(inst, now)) return false;
+    inst->header_written = false;
+    inst->waiting_for_keyframe = false;
+    return true;
 }
 
 // Process an actual video frame
@@ -672,6 +686,12 @@ static void process_video_frame(StoreInstance* inst, const zm_frame_hdr_t* hdr, 
         if (!open_file(inst, std::time(nullptr))) return;
     }
 
+    // Rotate at this keyframe if the current segment is full (closes the old file
+    // and opens a fresh one; the header block below re-initializes it). This MUST
+    // run before cache_keyframe: close_file frees last_keyframe, so caching after
+    // rotation ensures the new segment has its starting keyframe to write.
+    maybe_rotate_segment(inst, hdr);
+
     // Handle keyframes
     if (hdr->flags & 1) {
         cache_keyframe(inst, hdr, payload);
@@ -689,8 +709,16 @@ static void process_video_frame(StoreInstance* inst, const zm_frame_hdr_t* hdr, 
             log(inst, ZM_LOG_INFO, "Setting initial timestamp: %" PRId64, inst->start_ts);
         }
         
-        // Write cached keyframe if we have one
+        // Write cached keyframe if we have one. Its pts is absolute microseconds;
+        // rebase to this segment's start_ts and rescale to the stream timebase, so
+        // it is consistent with the frames written via write_frame_to_file below
+        // (otherwise the raw µs pts is non-monotonic against them → EINVAL on every
+        // subsequent frame, which broke every segment after the first).
         if (inst->last_keyframe) {
+            int64_t rel = inst->last_keyframe->pts - inst->start_ts;
+            if (rel < 0) rel = 0;
+            inst->last_keyframe->pts = inst->last_keyframe->dts =
+                av_rescale_q(rel, (AVRational){1, 1000000}, inst->video_stream->time_base);
             inst->last_keyframe->stream_index = inst->video_stream->index;
             int ret = av_interleaved_write_frame(inst->fmt_ctx.get(), inst->last_keyframe);
             if (ret < 0) {
@@ -715,9 +743,6 @@ static void process_video_frame(StoreInstance* inst, const zm_frame_hdr_t* hdr, 
     // 3. We've seen at least one keyframe (header_written also implies this in our implementation)
     if (inst->header_written && inst->video_stream) {
         write_frame_to_file(inst, hdr, payload);
-        
-        // Only update timestamps and check rotation once we're properly writing frames
-        check_segment_rotation(inst, hdr);
     }
 }
 

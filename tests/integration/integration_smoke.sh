@@ -146,6 +146,29 @@ kill -0 $WPID 2>/dev/null && pass "worker still alive (no crash on dead input)" 
 kill $WPID 2>/dev/null; wait $WPID 2>/dev/null
 
 # ---------------------------------------------------------------------------
+echo "[7] segment rotation (keyframe-aligned, no frame loss)"
+# 5s clip, max_secs=2 -> ~3 keyframe-aligned segments that together hold every
+# frame, each a valid mkv (regression for the rotation bug chain).
+cat > "$WORK/rot.json" <<JSON
+{"name":"rot","root":true,"plugins":[
+ {"id":"cap","kind":"capture_file","cfg":{"path":"$WORK/h264.mp4","stream_id":0,"loop":false,"realtime":false},
+  "children":[
+   {"id":"st","kind":"store_filesystem","cfg":{"root":"$WORK/rot_rec","monitor_id":707,"max_secs":2},"queue_depth":120}]}]}
+JSON
+"$ZMCORE" --pipeline "$WORK/rot.json" --socket "$WORK/s707.sock" --monitor-id 707 >"$WORK/c707.log" 2>&1 &
+WPID=$!; PIDS+=("$WPID"); wait_sock "$WORK/s707.sock"; sleep 4; kill $WPID 2>/dev/null; wait $WPID 2>/dev/null
+NSEG=$(find "$WORK/rot_rec" -name '*.mkv' -type f 2>/dev/null | wc -l | tr -d ' ')
+TOT=0; BAD=0
+for f in $(find "$WORK/rot_rec" -name '*.mkv' -type f 2>/dev/null); do
+  P=$(pkt_count "$f"); TOT=$((TOT + ${P:-0})); ffprobe -v error "$f" >/dev/null 2>&1 || BAD=$((BAD + 1))
+done
+[ "$NSEG" -ge 2 ] && pass "rotated into $NSEG segments" || fail "expected multiple segments, got $NSEG"
+[ "$TOT" = "$SRC_PKTS" ] && pass "segments hold all $TOT frames (no loss across rotation)" \
+                         || fail "segments hold $TOT frames != source $SRC_PKTS"
+[ "$BAD" = "0" ] && pass "all segments are valid mkv" || fail "$BAD corrupt/empty segment(s)"
+grep -q "Error writing frame" "$WORK/c707.log" && fail "write errors during rotation" || pass "no write errors during rotation"
+
+# ---------------------------------------------------------------------------
 echo "[6] audio carried end-to-end [B4]"
 if ffmpeg -y -f lavfi -i testsrc=duration=4:size=640x480:rate=15 \
           -f lavfi -i sine=frequency=1000:duration=4 \
