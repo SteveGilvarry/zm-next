@@ -25,6 +25,24 @@ TEST(EventBusTest, BasicSubscribePublish) {
     EXPECT_EQ(rec2[1], "world");
 }
 
+TEST(EventBusTest, Unsubscribe) {
+    auto& bus = EventBus::instance();
+    std::vector<std::string> rec;
+    auto id = bus.subscribe("unsub_chan", [&rec](const std::string& m) { rec.push_back(m); });
+
+    bus.publish("unsub_chan", "a");
+    bus.unsubscribe("unsub_chan", id);
+    bus.publish("unsub_chan", "b");  // should NOT be delivered
+
+    ASSERT_EQ(rec.size(), 1u);
+    EXPECT_EQ(rec[0], "a");
+
+    // Unsubscribing an unknown id is a harmless no-op.
+    bus.unsubscribe("unsub_chan", 999999);
+    bus.unsubscribe("no_such_chan", id);
+    SUCCEED();
+}
+
 TEST(EventBusTest, NoSubscribers) {
     auto& bus = EventBus::instance();
     // Should not crash or throw if no subscribers

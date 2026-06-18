@@ -1409,6 +1409,10 @@ static void mse_on_frame(zm_plugin_t* plugin, const void* buf, size_t size) {
     
     OutputMSEPlugin* plugin_instance = static_cast<OutputMSEPlugin*>(plugin->instance);
     const zm_frame_hdr_t* hdr = static_cast<const zm_frame_hdr_t*>(buf);
+    // This output handles compressed video only; ignore audio (and other) frames
+    // now that the pipeline carries audio. (Audio streaming is handled via the
+    // worker link / zm-api front door.)
+    if (hdr->hw_type == ZM_FRAME_COMPRESSED_AUDIO) return;
     const uint8_t* payload = static_cast<const uint8_t*>(buf) + sizeof(zm_frame_hdr_t);
     size_t payload_size = size - sizeof(zm_frame_hdr_t);
     

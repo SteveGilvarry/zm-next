@@ -1,4 +1,7 @@
 #include "zm/CaptureThread.hpp"
+#include "zm/EventBus.hpp"
+#include "zm/WorkerLink.hpp"
+#include "zm/StageRunner.hpp"
 #include <cstring>
 #include <iostream>
 #include <chrono>
@@ -26,12 +29,12 @@ struct FrameData {
 
 // Static callback for frame data from plugin to ShmRing
 // Adapter to match zm_host_api_t::on_frame signature
-// Adapter for host_api.publish_evt to push JSON events into ring
-static void host_api_publish_evt_adapter(void* host_ctx, const char* json_event) {
-    if (!host_ctx || !json_event) return;
-    ShmRing* ring = static_cast<ShmRing*>(host_ctx);
-    size_t len = strlen(json_event);
-    ring->push(json_event, len);
+// Adapter for host_api.publish_evt: route input-plugin events to the in-process
+// EventBus (the single telemetry source), NOT the frame ring. The control
+// socket subscribes to the bus and forwards events to the orchestrating daemon.
+static void host_api_publish_evt_adapter(void* /*host_ctx*/, const char* json_event) {
+    if (!json_event) return;
+    EventBus::instance().publish("plugin_event", json_event);
 }
 // Adapter to match zm_host_api_t::on_frame signature
 static void host_api_on_frame_adapter(void* host_ctx, const void* frame_buf, size_t frame_size) {
@@ -52,12 +55,14 @@ static void host_api_on_frame_adapter(void* host_ctx, const void* frame_buf, siz
 
 CaptureThread::CaptureThread(zm_plugin_t* inputPlugin,
                              ShmRing& ring,
-                             const std::vector<zm_plugin_t*>& outputs,
-                             const std::string& inputConfig)
+                             const std::vector<StageRunner*>& outputs,
+                             const std::string& inputConfig,
+                             WorkerLink* link)
     : inputPlugin_(inputPlugin)
     , ring_(ring)
     , outputs_(outputs)
-    , inputConfig_(inputConfig) {
+    , inputConfig_(inputConfig)
+    , link_(link) {
     // No need to register legacy frame callback; host_api->on_frame is used for input plugins
 }
 
@@ -74,6 +79,7 @@ void CaptureThread::start() {
 void CaptureThread::stop() {
     if (!running_.exchange(false))
         return;
+    ring_.cancel();  // wake the blocking pop() so run() can exit promptly
     if (thread_.joinable())
         thread_.join();
 }
@@ -93,11 +99,6 @@ void CaptureThread::run() {
     host_api.on_frame = host_api_on_frame_adapter;
     // Pass the ring buffer as host_ctx so the callback can access it
     void* host_ctx = &ring_;
-    // Log host_api pointer and on_frame value for debugging
-    std::cerr << "CaptureThread::run: host_api=" << (void*)&host_api
-              << ", on_frame=" << (void*)host_api.on_frame
-              << ", log=" << (void*)host_api.log
-              << ", publish_evt=" << (void*)host_api.publish_evt << std::endl;
     if (inputPlugin_->start)
         inputPlugin_->start(inputPlugin_, &host_api, host_ctx, inputConfig_.c_str());
     
@@ -115,13 +116,30 @@ void CaptureThread::run() {
                 std::cerr << "CaptureThread: Received invalid data size" << std::endl;
                 continue;
             }
-            
-            // Fan out to all output plugins using the new single-buffer API
-            for (auto out : outputs_) {
-                if (out && out->on_frame) {
-                    // The new API expects (plugin, buf, size)
-                    out->on_frame(out, buffer.data(), size);
+
+            // Tap compressed access units into the worker link (media out). The
+            // payload is copied once into a refcounted buffer here (it is shared
+            // by pointer across all consumer queues — never copied per-consumer).
+            if (link_) {
+                const zm_frame_hdr_t* hdr = reinterpret_cast<const zm_frame_hdr_t*>(buffer.data());
+                const bool isVideo = (hdr->hw_type == ZM_FRAME_COMPRESSED);
+                const bool isAudio = (hdr->hw_type == ZM_FRAME_COMPRESSED_AUDIO);
+                if (isVideo || isAudio) {
+                    const char* payload = buffer.data() + headerSize;
+                    auto shared = std::make_shared<std::vector<uint8_t>>(
+                        reinterpret_cast<const uint8_t*>(payload),
+                        reinterpret_cast<const uint8_t*>(payload) + (size - headerSize));
+                    // WorkerLink StreamKind: 1 = VIDEO, 2 = AUDIO.
+                    link_->sendMedia(/*stream=*/isVideo ? 1u : 2u, (hdr->flags & 1) != 0,
+                                     static_cast<int64_t>(hdr->pts_usec), std::move(shared));
                 }
+            }
+
+            // Deliver to the input plugin's downstream stages. Each runs on its
+            // own thread with a bounded drop-queue, so a slow stage drops its own
+            // backlog instead of blocking capture or sibling branches.
+            for (auto* out : outputs_) {
+                if (out) out->deliver(buffer.data(), size);
             }
         } else {
             // Sleep a bit if no frames to avoid busy loop

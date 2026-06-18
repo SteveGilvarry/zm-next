@@ -1,11 +1,14 @@
-// Stub implementation for ShmRing
+// Shared-memory ring buffer implementation
 #include "zm/ShmRing.hpp"
+#include <cstring>
+#include <thread>
+#include <chrono>
 
 namespace zm {
 
-ShmRing::ShmRing(size_t slotCount, size_t slotSize)
-    : shm_(boost::interprocess::open_or_create, "zm_shmring", boost::interprocess::read_write),
-      region_(), header_(nullptr), buffer_(nullptr) {
+ShmRing::ShmRing(size_t slotCount, size_t slotSize, const std::string& name)
+    : shm_(boost::interprocess::open_or_create, name.c_str(), boost::interprocess::read_write),
+      region_(), header_(nullptr), buffer_(nullptr), name_(name) {
     // Calculate total size: header + slot sizes array + slots
     size_t totalSize = sizeof(Header) + slotCount * sizeof(size_t) + slotCount * slotSize;
     // Set size and map region
@@ -48,12 +51,24 @@ bool ShmRing::push(const void* data, size_t size) {
     return true;
 }
 
+void ShmRing::cancel() {
+    cancelled_.store(true, std::memory_order_release);
+}
+
+ShmRing::~ShmRing() {
+    // Remove the named segment so a restart doesn't reuse stale state and the
+    // OS doesn't leak the shared-memory object after this owner exits.
+    boost::interprocess::shared_memory_object::remove(name_.c_str());
+}
+
 bool ShmRing::pop(void* data, size_t& size) {
     size_t head = header_->head.load(std::memory_order_relaxed);
     size_t tail = header_->tail.load(std::memory_order_acquire);
-    // wait if empty
+    // Wait while empty, but stay cancellable: poll at a short interval so
+    // shutdown can break the loop instead of blocking forever.
     while (head == tail) {
-        header_->tail.wait(tail, std::memory_order_relaxed);
+        if (cancelled_.load(std::memory_order_acquire)) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
         tail = header_->tail.load(std::memory_order_acquire);
     }
     // Get slot sizes array

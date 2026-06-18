@@ -8,6 +8,10 @@
 extern "C" {
 #endif
 
+// ABI version of the plugin contract. Plugins should set zm_plugin_t.version
+// to this value in their zm_plugin_init; the host warns on a mismatch.
+#define ZM_PLUGIN_ABI_VERSION 1u
+
 // Simple JSON library for configuration
 typedef struct zm_json_s zm_json_t;
 
@@ -40,7 +44,8 @@ typedef enum zm_hw_type_e {
     ZM_FRAME_COMPRESSED = 100,  // Compressed video (H.264, etc.)
     ZM_FRAME_RGB24 = 101,       // Uncompressed RGB24
     ZM_FRAME_GRAYSCALE = 102,   // Uncompressed grayscale
-    ZM_FRAME_YUV420P = 103      // Uncompressed YUV420P
+    ZM_FRAME_YUV420P = 103,     // Uncompressed YUV420P
+    ZM_FRAME_COMPRESSED_AUDIO = 104  // Compressed audio (AAC, Opus, G.711, ...)
 } zm_hw_type_t;
 
 // Host API for plugins to call
@@ -51,8 +56,18 @@ typedef struct zm_host_api_s {
     void (*publish_evt)(void* host_ctx, const char* json_event);
     // Frame callback for input plugins to forward frames to pipeline
     void (*on_frame)(void* host_ctx, const void* frame_hdr, size_t frame_size);
+    // Subscribe to metadata events. `cb(user, json_event)` is invoked for each
+    // event published by any plugin; returns an opaque handle for unsubscribe_evt.
+    // ALWAYS subscribe via this host call rather than touching an in-process bus
+    // directly: plugins are dlopen'd shared libraries and do NOT share the host's
+    // event-bus singleton across the library boundary.
+    void* (*subscribe_evt)(void* host_ctx,
+                           void (*cb)(void* user, const char* json_event),
+                           void* user);
+    // Remove a subscription created with subscribe_evt.
+    void (*unsubscribe_evt)(void* host_ctx, void* handle);
     // Reserved for future extensions of the API
-    void* reserved[4];
+    void* reserved[2];
 } zm_host_api_t;
 
 // Frame header prefixed to each media packet/frame
@@ -64,6 +79,25 @@ typedef struct zm_frame_hdr_s {
     uint32_t flags;            // Keyframe flag, etc.
     uint64_t pts_usec;         // Presentation timestamp in microseconds
 } zm_frame_hdr_t;
+
+// Descriptor for a frame that lives on a GPU/accelerator surface (zero-copy
+// path). When a frame's hw_type is a GPU type (ZM_HW_CUDA / ZM_HW_VAAPI /
+// ZM_HW_VTB), the on_frame payload after the zm_frame_hdr_t is THIS struct, not
+// pixel bytes — the actual surface stays on the device. `av_frame` is the opaque
+// AVFrame* that owns the surface; it is guaranteed valid only for the duration
+// of the (synchronous) on_frame call, so a consumer must use or download it
+// before returning. A CPU consumer calls a download helper; a GPU consumer
+// (e.g. ORT CUDA EP) uses plane_ptr/linesize directly without a host copy.
+typedef struct zm_gpu_frame_s {
+    uint32_t hw_type;        // ZM_HW_CUDA / ZM_HW_VAAPI / ZM_HW_VTB
+    uint32_t pix_fmt;        // native surface format (AVPixelFormat, e.g. NV12)
+    uint32_t width;
+    uint32_t height;
+    uint64_t plane_ptr[4];   // per-plane device pointers / surface handles
+    uint32_t linesize[4];    // per-plane strides (bytes)
+    uint64_t av_frame;       // opaque AVFrame* owning the surface (call-scoped)
+    uint64_t device_ctx;     // opaque hw device context (AVBufferRef*), optional
+} zm_gpu_frame_t;
 
 // Plugin definition
 typedef struct zm_plugin_s {

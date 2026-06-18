@@ -33,8 +33,10 @@ struct StreamConfig {
     bool hw_decode;               // Hardware decoding enabled
     int max_retry_attempts;       // Max reconnection attempts (-1 = infinite)
     int retry_delay_ms;           // Delay between retry attempts
-    
-    StreamConfig() : stream_id(0), hw_decode(false), max_retry_attempts(5), retry_delay_ms(2000) {}
+    bool forward_audio;           // Forward compressed audio packets downstream
+
+    StreamConfig() : stream_id(0), hw_decode(false), max_retry_attempts(5), retry_delay_ms(2000),
+                     forward_audio(true) {}
 };
 
 // Runtime state for a single stream
@@ -46,6 +48,7 @@ struct StreamState {
     
     uint32_t stream_id;
     int video_stream_index;
+    int audio_stream_index;
     std::atomic<bool> running;
     std::atomic<bool> connected;
     std::thread capture_thread;
@@ -62,7 +65,7 @@ struct StreamState {
     std::chrono::steady_clock::time_point start_time;
     
     StreamState() : fmt_ctx(nullptr), codec_ctx(nullptr), packet(nullptr), 
-                   hw_device_ctx(nullptr), stream_id(0), video_stream_index(-1),
+                   hw_device_ctx(nullptr), stream_id(0), video_stream_index(-1), audio_stream_index(-1),
                    running(false), connected(false), retry_count(0), current_retry_delay_ms(1000),
                    frames_captured(0), packets_dropped(0) {}
 };
@@ -137,10 +140,12 @@ private:
     
     // Frame processing and publishing
     void process_and_publish_frame(StreamState* state, const StreamConfig& config);
+    void publish_audio_packet(StreamState* state, const StreamConfig& config);
     
     // Publishing and communication
     void log(zm_log_level_t level, const char* format, ...);
     void log_stream(uint32_t stream_id, zm_log_level_t level, const char* format, ...);
     void publish_event(const char* json_event);
-    void publish_stream_metadata(uint32_t stream_id, const AVCodecParameters* codecpar);
+    void publish_stream_metadata(uint32_t stream_id, const AVCodecParameters* codecpar,
+                                 const char* media = "video");
 };

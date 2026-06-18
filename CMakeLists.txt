@@ -70,9 +70,28 @@ set(ZM_FFMPEG_INCLUDES ${FFMPEG_INCLUDE_DIRS}  CACHE INTERNAL "")
 set(ZM_FFMPEG_LIBDIRS  ${FFMPEG_LIBRARY_DIRS}  CACHE INTERNAL "")
 set(ZM_FFMPEG_LIBS     ${FFMPEG_LIBRARIES}     CACHE INTERNAL "")
 
+# ========================================
+# OPTIONAL CUDA / NVDEC ZERO-COPY GPU PATH (Linux/NVIDIA)
+# ========================================
+# OFF by default so macOS / CPU builds are unaffected. Enable on a GPU box with
+# -DZM_WITH_CUDA=ON (requires CUDA toolkit incl. NPP, FFmpeg built with --enable-
+# cuda/--enable-nvdec, and an onnxruntime built with the CUDA execution provider).
+option(ZM_WITH_CUDA "Build NVDEC hw-decode + ONNX Runtime CUDA zero-copy detect path" OFF)
+if(ZM_WITH_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    add_compile_definitions(ZMP_WITH_CUDA)
+    message(STATUS "ZM_WITH_CUDA=ON: building NVDEC + ORT CUDA zero-copy GPU path")
+else()
+    message(STATUS "ZM_WITH_CUDA=OFF: CPU/software decode + detect (default)")
+endif()
+
 # Include CTest for add_test / enable_testing support
 include(CTest)
 enable_testing()
+
+# Worker interface contract (protobuf codegen from proto/worker_link.proto)
+add_subdirectory(proto)
 
 # Core library
 add_subdirectory(core)
@@ -87,3 +106,19 @@ add_subdirectory(plugins)
 add_executable(zm-core src/zm-core.cpp)
 target_link_libraries(zm-core PRIVATE zmcore)
 target_include_directories(zm-core PRIVATE ${Boost_INCLUDE_DIRS} /opt/homebrew/include)
+
+# ========================================
+# TOOLS
+# ========================================
+# wl_dump: live worker-socket probe (connects, subscribes, prints framed protobuf).
+# Links zm_proto only (vcpkg protobuf, no Boost/Homebrew protobuf collision).
+add_executable(wl_dump tools/wl_dump.cpp)
+target_link_libraries(wl_dump PRIVATE zm_proto)
+target_compile_features(wl_dump PRIVATE cxx_std_20)
+
+# Integration smoke test: drives the built zm-core + plugins through capture_file
+# scenarios (decode/record/socket) and asserts end-to-end behavior. Skips itself
+# gracefully if ffmpeg is unavailable. Depends on zm-core + wl_dump + plugins.
+add_test(NAME IntegrationSmoke
+         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/integration/integration_smoke.sh ${CMAKE_BINARY_DIR})
+set_tests_properties(IntegrationSmoke PROPERTIES TIMEOUT 120)

@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 #include "zm/ShmRing.hpp"
 #include <vector>
+#include <thread>
+#include <atomic>
+#include <chrono>
 
 using namespace zm;
 
@@ -31,6 +34,28 @@ TEST(ShmRingTest, PushPopBasic) {
 
     // Now empty: pop blocks then should return true once push occurs
     // But blocking behavior is not tested here
+}
+
+// A blocked pop() on an empty ring must return false when cancel() is called,
+// so a consumer loop can exit cleanly on shutdown instead of hanging.
+TEST(ShmRingTest, CancelUnblocksPop) {
+    ShmRing ring(4, 16, "zm_shmring_cancel_test");
+    std::atomic<bool> returned{false};
+    bool result = true;
+    std::thread t([&] {
+        std::vector<char> out(16);
+        size_t sz = 0;
+        result = ring.pop(out.data(), sz);  // blocks: ring is empty
+        returned.store(true);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(returned.load());  // still blocked
+
+    ring.cancel();
+    t.join();
+    EXPECT_TRUE(returned.load());
+    EXPECT_FALSE(result);  // a cancelled pop returns false
 }
 
 int main(int argc, char **argv) {
