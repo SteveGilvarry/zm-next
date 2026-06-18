@@ -475,6 +475,16 @@ void WorkerLink::publishEventJson(const std::string& raw_event_json) {
         d->set_model(j.value("model", std::string{}));
     }
 
+    const pb::Event::Code code = ev->code();
+    // Lifecycle/health events represent current monitor status, so cache the
+    // latest as the connect-time snapshot — a consumer that connects later learns
+    // the current state immediately. Detection/description are per-event streams
+    // (too frequent, not "status") and must not clobber the snapshot.
+    const bool is_health = code != pb::Event::CODE_UNSPECIFIED &&
+                           code != pb::Event::SNAPSHOT &&
+                           code != pb::Event::DETECTION &&
+                           code != pb::Event::DESCRIPTION;
+
     MessagePtr msg;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -482,6 +492,7 @@ void WorkerLink::publishEventJson(const std::string& raw_event_json) {
         frame.set_generation(generation_);
         msg = buildFrameMessage(frame, nullptr, /*control=*/true);
         enqueue(msg, /*video=*/false, /*audio=*/false, /*events=*/true);
+        if (is_health) snapshot_ = msg;
     }
 }
 

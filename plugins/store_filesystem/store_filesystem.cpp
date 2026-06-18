@@ -292,14 +292,10 @@ static int handle_plugin_start(zm_plugin_t* plugin, zm_host_api_t* host, void* h
             host->subscribe_evt(host_ctx, &store_meta_cb, inst->ebus);
     }
 
-    std::time_t now = std::time(nullptr);
-    if (!open_file(inst, now)) {
-        if (host && host->unsubscribe_evt)
-            host->unsubscribe_evt(host_ctx, inst->ebus_sub_handle);
-        inst->ebus->running.store(false);
-        delete inst;
-        return -1;
-    }
+    // NOTE: the output file is created lazily on the first muxable frame (see
+    // process_video_frame), NOT here. Opening at start left an orphaned 0-byte,
+    // header-less .mkv whenever no frame ever arrived (e.g. wrong codec, dead
+    // input) — a corrupt artifact that confuses "does a recording exist?" checks.
     plugin->instance = inst;
     return 0;
 }
@@ -630,11 +626,6 @@ static void process_video_frame(StoreInstance* inst, const zm_frame_hdr_t* hdr, 
     log(inst, ZM_LOG_DEBUG, "process_video_frame: ENTRY stream_id=%d, size=%d, flags=0x%x", 
         hdr->stream_id, hdr->bytes, hdr->flags);
     std::lock_guard<std::mutex> lock(inst->mtx);
-    
-    if (!inst->file_open) {
-        log(inst, ZM_LOG_DEBUG, "on_frame: file not open, skipping");
-        return;
-    }
 
     // Lazily build the muxer's codec parameters from video StreamMetadata received
     // on the EventBus. The core delivers the input plugin's metadata there (not as
@@ -670,11 +661,22 @@ static void process_video_frame(StoreInstance* inst, const zm_frame_hdr_t* hdr, 
         }
     }
 
+    // Create the output file lazily: only once we can actually record — we need
+    // the codec params (for the header) AND a keyframe to start the segment. This
+    // avoids leaving an orphaned 0-byte file when no muxable frame ever arrives
+    // (wrong codec, dead input, etc.).
+    if (!inst->file_open) {
+        if (!inst->metadata_codecpar || !(hdr->flags & 1)) {
+            return;  // wait for both codec metadata and a starting keyframe
+        }
+        if (!open_file(inst, std::time(nullptr))) return;
+    }
+
     // Handle keyframes
     if (hdr->flags & 1) {
         cache_keyframe(inst, hdr, payload);
     }
-    
+
     // Write file header if necessary
     if (!inst->header_written && inst->metadata_codecpar) {
         if (!initialize_video_stream(inst)) {
@@ -696,6 +698,9 @@ static void process_video_frame(StoreInstance* inst, const zm_frame_hdr_t* hdr, 
             } else {
                 log(inst, ZM_LOG_INFO, "Successfully wrote cached keyframe");
             }
+            // If the current frame IS that keyframe, it has now been written; don't
+            // write it again below (was a duplicate first frame: 76 pkts for 75).
+            if (hdr->flags & 1) return;
         } else {
             // Otherwise wait for next keyframe
             inst->waiting_for_keyframe = true;

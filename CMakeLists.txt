@@ -115,3 +115,10 @@ target_include_directories(zm-core PRIVATE ${Boost_INCLUDE_DIRS} /opt/homebrew/i
 add_executable(wl_dump tools/wl_dump.cpp)
 target_link_libraries(wl_dump PRIVATE zm_proto)
 target_compile_features(wl_dump PRIVATE cxx_std_20)
+
+# Integration smoke test: drives the built zm-core + plugins through capture_file
+# scenarios (decode/record/socket) and asserts end-to-end behavior. Skips itself
+# gracefully if ffmpeg is unavailable. Depends on zm-core + wl_dump + plugins.
+add_test(NAME IntegrationSmoke
+         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/integration/integration_smoke.sh ${CMAKE_BINARY_DIR})
+set_tests_properties(IntegrationSmoke PROPERTIES TIMEOUT 120)

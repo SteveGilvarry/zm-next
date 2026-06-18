@@ -40,10 +40,12 @@ struct CaptureFileContext {
     uint32_t stream_id = 0;
     bool loop = true;
     bool realtime = true;
+    bool forward_audio = true;  // forward the file's audio stream too (if present)
 
     // FFmpeg state.
     AVFormatContext* fmt_ctx = nullptr;
     int video_stream_index = -1;
+    int audio_stream_index = -1;
 
     // Replay thread control.
     std::thread worker;
@@ -70,14 +72,15 @@ struct CaptureFileContext {
     }
 };
 
-// Publish the StreamMetadata handshake event. The shape here is fixed: the core
-// turns it into the codec setup for downstream decode plugins.
-void publish_stream_metadata(CaptureFileContext* ctx, const AVCodecParameters* codecpar) {
+// Publish the StreamMetadata handshake event for a video or audio stream. The
+// core turns it into the codec setup for downstream decode/store/Hello.
+void publish_stream_metadata(CaptureFileContext* ctx, const AVCodecParameters* codecpar,
+                             const char* media) {
     if (!ctx->host_api || !ctx->host_api->publish_evt || !codecpar) {
         return;
     }
 
-    // Base64-encode extradata (SPS/PPS etc.) if present.
+    // Base64-encode extradata (SPS/PPS, AudioSpecificConfig, ...) if present.
     std::string extradata_b64;
     if (codecpar->extradata && codecpar->extradata_size > 0) {
         int b64len = 4 * ((codecpar->extradata_size + 2) / 3) + 1;
@@ -91,6 +94,7 @@ void publish_stream_metadata(CaptureFileContext* ctx, const AVCodecParameters* c
     // every consumer's json::parse silently rejects (codec + extradata lost).
     nlohmann::json meta = {
         {"event", "StreamMetadata"},
+        {"media", media},
         {"stream_id", ctx->stream_id},
         {"codec_id", static_cast<int>(codecpar->codec_id)},
         {"width", codecpar->width},
@@ -98,23 +102,25 @@ void publish_stream_metadata(CaptureFileContext* ctx, const AVCodecParameters* c
         {"pix_fmt", codecpar->format},
         {"profile", codecpar->profile},
         {"level", codecpar->level},
+        {"sample_rate", codecpar->sample_rate},
+        {"channels", codecpar->ch_layout.nb_channels},
         {"extradata", extradata_b64},
     };
     ctx->host_api->publish_evt(ctx->host_ctx, meta.dump().c_str());
 
-    ctx->log(ZM_LOG_INFO, "Published metadata for stream %u: %dx%d, codec=%s",
-             ctx->stream_id, codecpar->width, codecpar->height,
+    ctx->log(ZM_LOG_INFO, "Published %s metadata for stream %u: codec=%s",
+             media, ctx->stream_id,
              avcodec_get_name(static_cast<AVCodecID>(codecpar->codec_id)));
 }
 
 // Build [zm_frame_hdr_t][payload] and forward the packet downstream.
-void emit_packet(CaptureFileContext* ctx, AVPacket* pkt, AVStream* stream) {
+void emit_packet(CaptureFileContext* ctx, AVPacket* pkt, AVStream* stream, bool is_audio) {
     if (!ctx->host_api || !ctx->host_api->on_frame) return;
     if (!pkt->data || pkt->size <= 0) return;
 
     zm_frame_hdr_t hdr = {};
     hdr.stream_id = ctx->stream_id;
-    hdr.hw_type = ZM_FRAME_COMPRESSED;  // Compressed (e.g. H.264) packet.
+    hdr.hw_type = is_audio ? ZM_FRAME_COMPRESSED_AUDIO : ZM_FRAME_COMPRESSED;
     hdr.handle = reinterpret_cast<uint64_t>(pkt->data);
     hdr.bytes = static_cast<uint32_t>(pkt->size);
     hdr.flags = (pkt->flags & AV_PKT_FLAG_KEY) ? 1u : 0u;
@@ -128,8 +134,10 @@ void emit_packet(CaptureFileContext* ctx, AVPacket* pkt, AVStream* stream) {
         base_usec = av_gettime();
     }
     // Apply the loop offset so the timeline never runs backwards across replays.
+    // The offset is driven by video (the primary stream); audio shares it to stay
+    // aligned but does not redefine it.
     hdr.pts_usec = static_cast<uint64_t>(base_usec + ctx->pts_offset_usec);
-    ctx->last_emitted_pts_usec = base_usec + ctx->pts_offset_usec;
+    if (!is_audio) ctx->last_emitted_pts_usec = base_usec + ctx->pts_offset_usec;
 
     std::vector<uint8_t> frame_buf(sizeof(zm_frame_hdr_t) + pkt->size);
     std::memcpy(frame_buf.data(), &hdr, sizeof(zm_frame_hdr_t));
@@ -188,7 +196,7 @@ void replay_loop(CaptureFileContext* ctx) {
                     }
                 }
 
-                emit_packet(ctx, pkt, stream);
+                emit_packet(ctx, pkt, stream, /*is_audio=*/false);
 
                 if (!ctx->realtime) {
                     // Small yield to avoid flooding downstream when running flat-out.
@@ -200,6 +208,11 @@ void replay_loop(CaptureFileContext* ctx) {
                              ctx->stream_id,
                              static_cast<unsigned long long>(ctx->frames_emitted));
                 }
+            } else if (ctx->forward_audio && pkt->stream_index == ctx->audio_stream_index) {
+                // Audio rides the same pipeline (compressed), paced by the video
+                // clock above. store/output consumers handle it via the audio path.
+                emit_packet(ctx, pkt,
+                            ctx->fmt_ctx->streams[ctx->audio_stream_index], /*is_audio=*/true);
             }
             av_packet_unref(pkt);
         } else if (ret == AVERROR_EOF) {
@@ -259,11 +272,13 @@ bool open_input(CaptureFileContext* ctx) {
     }
 
     ctx->video_stream_index = -1;
+    ctx->audio_stream_index = -1;
     for (unsigned int i = 0; i < ctx->fmt_ctx->nb_streams; i++) {
-        if (ctx->fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        const auto type = ctx->fmt_ctx->streams[i]->codecpar->codec_type;
+        if (type == AVMEDIA_TYPE_VIDEO && ctx->video_stream_index < 0)
             ctx->video_stream_index = static_cast<int>(i);
-            break;
-        }
+        else if (type == AVMEDIA_TYPE_AUDIO && ctx->audio_stream_index < 0)
+            ctx->audio_stream_index = static_cast<int>(i);
     }
 
     if (ctx->video_stream_index < 0) {
@@ -277,7 +292,14 @@ bool open_input(CaptureFileContext* ctx) {
         ctx->frame_dur_usec = av_rescale_q(1, av_inv_q(video_stream->avg_frame_rate),
                                            AVRational{1, 1000000});
     }
-    publish_stream_metadata(ctx, video_stream->codecpar);
+    publish_stream_metadata(ctx, video_stream->codecpar, "video");
+    // Forward audio too (if present), so recordings/outputs can carry it.
+    if (ctx->forward_audio && ctx->audio_stream_index >= 0) {
+        publish_stream_metadata(
+            ctx, ctx->fmt_ctx->streams[ctx->audio_stream_index]->codecpar, "audio");
+    } else {
+        ctx->audio_stream_index = -1;  // disabled
+    }
     // Note: packets are forwarded in their native container form (AVCC for
     // MP4/MOV, Annex-B for MPEG-TS/RTSP). The StreamMetadata carries the codec
     // extradata so the decoder can parse AVCC and the store can mux it natively —
@@ -327,6 +349,9 @@ static int capture_file_start(zm_plugin_t* plugin, zm_host_api_t* host, void* ho
         if (cfg.contains("realtime") && cfg["realtime"].is_boolean()) {
             ctx->realtime = cfg["realtime"].get<bool>();
         }
+        if (cfg.contains("forward_audio") && cfg["forward_audio"].is_boolean()) {
+            ctx->forward_audio = cfg["forward_audio"].get<bool>();
+        }
     } catch (const std::exception& e) {
         ctx->log(ZM_LOG_ERROR, "capture_file: failed to parse config: %s", e.what());
         delete ctx;
@@ -340,6 +365,17 @@ static int capture_file_start(zm_plugin_t* plugin, zm_host_api_t* host, void* ho
              ctx->realtime ? "true" : "false");
 
     if (!open_input(ctx)) {
+        // Surface a health event so the orchestrator can mark the monitor
+        // unhealthy instead of seeing a silent, frame-less worker (a dead input
+        // would otherwise just stall with no signal).
+        if (ctx->host_api && ctx->host_api->publish_evt) {
+            nlohmann::json ev = {
+                {"type", "connection_failed"},
+                {"stream_id", ctx->stream_id},
+                {"message", std::string("capture_file: failed to open ") + ctx->path},
+            };
+            ctx->host_api->publish_evt(ctx->host_ctx, ev.dump().c_str());
+        }
         if (ctx->fmt_ctx) {
             avformat_close_input(&ctx->fmt_ctx);
         }
