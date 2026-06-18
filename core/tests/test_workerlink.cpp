@@ -282,6 +282,31 @@ TEST(WorkerLinkTest, HelloReplayedToLateSubscriber) {
     link.stop();
 }
 
+// A consumer that disconnects and reconnects (zm-api restart, network blip) must
+// get the Hello again on its new connection so it can re-init its decoder.
+TEST(WorkerLinkTest, ReconnectReceivesHelloAgain) {
+    const std::string path = temp_socket_path(960);
+    zm::WorkerLink link(/*monitor_id=*/12, path);
+    ASSERT_TRUE(link.start());
+    link.publishEventJson(
+        R"({"event":"StreamMetadata","stream_id":0,"codec_id":27,"width":800,)"
+        R"("height":600,"pix_fmt":0,"profile":100,"level":40,"extradata":"AAECAw=="})");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        int client = connect_client(path);
+        ASSERT_GE(client, 0) << "attempt " << attempt;
+        pb_subscribe(client, /*video=*/true);
+        wlp::Frame f;
+        ASSERT_TRUE(read_frame(client, f)) << "attempt " << attempt;
+        ASSERT_EQ(f.payload_case(), wlp::Frame::kHello) << "attempt " << attempt;
+        EXPECT_EQ(f.hello().width(), 800u);
+        ::close(client);  // disconnect; the worker must reap us and serve the next
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    link.stop();
+}
+
 // Cold-start stress: repeatedly connect + subscribe + stream, asserting the
 // consumer always begins receiving media within a bounded window. Targets the
 // intermittent "media=0 for the whole session" race seen under load.
