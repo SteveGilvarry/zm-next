@@ -1033,9 +1033,11 @@ static void webrtc_on_frame(zm_plugin_t* plugin, const void* buf, size_t size) {
     
     auto instance = static_cast<WebRTCPluginInstance*>(plugin->instance);
     const zm_frame_hdr_t* frame_hdr = static_cast<const zm_frame_hdr_t*>(buf);
+    // Video-only output; ignore audio frames now that the pipeline carries audio.
+    if (frame_hdr->hw_type == ZM_FRAME_COMPRESSED_AUDIO) return;
     const uint8_t* frame_data = static_cast<const uint8_t*>(buf) + sizeof(zm_frame_hdr_t);
     size_t frame_size = size - sizeof(zm_frame_hdr_t);
-    
+
     WebRTCService::getInstance().pushFrame(frame_hdr, frame_data, frame_size);
 }
 

@@ -4,6 +4,7 @@
 #include "zm/PluginManager.hpp"
 #include "zm_plugin.h"
 #include "zm/EventBus.hpp"
+#include "zm/StageRunner.hpp"
 #include <dlfcn.h>
 #include <iostream>
 #include <cstring>
@@ -17,13 +18,40 @@ extern "C" void host_log(void* /*host_ctx*/, zm_log_level_t level, const char* m
     else if (level == ZM_LOG_ERROR) lvl = "ERROR";
     std::cout << "[PLUGIN][" << lvl << "] " << (msg ? msg : "(null)") << std::endl;
 }
+// Routes a plugin's output frame to its downstream stages. host_ctx is the
+// plugin's StageRunner; forwarding copies the frame into each child stage's
+// bounded queue (which runs on its own thread), so stages are decoupled.
+extern "C" void chain_on_frame(void* host_ctx, const void* buf, size_t size) {
+    if (!host_ctx) return;
+    static_cast<zm::StageRunner*>(host_ctx)->forwardToChildren(buf, size);
+}
+
+// Host-backed event subscription so plugins reliably reach the host's single
+// EventBus instance across the dlopen boundary (a plugin calling
+// EventBus::instance() in its own .dylib would get a separate instance).
+extern "C" void* host_subscribe_evt(void* /*host_ctx*/,
+                                    void (*cb)(void* user, const char* json_event),
+                                    void* user) {
+    auto id = zm::EventBus::instance().subscribe(
+        "plugin_event",
+        [cb, user](const std::string& m) { cb(user, m.c_str()); });
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(id));
+}
+extern "C" void host_unsubscribe_evt(void* /*host_ctx*/, void* handle) {
+    zm::EventBus::instance().unsubscribe(
+        "plugin_event",
+        static_cast<zm::EventBus::SubscriptionId>(reinterpret_cast<uintptr_t>(handle)));
+}
+
 zm_host_api_t gHost = {
     /* log */ host_log,
     /* publish_evt */ [](void* host_ctx, const char* json_event) -> void {
         zm::EventBus::instance().publish("plugin_event", json_event);
     },
-    /* on_frame    */ nullptr,
-    /* reserved    */ {nullptr, nullptr, nullptr, nullptr}
+    /* on_frame        */ chain_on_frame,
+    /* subscribe_evt   */ host_subscribe_evt,
+    /* unsubscribe_evt */ host_unsubscribe_evt,
+    /* reserved        */ {nullptr, nullptr}
 };
 
 namespace zm {
@@ -73,6 +101,11 @@ bool PluginManager::loadPipeline(const std::vector<PluginConfig>& pipeline) {
         inst.handle = handle;
         std::memset(&inst.plugin, 0, sizeof(zm_plugin_t));
         init_fn(&inst.plugin);
+        if (inst.plugin.version != ZM_PLUGIN_ABI_VERSION) {
+            std::cerr << "[PluginManager] WARN: " << pcfg.path << " reports ABI version "
+                      << inst.plugin.version << ", expected " << ZM_PLUGIN_ABI_VERSION
+                      << "; loading anyway." << std::endl;
+        }
         inst.config = pcfg;
         pipeline_.push_back(inst);
     }
@@ -93,35 +126,64 @@ void PluginManager::startAll() {
         return;
     }
 
-    // Prepare outputs (all plugins after input, or all non-inputs)
-    std::vector<zm_plugin_t*> outputs;
+    // One StageRunner (thread + bounded drop-queue) per non-input plugin,
+    // index-aligned with pipeline_ (the input slot stays null).
+    runners_.clear();
+    runners_.resize(pipeline_.size());
     for (size_t i = 0; i < pipeline_.size(); ++i) {
-        if (i != inputIdx)
-            outputs.push_back(&pipeline_[i].plugin);
+        if (i == inputIdx) continue;
+        const int depth = pipeline_[i].config.queue_depth > 0 ? pipeline_[i].config.queue_depth : 16;
+        runners_[i] = std::make_unique<StageRunner>(&pipeline_[i].plugin, static_cast<size_t>(depth));
     }
+    // Resolve a node's downstream child runners from the tree topology.
+    auto childRunnersOf = [&](size_t i) {
+        std::vector<StageRunner*> kids;
+        for (int ci : pipeline_[i].config.children)
+            if (ci >= 0 && ci < static_cast<int>(pipeline_.size()) && runners_[ci])
+                kids.push_back(runners_[ci].get());
+        return kids;
+    };
+    for (size_t i = 0; i < pipeline_.size(); ++i)
+        if (runners_[i]) runners_[i]->setChildren(childRunnersOf(i));
 
-    // Create ring buffer (256 slots, 1MiB each)
-    ring_ = std::make_unique<ShmRing>(256, 1024*1024);
-    // Start capture thread for input plugin
-    captureThread_ = std::make_unique<CaptureThread>(&pipeline_[inputIdx].plugin, *ring_, outputs, pipeline_[inputIdx].config.config_json);
-    captureThread_->start();
-
-    // Start output/process plugins directly
+    // Start each non-input plugin with its StageRunner as host_ctx, so that
+    // host->on_frame (chain_on_frame) routes its output into the children's
+    // queues. Then start the stage threads.
     for (size_t i = 0; i < pipeline_.size(); ++i) {
         if (i == inputIdx) continue;
         auto& inst = pipeline_[i];
-        if (inst.plugin.start) {
-            inst.plugin.start(&inst.plugin, &gHost, nullptr, inst.config.config_json.c_str());
-        }
+        if (inst.plugin.start)
+            inst.plugin.start(&inst.plugin, &gHost, runners_[i].get(), inst.config.config_json.c_str());
     }
+    for (size_t i = 0; i < pipeline_.size(); ++i)
+        if (runners_[i]) runners_[i]->start();
+
+    // Ring + capture thread, delivering captured frames to the input's children.
+    ring_ = std::make_unique<ShmRing>(256, 1024*1024, ringName_);
+    captureThread_ = std::make_unique<CaptureThread>(&pipeline_[inputIdx].plugin, *ring_,
+                                                     childRunnersOf(inputIdx),
+                                                     pipeline_[inputIdx].config.config_json, link_);
+    captureThread_->start();
 }
 
 void PluginManager::stopAll() {
+    // Stop the frame pump first: this cancels the ring's blocking pop and joins
+    // the capture thread, whose run() stops the input plugin on exit.
+    if (captureThread_) {
+        captureThread_->stop();
+        captureThread_.reset();
+    }
+    // Stop the stage threads (join) so no plugin on_frame is in flight, then stop
+    // the plugins. The input plugin was already stopped by the capture thread.
+    for (auto& r : runners_)
+        if (r) r->stop();
     for (auto& inst : pipeline_) {
+        if (inst.plugin.type == ZM_PLUGIN_INPUT) continue;
         if (inst.plugin.stop) {
             inst.plugin.stop(&inst.plugin);
         }
     }
+    runners_.clear();
 }
 
 

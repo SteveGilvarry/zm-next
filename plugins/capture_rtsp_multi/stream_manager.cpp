@@ -323,8 +323,11 @@ void StreamManager::capture_loop(uint32_t stream_id) {
                 if (state->packet->stream_index == state->video_stream_index) {
                     process_and_publish_frame(state.get(), config);
                     state->frames_captured++;
+                } else if (config.forward_audio &&
+                           state->packet->stream_index == state->audio_stream_index) {
+                    publish_audio_packet(state.get(), config);
                 } else {
-                    // Non-video packet (audio, etc.) - just discard
+                    // Other (e.g. data/subtitle) packet - discard
                     av_packet_unref(state->packet);
                 }
                 
@@ -415,9 +418,10 @@ bool StreamManager::connect_stream(StreamState* state, const StreamConfig& confi
         return false;
     }
     
-    // Count streams and find video stream
+    // Count streams and find the first video + first audio stream
     int video_count = 0, audio_count = 0;
     state->video_stream_index = -1;
+    state->audio_stream_index = -1;
     for (unsigned int i = 0; i < state->fmt_ctx->nb_streams; i++) {
         AVMediaType type = state->fmt_ctx->streams[i]->codecpar->codec_type;
         if (type == AVMEDIA_TYPE_VIDEO) {
@@ -427,6 +431,9 @@ bool StreamManager::connect_stream(StreamState* state, const StreamConfig& confi
             }
         } else if (type == AVMEDIA_TYPE_AUDIO) {
             audio_count++;
+            if (state->audio_stream_index == -1) {
+                state->audio_stream_index = i;
+            }
         }
     }
     
@@ -489,9 +496,14 @@ bool StreamManager::connect_stream(StreamState* state, const StreamConfig& confi
         host_api_->publish_evt(host_ctx_, json_event);
     }
     
-    // Publish stream metadata with codec parameters
-    publish_stream_metadata(config.stream_id, video_stream->codecpar);
-    
+    // Publish stream metadata with codec parameters (video, and audio if present)
+    publish_stream_metadata(config.stream_id, video_stream->codecpar, "video");
+    if (config.forward_audio && state->audio_stream_index >= 0) {
+        publish_stream_metadata(config.stream_id,
+                                state->fmt_ctx->streams[state->audio_stream_index]->codecpar,
+                                "audio");
+    }
+
     return true;
 }
 
@@ -654,11 +666,36 @@ void StreamManager::process_and_publish_frame(StreamState* state, const StreamCo
     host_api_->on_frame(host_ctx_, frame_buf.data(), frame_buf.size());
 }
 
-void StreamManager::publish_stream_metadata(uint32_t stream_id, const AVCodecParameters* codecpar) {
+void StreamManager::publish_audio_packet(StreamState* state, const StreamConfig& config) {
+    if (!state->packet || !host_api_ || !host_api_->on_frame) {
+        if (state->packet) av_packet_unref(state->packet);
+        return;
+    }
+    AVStream* astream = state->fmt_ctx->streams[state->audio_stream_index];
+    zm_frame_hdr_t hdr{};
+    hdr.stream_id = config.stream_id;
+    hdr.hw_type = ZM_FRAME_COMPRESSED_AUDIO;
+    hdr.handle = reinterpret_cast<uint64_t>(state->packet->data);
+    hdr.bytes = state->packet->size;
+    hdr.flags = 0;
+    int64_t pts = (state->packet->pts != AV_NOPTS_VALUE) ? state->packet->pts : state->packet->dts;
+    hdr.pts_usec = (pts != AV_NOPTS_VALUE)
+                       ? av_rescale_q(pts, astream->time_base, AVRational{1, 1000000})
+                       : av_gettime();
+
+    std::vector<uint8_t> frame_buf(sizeof(zm_frame_hdr_t) + state->packet->size);
+    memcpy(frame_buf.data(), &hdr, sizeof(zm_frame_hdr_t));
+    memcpy(frame_buf.data() + sizeof(zm_frame_hdr_t), state->packet->data, state->packet->size);
+    host_api_->on_frame(host_ctx_, frame_buf.data(), frame_buf.size());
+    av_packet_unref(state->packet);
+}
+
+void StreamManager::publish_stream_metadata(uint32_t stream_id, const AVCodecParameters* codecpar,
+                                            const char* media) {
     if (!host_api_ || !host_api_->publish_evt || !codecpar) {
         return;
     }
-    
+
     // Base64-encode extradata if present
     std::string extradata_b64;
     if (codecpar->extradata && codecpar->extradata_size > 0) {
@@ -667,14 +704,17 @@ void StreamManager::publish_stream_metadata(uint32_t stream_id, const AVCodecPar
         av_base64_encode(b64buf.data(), b64len, codecpar->extradata, codecpar->extradata_size);
         extradata_b64 = std::string(b64buf.data());
     }
-    
-    // Create StreamMetadata JSON event
+
+    // Create StreamMetadata JSON event. "media" ("video"/"audio") lets the core
+    // route this to a video or audio Hello; audio carries sample_rate/channels.
     char metadata_json[1024];
     snprintf(metadata_json, sizeof(metadata_json),
-             "{\"event\":\"StreamMetadata\",\"stream_id\":%u,"
+             "{\"event\":\"StreamMetadata\",\"media\":\"%s\",\"stream_id\":%u,"
              "\"codec_id\":%d,\"width\":%d,\"height\":%d,"
              "\"pix_fmt\":%d,\"profile\":%d,\"level\":%d,"
+             "\"sample_rate\":%d,\"channels\":%d,"
              "\"extradata\":\"%s\"}",
+             media ? media : "video",
              stream_id,
              codecpar->codec_id,
              codecpar->width,
@@ -682,12 +722,14 @@ void StreamManager::publish_stream_metadata(uint32_t stream_id, const AVCodecPar
              codecpar->format,
              codecpar->profile,
              codecpar->level,
+             codecpar->sample_rate,
+             codecpar->ch_layout.nb_channels,
              extradata_b64.c_str());
-    
+
     host_api_->publish_evt(host_ctx_, metadata_json);
-    
-    log(ZM_LOG_INFO, "Published metadata for stream %u: %dx%d, codec=%s",
-        stream_id, codecpar->width, codecpar->height,
+
+    log(ZM_LOG_INFO, "Published %s metadata for stream %u: codec=%s",
+        media ? media : "video", stream_id,
         avcodec_get_name(static_cast<AVCodecID>(codecpar->codec_id)));
 }
 

@@ -24,3 +24,6 @@ webrtc_client.html
 WebRTC_Guide.md
 .vscode/
 .VSCodeCounter/
+
+# clangd / editor cache
+.cache/

@@ -21,9 +21,36 @@ extern "C" {
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <atomic>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
+
+// Audio codec parameters captured from the EventBus "plugin_event" channel
+// (StreamMetadata, media=="audio"). Best-effort: if none ever arrives the
+// plugin records video only, exactly as before.
+struct AudioParams {
+    bool valid = false;
+    int codec_id = 0;          // AVCodecID as int
+    int sample_rate = 0;
+    int channels = 0;
+    std::vector<uint8_t> extradata;
+};
+
+// Video codec parameters captured from the same StreamMetadata channel. The
+// input plugin publishes this once on start (and on reconnect); it is the only
+// source of the codec id / dimensions / extradata the muxer needs, because the
+// core delivers metadata on the EventBus, not as an on_frame buffer.
+struct VideoParams {
+    bool valid = false;
+    int codec_id = 0;          // AVCodecID as int
+    int width = 0;
+    int height = 0;
+    int pix_fmt = -1;
+    int profile = 0;
+    int level = 0;
+    std::vector<uint8_t> extradata;
+};
 
 struct StoreInstance {
     std::string root;
@@ -43,13 +70,86 @@ struct StoreInstance {
     bool waiting_for_keyframe = false;
     AVPacket* last_keyframe   = nullptr;
     AVStream* video_stream = nullptr;
+    AVStream* audio_stream = nullptr;   // optional, added at file-open time
     // metadata from input plugin
     AVCodecParameters* metadata_codecpar = nullptr;
     zm_host_api_t* host = nullptr;
     void* host_ctx = nullptr;
     // Multi-stream support
     std::vector<uint32_t> stream_filter;  // If empty, accept all streams
+    // Audio metadata received via the host event subscription. `ebus` is leaked
+    // on stop (after unsubscribe) so an in-flight callback never dangles.
+    struct EventBusState* ebus = nullptr;
+    void* ebus_sub_handle = nullptr;   // host subscription handle (for unsubscribe)
 };
+
+// Host-event subscription state, referenced (as a raw user pointer) by the host
+// callback. The `running` flag gates the callback body; we unsubscribe in stop().
+struct EventBusState {
+    std::atomic<bool> running{true};
+    std::mutex mtx;
+    AudioParams audio;                 // guarded by mtx
+    VideoParams video;                 // guarded by mtx
+    std::vector<uint32_t> stream_filter;
+};
+
+// Decode the optional base64 "extradata" field of a StreamMetadata event.
+static std::vector<uint8_t> decode_extradata_field(const json& j) {
+    std::vector<uint8_t> out;
+    std::string ed_b64 = j.value("extradata", std::string());
+    if (!ed_b64.empty()) {
+        size_t max_out = (ed_b64.size() * 3) / 4 + 1;
+        std::vector<uint8_t> tmp(max_out);
+        int n = av_base64_decode(tmp.data(), ed_b64.c_str(), (int)max_out);
+        if (n > 0) { tmp.resize(n); out = std::move(tmp); }
+    }
+    return out;
+}
+
+// Host event callback: capture both video and audio StreamMetadata. The core
+// delivers the input plugin's metadata on the EventBus (not as an on_frame
+// buffer), so this is the muxer's only source of codec parameters. A metadata
+// event with no "media" field is treated as video (the capture plugins tag audio
+// explicitly with media=="audio").
+static void store_meta_cb(void* user, const char* json_event) {
+    auto* ebus = static_cast<EventBusState*>(user);
+    if (!ebus || !ebus->running.load() || !json_event) return;
+    try {
+        auto j = json::parse(json_event);
+        if (j.value("event", std::string()) != "StreamMetadata") return;
+        if (!ebus->stream_filter.empty()) {
+            uint32_t sid = j.value("stream_id", 0u);
+            if (std::find(ebus->stream_filter.begin(), ebus->stream_filter.end(), sid) ==
+                ebus->stream_filter.end())
+                return;
+        }
+        const std::string media = j.value("media", std::string());
+        if (media == "audio") {
+            AudioParams ap;
+            ap.codec_id    = j.value("codec_id", 0);
+            ap.sample_rate = j.value("sample_rate", 0);
+            ap.channels    = j.value("channels", 0);
+            ap.extradata   = decode_extradata_field(j);
+            ap.valid = true;
+            std::lock_guard<std::mutex> lk(ebus->mtx);
+            ebus->audio = std::move(ap);
+        } else {
+            VideoParams vp;
+            vp.codec_id  = j.value("codec_id", 0);
+            vp.width     = j.value("width", 0);
+            vp.height    = j.value("height", 0);
+            vp.pix_fmt   = j.value("pix_fmt", -1);
+            vp.profile   = j.value("profile", 0);
+            vp.level     = j.value("level", 0);
+            vp.extradata = decode_extradata_field(j);
+            vp.valid = true;
+            std::lock_guard<std::mutex> lk(ebus->mtx);
+            ebus->video = std::move(vp);
+        }
+    } catch (...) {
+        // Ignore malformed events; metadata remains best-effort.
+    }
+}
 
 static std::string get_default_root() {
 #ifdef __APPLE__
@@ -99,6 +199,7 @@ static void close_file(StoreInstance* inst) {
     inst->file_open = false;
     inst->header_written = false;
     inst->video_stream = nullptr;
+    inst->audio_stream = nullptr;
 }
 
 static bool open_file(StoreInstance* inst, std::time_t t) {
@@ -122,6 +223,7 @@ static bool open_file(StoreInstance* inst, std::time_t t) {
     inst->header_written = false;
     inst->waiting_for_keyframe = false;
     inst->video_stream = nullptr;
+    inst->audio_stream = nullptr;
     log(inst, ZM_LOG_INFO, "Opened file: %s", inst->cur_path.c_str());
     return true;
 }
@@ -132,6 +234,8 @@ static void handle_frame(zm_plugin_t* plugin, const void* buf, size_t size);
 static void handle_plugin_stop(zm_plugin_t* plugin);
 static void process_metadata_json(StoreInstance* inst, const char* buf, size_t size);
 static void process_video_frame(StoreInstance* inst, const zm_frame_hdr_t* hdr, const uint8_t* payload);
+static void process_audio_frame(StoreInstance* inst, const zm_frame_hdr_t* hdr, const uint8_t* payload);
+static void add_audio_stream_if_available(StoreInstance* inst);
 static bool initialize_video_stream(StoreInstance* inst);
 static void cache_keyframe(StoreInstance* inst, const zm_frame_hdr_t* hdr, const uint8_t* payload);
 static void write_frame_to_file(StoreInstance* inst, const zm_frame_hdr_t* hdr, const uint8_t* payload);
@@ -177,8 +281,22 @@ static int handle_plugin_start(zm_plugin_t* plugin, zm_host_api_t* host, void* h
         delete inst;
         return -1;
     }
+
+    // Subscribe via the HOST for audio StreamMetadata (reliable across the dlopen
+    // boundary). The EventBusState is leaked on stop so an in-flight callback is
+    // always safe; it carries the stream filter for the C callback.
+    inst->ebus = new EventBusState();
+    inst->ebus->stream_filter = inst->stream_filter;
+    if (host && host->subscribe_evt) {
+        inst->ebus_sub_handle =
+            host->subscribe_evt(host_ctx, &store_meta_cb, inst->ebus);
+    }
+
     std::time_t now = std::time(nullptr);
     if (!open_file(inst, now)) {
+        if (host && host->unsubscribe_evt)
+            host->unsubscribe_evt(host_ctx, inst->ebus_sub_handle);
+        inst->ebus->running.store(false);
         delete inst;
         return -1;
     }
@@ -354,17 +472,76 @@ static bool initialize_video_stream(StoreInstance* inst) {
     st->avg_frame_rate = (AVRational){25, 1};
     st->r_frame_rate   = st->avg_frame_rate;
     oc->streams[st->index]->time_base = st->time_base;
-    
+
+    inst->video_stream = st;
+
+    // Add the audio stream (if metadata is known) BEFORE writing the header;
+    // streams cannot be added after avformat_write_header. If audio metadata
+    // arrives only after this point, it is applied at the NEXT file rotation.
+    add_audio_stream_if_available(inst);
+
     ret = avformat_write_header(oc, nullptr);
     if (ret < 0) {
         log(inst, ZM_LOG_ERROR, "write_header failed: %s", av_err2str(ret));
+        inst->video_stream = nullptr;
+        inst->audio_stream = nullptr;
         return false;
     }
-    
-    inst->video_stream = st;
+
     inst->header_written = true;
-    
+
     return true;
+}
+
+// Add an audio AVStream to the (not-yet-header-written) output context if audio
+// metadata has been received via the EventBus. Best-effort: any failure simply
+// leaves audio_stream null and recording proceeds video-only.
+static void add_audio_stream_if_available(StoreInstance* inst) {
+    inst->audio_stream = nullptr;
+    if (!inst->ebus) return;
+
+    AudioParams ap;
+    {
+        std::lock_guard<std::mutex> lk(inst->ebus->mtx);
+        if (!inst->ebus->audio.valid) return;
+        ap = inst->ebus->audio;   // copy (incl. extradata) under lock
+    }
+
+    AVFormatContext* oc = inst->fmt_ctx.get();
+    AVStream* ast = avformat_new_stream(oc, nullptr);
+    if (!ast) {
+        log(inst, ZM_LOG_ERROR, "Could not create audio stream");
+        return;
+    }
+
+    ast->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
+    ast->codecpar->codec_id    = (enum AVCodecID)ap.codec_id;
+    ast->codecpar->sample_rate = ap.sample_rate;
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 28, 100)
+    av_channel_layout_default(&ast->codecpar->ch_layout, ap.channels > 0 ? ap.channels : 1);
+#else
+    ast->codecpar->channels       = ap.channels;
+    ast->codecpar->channel_layout = av_get_default_channel_layout(ap.channels > 0 ? ap.channels : 1);
+#endif
+
+    if (!ap.extradata.empty()) {
+        uint8_t* ed = (uint8_t*)av_mallocz(ap.extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (ed) {
+            memcpy(ed, ap.extradata.data(), ap.extradata.size());
+            ast->codecpar->extradata = ed;
+            ast->codecpar->extradata_size = (int)ap.extradata.size();
+        } else {
+            log(inst, ZM_LOG_ERROR, "Failed to allocate audio extradata");
+        }
+    }
+
+    // Use the shared microsecond clock as the audio stream time base; the muxer
+    // may adjust it, after which we rescale packet ts into the final time_base.
+    ast->time_base = AVRational{1, 1000000};
+
+    inst->audio_stream = ast;
+    log(inst, ZM_LOG_INFO, "Added audio stream: codec_id=%d sample_rate=%d channels=%d extradata=%zu",
+        ap.codec_id, ap.sample_rate, ap.channels, ap.extradata.size());
 }
 
 // Write a frame to the output file
@@ -458,7 +635,41 @@ static void process_video_frame(StoreInstance* inst, const zm_frame_hdr_t* hdr, 
         log(inst, ZM_LOG_DEBUG, "on_frame: file not open, skipping");
         return;
     }
-    
+
+    // Lazily build the muxer's codec parameters from video StreamMetadata received
+    // on the EventBus. The core delivers the input plugin's metadata there (not as
+    // an on_frame buffer), so without this the header is never written and the
+    // file stays empty.
+    if (!inst->metadata_codecpar && inst->ebus) {
+        VideoParams vp;
+        {
+            std::lock_guard<std::mutex> lk(inst->ebus->mtx);
+            if (inst->ebus->video.valid) vp = inst->ebus->video;
+        }
+        if (vp.valid) {
+            inst->metadata_codecpar = avcodec_parameters_alloc();
+            inst->metadata_codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+            inst->metadata_codecpar->codec_id   = (enum AVCodecID)vp.codec_id;
+            inst->metadata_codecpar->width      = vp.width;
+            inst->metadata_codecpar->height     = vp.height;
+            inst->metadata_codecpar->format     = vp.pix_fmt;
+            inst->metadata_codecpar->profile    = vp.profile;
+            inst->metadata_codecpar->level      = vp.level;
+            if (!vp.extradata.empty()) {
+                inst->metadata_codecpar->extradata =
+                    (uint8_t*)av_mallocz(vp.extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE);
+                if (inst->metadata_codecpar->extradata) {
+                    memcpy(inst->metadata_codecpar->extradata, vp.extradata.data(),
+                           vp.extradata.size());
+                    inst->metadata_codecpar->extradata_size = (int)vp.extradata.size();
+                }
+            }
+            log(inst, ZM_LOG_INFO,
+                "Built video codecpar from StreamMetadata: codec_id=%d %dx%d extradata=%zu",
+                vp.codec_id, vp.width, vp.height, vp.extradata.size());
+        }
+    }
+
     // Handle keyframes
     if (hdr->flags & 1) {
         cache_keyframe(inst, hdr, payload);
@@ -505,6 +716,47 @@ static void process_video_frame(StoreInstance* inst, const zm_frame_hdr_t* hdr, 
     }
 }
 
+// Process a compressed audio frame: best-effort mux into the audio stream of
+// the currently open file. Shares the same source clock (pts_usec) as video.
+static void process_audio_frame(StoreInstance* inst, const zm_frame_hdr_t* hdr, const uint8_t* payload) {
+    std::lock_guard<std::mutex> lock(inst->mtx);
+
+    // Audio is best-effort: drop until the file/header/audio stream are ready.
+    if (!inst->file_open || !inst->header_written || !inst->audio_stream) {
+        return;
+    }
+    // Align audio to the same timeline base as video; if video hasn't set the
+    // start timestamp yet, drop this packet rather than emit a negative ts.
+    if (inst->start_ts == 0) {
+        return;
+    }
+
+    AVPacket* pkt = av_packet_alloc();
+    if (!pkt) return;
+    if (av_new_packet(pkt, hdr->bytes) < 0) {
+        av_packet_free(&pkt);
+        return;
+    }
+    memcpy(pkt->data, payload, hdr->bytes);
+
+    int64_t relative_pts = hdr->pts_usec - inst->start_ts;
+    if (relative_pts < 0) relative_pts = 0;
+    pkt->pts = pkt->dts = av_rescale_q(relative_pts,
+                                       (AVRational){1, 1000000},
+                                       inst->audio_stream->time_base);
+    pkt->duration = 0;
+    pkt->stream_index = inst->audio_stream->index;
+    pkt->flags |= AV_PKT_FLAG_KEY;   // audio frames are independently decodable
+
+    int ret = av_interleaved_write_frame(inst->fmt_ctx.get(), pkt);
+    if (ret < 0) {
+        char err_buf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, err_buf, sizeof(err_buf));
+        log(inst, ZM_LOG_ERROR, "Error writing audio frame: %s", err_buf);
+    }
+    av_packet_free(&pkt);
+}
+
 // Implementation of the frame handler
 static void handle_frame(zm_plugin_t* plugin, const void* buf, size_t size) {
     auto inst = static_cast<StoreInstance*>(plugin->instance);
@@ -531,7 +783,27 @@ static void handle_frame(zm_plugin_t* plugin, const void* buf, size_t size) {
         log(inst, ZM_LOG_ERROR, "Invalid frame: zero bytes in payload");
         return;
     }
-    
+
+    // Audio path: route compressed audio packets to the audio stream and return
+    // before any video-specific keyframe/GPU gating below. Best-effort: dropped
+    // until a file with an audio stream is open (see process_audio_frame).
+    if (hdr->hw_type == ZM_FRAME_COMPRESSED_AUDIO) {
+        if (size < sizeof(zm_frame_hdr_t) + hdr->bytes) {
+            log(inst, ZM_LOG_ERROR, "Audio frame buffer too small: got %zu, need %zu",
+                size, sizeof(zm_frame_hdr_t) + static_cast<size_t>(hdr->bytes));
+            return;
+        }
+        // Respect the stream filter for audio as well.
+        if (!inst->stream_filter.empty()) {
+            bool allowed = false;
+            for (uint32_t s : inst->stream_filter) { if (hdr->stream_id == s) { allowed = true; break; } }
+            if (!allowed) return;
+        }
+        const uint8_t* apayload = static_cast<const uint8_t*>(buf) + sizeof(zm_frame_hdr_t);
+        process_audio_frame(inst, hdr, apayload);
+        return;
+    }
+
     // Skip frames until we get a keyframe to start segment
     if (inst->waiting_for_keyframe && !(hdr->flags & 1)) {
         log(inst, ZM_LOG_DEBUG, "Waiting for keyframe, skipping non-keyframe");
@@ -562,10 +834,16 @@ static void handle_frame(zm_plugin_t* plugin, const void* buf, size_t size) {
         }
     }
     
-    // Skip GPU frames
-    if (hdr->hw_type != ZM_HW_CPU) {
+    // store muxes the COMPRESSED video bitstream straight to disk; it cannot mux a
+    // GPU surface handle (CUDA/VAAPI/VTB/DXVA) or a raw/decoded pixel buffer
+    // (RGB24/GRAY/YUV420P). Accept only ZM_FRAME_COMPRESSED here (compressed audio
+    // was handled and returned above).
+    if (hdr->hw_type != ZM_FRAME_COMPRESSED) {
         if (!inst->warned_gpu) {
-            log(inst, ZM_LOG_WARN, "Skipping GPU frame");
+            log(inst, ZM_LOG_WARN,
+                "Skipping non-compressed video frame (hw_type=%d); store records the "
+                "compressed bitstream only — feed it the capture branch, not a decoder",
+                hdr->hw_type);
             inst->warned_gpu = true;
         }
         return;
@@ -588,6 +866,11 @@ static void handle_frame(zm_plugin_t* plugin, const void* buf, size_t size) {
 static void handle_plugin_stop(zm_plugin_t* plugin) {
     auto inst = static_cast<StoreInstance*>(plugin->instance);
     if (inst) {
+        // Unsubscribe via the host (no more callbacks), flip running off for any
+        // in-flight one. `ebus` is intentionally leaked so a late callback is safe.
+        if (inst->host && inst->host->unsubscribe_evt)
+            inst->host->unsubscribe_evt(inst->host_ctx, inst->ebus_sub_handle);
+        if (inst->ebus) inst->ebus->running.store(false);
         if (inst->metadata_codecpar) {
             avcodec_parameters_free(&inst->metadata_codecpar);
         }
