@@ -1,0 +1,77 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>zm-next detection overlay (WebVTT metadata track)</title>
+<style>
+  body { font: 14px system-ui, sans-serif; background:#111; color:#ddd; margin:0; padding:16px; }
+  h1 { font-size:16px; font-weight:600; }
+  #wrap { position:relative; display:inline-block; max-width:100%; }
+  video { display:block; max-width:100%; height:auto; background:#000; }
+  canvas { position:absolute; left:0; top:0; pointer-events:none; }
+  #bar { margin:10px 0; display:flex; gap:18px; align-items:center; flex-wrap:wrap; }
+  #readout { font-family:ui-monospace,monospace; color:#7CFC00; }
+  label { user-select:none; }
+</style>
+<h1>zm-next — detect on 720p substream, overlay on 4K main stream (WebVTT metadata)</h1>
+<div id="bar">
+  <label><input type="checkbox" id="toggle" checked> Show detections (like a subtitle track)</label>
+  <span id="readout">—</span>
+</div>
+<div id="wrap">
+  <!-- The video stream is UNTOUCHED. The boxes come from the metadata track. -->
+  <video id="v" controls crossorigin="anonymous" src="../clips/sync_4k.mp4">
+    <track id="t" kind="metadata" src="../samples/boxes_lowres.vtt" default>
+  </video>
+  <canvas id="c"></canvas>
+</div>
+<p style="color:#888;max-width:64ch">
+  The <code>&lt;video&gt;</code> plays the original <b>4K</b> H.264 with no re-encode.
+  The <code>&lt;track kind="metadata"&gt;</code> carries the detect_onnx plugin's
+  <code>Event.DETECTION</code> JSON — but detection ran on the cheap <b>720p</b>
+  substream. Each cue records the detection resolution, so the canvas scales the
+  boxes from 720p onto the 4K display for free. <code>cuechange</code> fires and the
+  canvas draws them; the checkbox toggles the layer like a subtitle.
+</p>
+<script>
+const v = document.getElementById('v'), c = document.getElementById('c'), ctx = c.getContext('2d');
+const toggle = document.getElementById('toggle'), readout = document.getElementById('readout');
+const track = document.getElementById('t').track;
+track.mode = 'hidden';                       // metadata tracks: hidden, still fires cuechange
+
+function fit() { c.width = v.clientWidth; c.height = v.clientHeight; draw(); }
+function draw() {
+  ctx.clearRect(0, 0, c.width, c.height);
+  if (!toggle.checked) { readout.textContent = 'overlay off'; return; }
+  const cue = track.activeCues && track.activeCues[0];
+  if (!cue || !v.videoWidth) { readout.textContent = '— no detections —'; return; }
+  let obj; try { obj = JSON.parse(cue.text); } catch { return; }
+  // Cues may wrap the event with the detection resolution {sw,sh,event}; scale the
+  // boxes from THAT resolution onto this (possibly different) display. So detection
+  // done at 720p overlays correctly on the 4K stream.
+  const ev = obj.event || obj;
+  const sw = obj.sw || v.videoWidth, sh = obj.sh || v.videoHeight;
+  const sx = c.width / sw, sy = c.height / sh;
+  const counts = {};
+  ctx.lineWidth = Math.max(2, c.width / 640);
+  ctx.font = `${Math.max(12, Math.round(c.width / 55))}px system-ui`;
+  for (const d of ev.detections || []) {
+    counts[d.label] = (counts[d.label] || 0) + 1;
+    const [x, y, w, h] = d.bbox.map((n, i) => n * (i % 2 ? sy : sx));
+    ctx.strokeStyle = 'rgb(0,230,0)';
+    ctx.strokeRect(x, y, w, h);
+    const label = `${d.label} ${d.confidence.toFixed(2)}`;
+    const tw = ctx.measureText(label).width, th = parseInt(ctx.font) + 4;
+    ctx.fillStyle = 'rgb(0,230,0)';
+    ctx.fillRect(x, Math.max(0, y - th), tw + 6, th);
+    ctx.fillStyle = '#000';
+    ctx.fillText(label, x + 3, Math.max(th - 4, y - 4));
+  }
+  readout.textContent = Object.entries(counts).map(([k, n]) => `${n}× ${k}`).join('  ·  ') || '—';
+}
+
+track.addEventListener('cuechange', draw);
+toggle.addEventListener('change', draw);
+v.addEventListener('loadedmetadata', fit);
+v.addEventListener('seeked', draw);
+addEventListener('resize', fit);
+fit();
+</script>
