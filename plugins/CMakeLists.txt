@@ -5,6 +5,7 @@ project(plugins)
 add_subdirectory(hello)
 add_subdirectory(capture_rtsp_multi)
 add_subdirectory(decode_ffmpeg)
+add_subdirectory(decode_detect)
 
 add_subdirectory(encode_ffmpeg)
 add_subdirectory(privacy_mask)
