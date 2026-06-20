@@ -14,8 +14,9 @@ plugins/*.so
 plugins/*.dll
 plugins/*.dylib
 
-# Pipeline configuration files (may contain sensitive data)
-pipelines/
+# Pipeline configuration files (may contain sensitive data). Ignore the dir
+# CONTENTS (pipelines/*) not the dir itself, so the template negation works.
+pipelines/*
 !pipelines/*.template.json
 
 # Signaling files

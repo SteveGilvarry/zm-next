@@ -1,0 +1,53 @@
+{
+  "_comment": [
+    "One camera, two RTSP renditions via capture_rtsp_multi:",
+    "  stream 0 = main (e.g. 4K) -> recorded to disk as-is (compressed, NO decode)",
+    "  stream 1 = substream (e.g. 720p) -> decoded + run through detect_onnx",
+    "Detection runs on the cheap substream; the main stream is only muxed to disk.",
+    "Copy to pipelines/<name>.json, fill in real URLs/paths (that copy is git-ignored).",
+    "Run from build/:  ./zm-core --pipeline ../pipelines/<name>.json"
+  ],
+  "plugins": [
+    {
+      "id": "capture",
+      "kind": "capture_rtsp_multi",
+      "cfg": {
+        "streams": [
+          { "stream_id": 0, "url": "rtsp://USER:PASS@CAMERA:554/Streaming/Channels/101", "transport": "tcp", "max_retry_attempts": -1, "retry_delay_ms": 2000 },
+          { "stream_id": 1, "url": "rtsp://USER:PASS@CAMERA:554/Streaming/Channels/102", "transport": "tcp", "max_retry_attempts": -1, "retry_delay_ms": 2000 }
+        ]
+      },
+      "queue_depth": 32,
+      "children": [
+        {
+          "id": "record_main",
+          "kind": "store_filesystem",
+          "cfg": { "root": "/var/lib/zm/recordings", "monitor_id": 1, "max_secs": 300, "stream_filter": [0] },
+          "queue_depth": 120
+        },
+        {
+          "id": "decode_sub",
+          "kind": "decode_ffmpeg",
+          "cfg": { "stream_filter": [1], "output_format": "rgb24", "scale": "orig", "threads": 2 },
+          "queue_depth": 8,
+          "children": [
+            {
+              "id": "detect_sub",
+              "kind": "detect_onnx",
+              "cfg": {
+                "model_path": "/path/to/yolo26n.onnx",
+                "ep": "cpu",
+                "input_size": 640,
+                "conf_threshold": 0.30,
+                "frame_width": 1280,
+                "frame_height": 720,
+                "stream_filter": [1]
+              },
+              "queue_depth": 2
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
