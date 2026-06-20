@@ -1,0 +1,52 @@
+{
+  "_comment": [
+    "Detection -> tracking -> alert policy. detect_onnx fires per FRAME; the tracker",
+    "assigns a persistent track_id; alert_policy emits ONE 'alert' per object (not per",
+    "frame) and stays quiet on stationary objects, re-alerting only if one starts moving.",
+    "tracker + alert_policy are event-driven (EventBus) — chain position just instantiates",
+    "them. Copy to pipelines/<name>.json and fill in real URL/model (that copy is ignored)."
+  ],
+  "plugins": [
+    {
+      "id": "capture",
+      "kind": "capture_rtsp_multi",
+      "cfg": { "streams": [ { "stream_id": 0, "url": "rtsp://USER:PASS@CAMERA:554/Streaming/Channels/102", "transport": "tcp", "max_retry_attempts": -1 } ] },
+      "queue_depth": 16,
+      "children": [
+        {
+          "id": "decode",
+          "kind": "decode_ffmpeg",
+          "cfg": { "output_format": "rgb24", "scale": "orig", "threads": 2 },
+          "queue_depth": 8,
+          "children": [
+            {
+              "id": "detect",
+              "kind": "detect_onnx",
+              "cfg": { "model_path": "/path/to/yolo26n.onnx", "ep": "cpu", "conf_threshold": 0.35, "frame_width": 1280, "frame_height": 720 },
+              "queue_depth": 2,
+              "children": [
+                {
+                  "id": "tracker",
+                  "kind": "tracker",
+                  "cfg": { "iou_threshold": 0.3, "max_age": 30, "min_hits": 3 },
+                  "children": [
+                    {
+                      "id": "alerts",
+                      "kind": "alert_policy",
+                      "cfg": {
+                        "classes": ["car", "truck", "bus", "person"],
+                        "stationary_sec": 3.0,
+                        "realert_on_move": true,
+                        "cooldown_sec": 0
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
