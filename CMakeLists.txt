@@ -122,3 +122,13 @@ target_compile_features(wl_dump PRIVATE cxx_std_20)
 add_test(NAME IntegrationSmoke
          COMMAND bash ${CMAKE_SOURCE_DIR}/tests/integration/integration_smoke.sh ${CMAKE_BINARY_DIR})
 set_tests_properties(IntegrationSmoke PROPERTIES TIMEOUT 120)
+
+# ========================================
+# BENCHMARKS (optional)
+# ========================================
+# Decode/detect CPU-vs-GPU benchmark (bench/). Off by default; turn on with
+# -DZM_BUILD_BENCH=ON (needs ONNXRUNTIME_ROOT; CUDA paths need -DZM_WITH_CUDA=ON).
+option(ZM_BUILD_BENCH "Build the decode/detect performance benchmark" OFF)
+if(ZM_BUILD_BENCH)
+    add_subdirectory(bench)
+endif()

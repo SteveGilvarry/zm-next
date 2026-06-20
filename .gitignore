@@ -27,3 +27,8 @@ WebRTC_Guide.md
 
 # clangd / editor cache
 .cache/
+
+# benchmark artifacts (large)
+bench/models/
+bench/clips/
+bench/*.local
