@@ -67,6 +67,17 @@ struct DetectOnnxCtx {
     std::vector<int> streamFilter;      // empty = all
     std::vector<std::string> classNames; // empty = use COCO-80
 
+    // ROI motion cascade (CUDA/GPU surface path only).
+    bool roiMotion = false;            // gate inference on motion + detect per-region crops
+    int motionDownscale = 8;
+    int motionThreshold = 25;
+    int motionMinCells = 0;            // per-region min changed cells (0 = auto ~0.25%)
+    int maxRegions = 8;
+    double fullSweepSec = 2.0;         // periodic full-frame sweep to catch static objects
+    std::vector<uint8_t> prevGrid;     // previous downsampled luma grid (motion state)
+    uint64_t lastSweepUsec = 0;
+    bool sweptOnce = false;
+
     bool warnedUnsupportedShape = false;
     bool warnedNoCuda = false;
 };
@@ -115,6 +126,12 @@ static int detect_onnx_start(zm_plugin_t* plugin, zm_host_api_t* host, void* hos
                 ctx->streamFilter = j["stream_filter"].get<std::vector<int>>();
             if (j.contains("class_names") && j["class_names"].is_array())
                 ctx->classNames = j["class_names"].get<std::vector<std::string>>();
+            ctx->roiMotion = j.value("roi_motion", false);
+            ctx->motionDownscale = j.value("motion_downscale", 8);
+            ctx->motionThreshold = j.value("motion_threshold", 25);
+            ctx->motionMinCells = j.value("motion_min_changed", 0);
+            ctx->maxRegions = j.value("max_regions", 8);
+            ctx->fullSweepSec = j.value("full_sweep_sec", 2.0);
         } catch (const std::exception& e) {
             ZM_LOG_ERROR("detect_onnx: failed to parse config: %s", e.what());
         }
@@ -232,14 +249,44 @@ static void detect_onnx_on_frame(zm_plugin_t* plugin, const void* buf, size_t si
         size >= sizeof(zm_frame_hdr_t) + sizeof(zm_gpu_frame_t)) {
 #ifdef ZMP_WITH_CUDA
         const auto* g = reinterpret_cast<const zm_gpu_frame_t*>(payload);
+        const int gw = static_cast<int>(g->width), gh = static_cast<int>(g->height);
+        const int yp = static_cast<int>(g->linesize[0]), uvp = static_cast<int>(g->linesize[1]);
         try {
-            auto boxes = zm::detect::cuda_infer_nv12(
-                *ctx->session, ctx->inputName, ctx->outputName,
-                g->plane_ptr[0], static_cast<int>(g->linesize[0]),
-                g->plane_ptr[1], static_cast<int>(g->linesize[1]),
-                static_cast<int>(g->width), static_cast<int>(g->height), ctx->net,
-                ctx->confThreshold, ctx->classFilter);
-            publishBoxes(ctx, hdr, boxes);
+            if (ctx->roiMotion) {
+                // Motion-gated, per-region ROI cascade with a periodic full sweep.
+                const int minCells = ctx->motionMinCells > 0 ? ctx->motionMinCells
+                    : std::max(8, (gw / ctx->motionDownscale) * (gh / ctx->motionDownscale) / 400);
+                auto regions = zm::detect::cuda_motion_regions(
+                    g->plane_ptr[0], yp, gw, gh, ctx->prevGrid,
+                    ctx->motionDownscale, ctx->motionThreshold, minCells, ctx->maxRegions);
+                const bool sweep = !ctx->sweptOnce ||
+                    hdr->pts_usec >= ctx->lastSweepUsec + static_cast<uint64_t>(ctx->fullSweepSec * 1e6);
+                std::vector<zm::detect::Box> boxes;
+                if (!regions.empty()) {  // detect each mover's crop in one batched pass
+                    auto rb = zm::detect::cuda_infer_nv12_batch(
+                        *ctx->session, ctx->inputName, ctx->outputName,
+                        g->plane_ptr[0], yp, g->plane_ptr[1], uvp, gw, gh,
+                        regions, ctx->net, ctx->confThreshold, ctx->classFilter);
+                    boxes.insert(boxes.end(), rb.begin(), rb.end());
+                }
+                if (sweep) {  // occasional whole-frame pass for static objects
+                    ctx->lastSweepUsec = hdr->pts_usec;
+                    ctx->sweptOnce = true;
+                    auto fb = zm::detect::cuda_infer_nv12(
+                        *ctx->session, ctx->inputName, ctx->outputName,
+                        g->plane_ptr[0], yp, g->plane_ptr[1], uvp, gw, gh,
+                        ctx->net, ctx->confThreshold, ctx->classFilter);
+                    boxes.insert(boxes.end(), fb.begin(), fb.end());
+                }
+                if (!boxes.empty()) boxes = zm::detect::merge_overlapping(boxes, 0.5f);
+                publishBoxes(ctx, hdr, boxes);
+            } else {
+                auto boxes = zm::detect::cuda_infer_nv12(
+                    *ctx->session, ctx->inputName, ctx->outputName,
+                    g->plane_ptr[0], yp, g->plane_ptr[1], uvp, gw, gh, ctx->net,
+                    ctx->confThreshold, ctx->classFilter);
+                publishBoxes(ctx, hdr, boxes);
+            }
         } catch (const std::exception& e) {
             ZM_LOG_ERROR("detect_onnx: CUDA inference error: %s", e.what());
         }

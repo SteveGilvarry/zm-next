@@ -50,11 +50,33 @@ std::vector<Box> cuda_infer_nv12(Ort::Session& session,
 // Result of the cheap on-GPU luma-diff motion check (bbox in full-frame pixels).
 struct MotionRoi { bool active = false; int x = 0, y = 0, w = 0, h = 0; int changed = 0; };
 
-// Compute a motion bounding box from the surface's luma vs the previous frame's
-// downsampled grid (which it updates in place). Only the small grid crosses PCIe.
+// Compute a single merged motion bounding box from the surface's luma vs the
+// previous frame's downsampled grid (updated in place). Only the grid crosses PCIe.
 MotionRoi cuda_motion_bbox(uint64_t y_ptr, int y_pitch, int width, int height,
                            std::vector<uint8_t>& prev_grid,
                            int ds, int pix_thr, int min_changed);
+
+// Like cuda_motion_bbox but returns SEPARATE motion regions via connected
+// components on the changed-cell grid (4-connectivity, overlapping boxes merged,
+// capped to max_regions by area, each >= min_cells). Lets detection run on each
+// distinct mover instead of one frame-spanning merged box.
+std::vector<MotionRoi> cuda_motion_regions(uint64_t y_ptr, int y_pitch, int width, int height,
+                                           std::vector<uint8_t>& prev_grid,
+                                           int ds, int pix_thr, int min_cells, int max_regions);
+
+// Batched zero-copy ROI inference: preprocess every region's crop of the NV12
+// surface into one [N,3,net,net] device tensor, run a single batched session
+// pass, and decode each region's boxes back to full-surface coordinates. The
+// model must accept a dynamic batch dimension. Returns all boxes (flattened).
+std::vector<Box> cuda_infer_nv12_batch(Ort::Session& session,
+                                       const std::string& input_name,
+                                       const std::string& output_name,
+                                       uint64_t y_ptr, int y_pitch,
+                                       uint64_t uv_ptr, int uv_pitch,
+                                       int full_w, int full_h,
+                                       const std::vector<MotionRoi>& regions,
+                                       int net, float conf_thr,
+                                       const std::vector<int>& allow);
 
 }  // namespace zm::detect
 

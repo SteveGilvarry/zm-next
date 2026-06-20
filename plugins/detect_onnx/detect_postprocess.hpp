@@ -118,4 +118,24 @@ inline std::vector<Box> decode_nms_free(const float* out, int num, const Letterb
     return boxes;
 }
 
+// Greedy IoU de-duplication (keep highest-confidence box per cluster, same class).
+// Used to merge detections from overlapping ROI crops and the full-frame sweep.
+inline std::vector<Box> merge_overlapping(std::vector<Box> boxes, float iou_thr = 0.5f) {
+    std::sort(boxes.begin(), boxes.end(),
+              [](const Box& a, const Box& b) { return a.confidence > b.confidence; });
+    std::vector<Box> keep;
+    for (const auto& b : boxes) {
+        bool dup = false;
+        for (const auto& k : keep) {
+            if (k.class_id != b.class_id) continue;
+            const float ix = std::max(0.f, std::min(b.x + b.w, k.x + k.w) - std::max(b.x, k.x));
+            const float iy = std::max(0.f, std::min(b.y + b.h, k.y + k.h) - std::max(b.y, k.y));
+            const float inter = ix * iy, uni = b.w * b.h + k.w * k.h - inter;
+            if (uni > 0 && inter / uni > iou_thr) { dup = true; break; }
+        }
+        if (!dup) keep.push_back(b);
+    }
+    return keep;
+}
+
 } // namespace zm::detect
