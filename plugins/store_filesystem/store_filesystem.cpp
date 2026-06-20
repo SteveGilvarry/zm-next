@@ -488,7 +488,9 @@ static bool initialize_video_stream(StoreInstance* inst) {
 
     ret = avformat_write_header(oc, nullptr);
     if (ret < 0) {
-        log(inst, ZM_LOG_ERROR, "write_header failed: %s", av_err2str(ret));
+        char err_buf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, err_buf, sizeof(err_buf));
+        log(inst, ZM_LOG_ERROR, "write_header failed: %s", err_buf);
         inst->video_stream = nullptr;
         inst->audio_stream = nullptr;
         return false;
@@ -722,7 +724,9 @@ static void process_video_frame(StoreInstance* inst, const zm_frame_hdr_t* hdr, 
             inst->last_keyframe->stream_index = inst->video_stream->index;
             int ret = av_interleaved_write_frame(inst->fmt_ctx.get(), inst->last_keyframe);
             if (ret < 0) {
-                log(inst, ZM_LOG_ERROR, "Failed to write cached keyframe: %s", av_err2str(ret));
+                char err_buf[AV_ERROR_MAX_STRING_SIZE];
+                av_strerror(ret, err_buf, sizeof(err_buf));
+                log(inst, ZM_LOG_ERROR, "Failed to write cached keyframe: %s", err_buf);
             } else {
                 log(inst, ZM_LOG_INFO, "Successfully wrote cached keyframe");
             }

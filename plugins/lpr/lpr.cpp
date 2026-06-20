@@ -21,7 +21,9 @@
 #include "../detect_onnx/detect_postprocess.hpp"
 
 #include <onnxruntime_cxx_api.h>
+#ifdef __APPLE__
 #include <coreml_provider_factory.h>
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -158,6 +160,7 @@ static int lpr_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx,
 
     // Optionally append the CoreML execution provider, falling back to CPU.
     if (ctx->ep == "coreml") {
+#ifdef __APPLE__
         try {
             uint32_t coreml_flags = 0;
             Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_CoreML(
@@ -166,6 +169,9 @@ static int lpr_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx,
         } catch (const std::exception& e) {
             ZM_LOG_WARN("lpr: CoreML EP unavailable, falling back to CPU: %s", e.what());
         }
+#else
+        ZM_LOG_WARN("lpr: CoreML EP not available on this platform, falling back to CPU");
+#endif
     }
 
     // Construct both sessions; either missing -> pass-through.

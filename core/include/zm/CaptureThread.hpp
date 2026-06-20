@@ -3,6 +3,8 @@
 #include <thread>
 #include <atomic>
 #include <memory>
+#include <vector>
+#include <string>
 #include "zm_plugin.h"
 #include "zm/ShmRing.hpp"
 
