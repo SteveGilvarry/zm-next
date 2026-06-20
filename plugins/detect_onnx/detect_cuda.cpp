@@ -8,7 +8,9 @@
 #ifdef ZMP_WITH_CUDA
 
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace zm::detect {
@@ -29,8 +31,17 @@ std::vector<Box> cuda_infer_nv12(Ort::Session& session,
                                  uint64_t y_ptr, int y_pitch,
                                  uint64_t uv_ptr, int uv_pitch,
                                  int width, int height, int net,
-                                 float conf_thr, const std::vector<int>& allow) {
-    const Letterbox lb = compute_letterbox(width, height, net);
+                                 float conf_thr, const std::vector<int>& allow,
+                                 int crop_x, int crop_y, int crop_w, int crop_h) {
+    // Default (0s) => whole frame. NV12 chroma is 2x2 subsampled, so keep the
+    // crop origin/size even and clamped to the surface.
+    if (crop_w <= 0 || crop_h <= 0) { crop_x = 0; crop_y = 0; crop_w = width; crop_h = height; }
+    crop_x &= ~1; crop_y &= ~1; crop_w &= ~1; crop_h &= ~1;
+    if (crop_x + crop_w > width)  crop_w = (width  - crop_x) & ~1;
+    if (crop_y + crop_h > height) crop_h = (height - crop_y) & ~1;
+    if (crop_w <= 0 || crop_h <= 0) return {};
+
+    const Letterbox lb = compute_letterbox(crop_w, crop_h, net);
 
     // Device input tensor (NCHW float), filled on-device by the fused kernel.
     const size_t n_floats = static_cast<size_t>(3) * net * net;
@@ -39,7 +50,8 @@ std::vector<Box> cuda_infer_nv12(Ort::Session& session,
 
     int kerr = launch_nv12_to_chw(reinterpret_cast<const uint8_t*>(y_ptr), y_pitch,
                                   reinterpret_cast<const uint8_t*>(uv_ptr), uv_pitch,
-                                  width, height, lb.scale, lb.pad_x, lb.pad_y, net,
+                                  crop_x, crop_y, crop_w, crop_h,
+                                  lb.scale, lb.pad_x, lb.pad_y, net,
                                   static_cast<float*>(d_input.ptr));
     if (kerr != 0) throw std::runtime_error("nv12_to_chw kernel launch failed");
 
@@ -68,7 +80,51 @@ std::vector<Box> cuda_infer_nv12(Ort::Session& session,
     if (shape.size() == 3)      num = static_cast<int>(shape[1]);
     else if (shape.size() == 2) num = static_cast<int>(shape[0]);
 
-    return decode_nms_free(out, num, lb, conf_thr, allow);
+    std::vector<Box> boxes = decode_nms_free(out, num, lb, conf_thr, allow);
+    if (crop_x || crop_y)  // map crop-space boxes back to full-surface coordinates
+        for (Box& b : boxes) { b.x += crop_x; b.y += crop_y; }
+    return boxes;
+}
+
+MotionRoi cuda_motion_bbox(uint64_t y_ptr, int y_pitch, int width, int height,
+                           std::vector<uint8_t>& prev_grid,
+                           int ds, int pix_thr, int min_changed) {
+    const int sw = width / ds, sh = height / ds;
+    const size_t n = static_cast<size_t>(sw) * sh;
+    DeviceBuffer d_grid(n);
+    if (!d_grid.ptr) throw std::runtime_error("cudaMalloc(grid) failed");
+    if (launch_luma_grid(reinterpret_cast<const uint8_t*>(y_ptr), y_pitch, width, height,
+                         ds, sw, sh, static_cast<uint8_t*>(d_grid.ptr)) != 0)
+        throw std::runtime_error("luma_grid kernel launch failed");
+    std::vector<uint8_t> cur(n);
+    cudaMemcpy(cur.data(), d_grid.ptr, n, cudaMemcpyDeviceToHost);  // tiny grid only
+
+    MotionRoi m;
+    if (prev_grid.size() == n) {
+        int minx = sw, miny = sh, maxx = -1, maxy = -1, cnt = 0;
+        for (int j = 0; j < sh; ++j) {
+            for (int i = 0; i < sw; ++i) {
+                int d = std::abs(static_cast<int>(cur[j * sw + i]) -
+                                 static_cast<int>(prev_grid[j * sw + i]));
+                if (d > pix_thr) {
+                    ++cnt;
+                    minx = std::min(minx, i); miny = std::min(miny, j);
+                    maxx = std::max(maxx, i); maxy = std::max(maxy, j);
+                }
+            }
+        }
+        m.changed = cnt;
+        if (cnt >= min_changed && maxx >= minx) {
+            m.active = true;
+            int x0 = minx * ds, y0 = miny * ds, x1 = (maxx + 1) * ds, y1 = (maxy + 1) * ds;
+            const int mx = (x1 - x0) / 5, my = (y1 - y0) / 5;  // 20% margin
+            x0 = std::max(0, x0 - mx); y0 = std::max(0, y0 - my);
+            x1 = std::min(width, x1 + mx); y1 = std::min(height, y1 + my);
+            m.x = x0; m.y = y0; m.w = x1 - x0; m.h = y1 - y0;
+        }
+    }
+    prev_grid.swap(cur);
+    return m;
 }
 
 }  // namespace zm::detect

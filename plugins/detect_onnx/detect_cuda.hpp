@@ -15,27 +15,46 @@
 
 namespace zm::detect {
 
-// Launch the fused preprocessing kernel: sample the NV12 CUDA surface (Y plane at
-// y_ptr/y_pitch, interleaved UV plane at uv_ptr/uv_pitch) into a planar,
-// normalized CHW float tensor (3*net*net) on the device, applying the same
-// letterbox (scale/pad, 114/255 border, BT.601 YUV->RGB, /255) as the CPU path.
-// Defined in detect_cuda.cu. Returns a cudaError_t-as-int (0 == success).
+// Launch the fused preprocessing kernel: sample a region (crop_x/crop_y origin,
+// crop_w x crop_h dims) of the NV12 CUDA surface (Y at y_ptr/y_pitch, interleaved
+// UV at uv_ptr/uv_pitch) into a planar normalized CHW float tensor (3*net*net) on
+// the device, applying the same letterbox (scale/pad, 114/255 border, BT.601
+// YUV->RGB, /255) as the CPU path. Defined in detect_cuda.cu. 0 == success.
 int launch_nv12_to_chw(const uint8_t* y_ptr, int y_pitch,
                        const uint8_t* uv_ptr, int uv_pitch,
-                       int src_w, int src_h,
+                       int crop_x, int crop_y, int crop_w, int crop_h,
                        float scale, int pad_x, int pad_y,
                        int net, float* d_out);
 
-// Full zero-copy GPU inference: preprocess the NV12 surface on-device, run the
-// session via IoBinding bound to CUDA memory (no host readback of the image),
-// and decode the NMS-free output into source-pixel boxes.
+// Downsample the luma plane to a small sw x sh grid on-device (for cheap on-GPU
+// motion diffing). Only the tiny grid is read back, never the full frame.
+int launch_luma_grid(const uint8_t* y_ptr, int y_pitch, int w, int h,
+                     int ds, int sw, int sh, uint8_t* d_grid);
+
+// Full zero-copy GPU inference: preprocess the NV12 surface (optionally just a
+// crop region) on-device, run the session via IoBinding bound to CUDA memory (no
+// host readback of the image), and decode the NMS-free output into source-pixel
+// boxes. A non-empty crop (crop_w>0 && crop_h>0) runs detection on just that
+// region and maps boxes back to full-surface coordinates; the default (0s) runs
+// the whole frame, so existing callers are unaffected.
 std::vector<Box> cuda_infer_nv12(Ort::Session& session,
                                  const std::string& input_name,
                                  const std::string& output_name,
                                  uint64_t y_ptr, int y_pitch,
                                  uint64_t uv_ptr, int uv_pitch,
                                  int width, int height, int net,
-                                 float conf_thr, const std::vector<int>& allow);
+                                 float conf_thr, const std::vector<int>& allow,
+                                 int crop_x = 0, int crop_y = 0,
+                                 int crop_w = 0, int crop_h = 0);
+
+// Result of the cheap on-GPU luma-diff motion check (bbox in full-frame pixels).
+struct MotionRoi { bool active = false; int x = 0, y = 0, w = 0, h = 0; int changed = 0; };
+
+// Compute a motion bounding box from the surface's luma vs the previous frame's
+// downsampled grid (which it updates in place). Only the small grid crosses PCIe.
+MotionRoi cuda_motion_bbox(uint64_t y_ptr, int y_pitch, int width, int height,
+                           std::vector<uint8_t>& prev_grid,
+                           int ds, int pix_thr, int min_changed);
 
 }  // namespace zm::detect
 
