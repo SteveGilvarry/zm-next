@@ -21,6 +21,20 @@ target_include_directories(bench_roi_cascade PRIVATE
 target_link_directories(bench_roi_cascade PRIVATE ${ONNXRUNTIME_ROOT}/lib)
 target_link_libraries(bench_roi_cascade PRIVATE PkgConfig::BFFMPEG onnxruntime)
 
+# (3) event dump: drives the REAL decode_ffmpeg -> detect_onnx plugins and writes
+# the detection events the detect plugin publishes (the faithful pipeline output).
+add_executable(bench_events bench_events.cpp)
+target_compile_features(bench_events PRIVATE cxx_std_17)
+target_include_directories(bench_events PRIVATE ${CMAKE_SOURCE_DIR}/core/include)
+target_link_libraries(bench_events PRIVATE PkgConfig::BFFMPEG dl)
+
+# (4) burned-in overlay: draw the plugin's boxes in C++ and re-encode an MP4 + JPEGs
+find_package(nlohmann_json CONFIG REQUIRED)
+add_executable(bench_overlay bench_overlay.cpp)
+target_compile_features(bench_overlay PRIVATE cxx_std_17)
+target_include_directories(bench_overlay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(bench_overlay PRIVATE PkgConfig::BFFMPEG nlohmann_json::nlohmann_json)
+
 if(ZM_WITH_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(bench_decode_detect PRIVATE CUDA::cudart)
