@@ -83,8 +83,8 @@ TEST(DecodeFfmpeg, DecodesSampleH264) {
         plugin.on_frame(&plugin, buf.data(), buf.size());
     }
     ASSERT_NE(plugin.instance, nullptr);
-    // Load sample packets (absolute path)
-    load_packets("/Users/stevengilvarry/Code/zm-next/plugins/decode_ffmpeg/tests/data/packet.h264");
+    // Load sample packets (path injected by CMake, relative to this test's source dir)
+    load_packets(TEST_DATA_DIR "/packet.h264");
     for (const auto& pkt : packets) {
         std::vector<uint8_t> buf(sizeof(zm_frame_hdr_t) + pkt.size());
         zm_frame_hdr_t* hdr = reinterpret_cast<zm_frame_hdr_t*>(buf.data());
