@@ -47,6 +47,15 @@ std::vector<Box> cuda_infer_nv12(Ort::Session& session,
                                  int crop_x = 0, int crop_y = 0,
                                  int crop_w = 0, int crop_h = 0);
 
+// Preprocess one NV12 surface (optionally a crop) into a thread-local device CHW
+// tensor (3*net*net floats) and return that device pointer plus the letterbox used.
+// For feeding the shared InferenceEngine: the caller preprocesses zero-copy here,
+// then hands the tensor to the engine which batches and runs it. The buffer is
+// reused per thread, so consume it before the next call on the same thread.
+const float* cuda_preprocess_nv12(uint64_t y_ptr, int y_pitch, uint64_t uv_ptr, int uv_pitch,
+                                  int width, int height, int net, Letterbox& out_lb,
+                                  int crop_x = 0, int crop_y = 0, int crop_w = 0, int crop_h = 0);
+
 // Result of the cheap on-GPU luma-diff motion check (bbox in full-frame pixels).
 struct MotionRoi { bool active = false; int x = 0, y = 0, w = 0, h = 0; int changed = 0; };
 

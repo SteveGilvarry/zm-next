@@ -14,6 +14,7 @@
 #endif
 #ifdef ZMP_WITH_CUDA
 #include <cuda_runtime.h>
+#include "detect_engine.hpp"
 #endif
 
 #include <nlohmann/json.hpp>
@@ -80,6 +81,8 @@ struct DetectOnnxCtx {
     std::vector<uint8_t> prevGrid;     // previous downsampled luma grid (motion state)
     uint64_t lastSweepUsec = 0;
     bool sweptOnce = false;
+    bool sharedEngine = false;     // route full-frame CUDA detect through the shared engine
+    bool engineReady = false;
 
     bool warnedUnsupportedShape = false;
     bool warnedNoCuda = false;
@@ -135,6 +138,7 @@ static int detect_onnx_start(zm_plugin_t* plugin, zm_host_api_t* host, void* hos
             ctx->motionMinCells = j.value("motion_min_changed", 0);
             ctx->maxRegions = j.value("max_regions", 8);
             ctx->fullSweepSec = j.value("full_sweep_sec", 2.0);
+            ctx->sharedEngine = j.value("shared_engine", false);
         } catch (const std::exception& e) {
             ZM_LOG_ERROR("detect_onnx: failed to parse config: %s", e.what());
         }
@@ -182,8 +186,24 @@ static int detect_onnx_start(zm_plugin_t* plugin, zm_host_api_t* host, void* hos
     }
 #endif
 
-    // Construct the session if a model path was given.
-    if (!ctx->modelPath.empty() && ctx->env) {
+#ifdef ZMP_WITH_CUDA
+    // Opt-in: route full-frame CUDA detection through the process-wide shared,
+    // batched engine (one ORT session + CUDA context for all detect instances).
+    if (ctx->sharedEngine && ctx->ep == "cuda" && !ctx->modelPath.empty()) {
+        try {
+            zm::detect::InferenceEngine::get(ctx->modelPath, ctx->net);   // load shared session now
+            ctx->engineReady = true;
+            ctx->roiMotion = false;   // engine path is whole-frame only
+            ZM_LOG_INFO("detect_onnx: using SHARED batched inference engine (model '%s')",
+                        ctx->modelPath.c_str());
+        } catch (const std::exception& e) {
+            ZM_LOG_ERROR("detect_onnx: shared engine init failed (%s); using per-instance session", e.what());
+        }
+    }
+#endif
+
+    // Construct a per-instance session unless the shared engine owns inference.
+    if (!ctx->engineReady && !ctx->modelPath.empty() && ctx->env) {
         try {
             ctx->session = std::make_unique<Ort::Session>(
                 *ctx->env, ctx->modelPath.c_str(), ctx->sessionOptions);
@@ -202,7 +222,7 @@ static int detect_onnx_start(zm_plugin_t* plugin, zm_host_api_t* host, void* hos
                          ctx->modelPath.c_str(), e.what());
             ctx->session.reset();
         }
-    } else {
+    } else if (!ctx->engineReady) {
         ZM_LOG_WARN("detect_onnx: no model_path configured; running as pass-through");
     }
 
@@ -252,7 +272,7 @@ static void detect_onnx_on_frame(zm_plugin_t* plugin, const void* buf, size_t si
     const uint8_t* payload = static_cast<const uint8_t*>(buf) + sizeof(zm_frame_hdr_t);
 
     // Zero-copy GPU path: a CUDA NV12 surface from NVDEC hardware decode.
-    if (ctx->session && hdr->hw_type == ZM_HW_CUDA &&
+    if ((ctx->session || ctx->engineReady) && hdr->hw_type == ZM_HW_CUDA &&
         size >= sizeof(zm_frame_hdr_t) + sizeof(zm_gpu_frame_t)) {
 #ifdef ZMP_WITH_CUDA
         const auto* g = reinterpret_cast<const zm_gpu_frame_t*>(payload);
@@ -286,6 +306,16 @@ static void detect_onnx_on_frame(zm_plugin_t* plugin, const void* buf, size_t si
                     boxes.insert(boxes.end(), fb.begin(), fb.end());
                 }
                 if (!boxes.empty()) boxes = zm::detect::merge_overlapping(boxes, 0.5f);
+                publishBoxes(ctx, hdr, boxes);
+            } else if (ctx->engineReady) {
+                // Shared batched engine: preprocess the surface zero-copy, then
+                // submit the tensor (coalesced with other streams into one Run).
+                zm::detect::Letterbox lb;
+                const float* d = zm::detect::cuda_preprocess_nv12(
+                    g->plane_ptr[0], yp, g->plane_ptr[1], uvp, gw, gh, ctx->net, lb);
+                std::vector<zm::detect::Box> boxes;
+                if (d) boxes = zm::detect::InferenceEngine::get(ctx->modelPath, ctx->net)
+                                   .infer(d, lb, ctx->confThreshold, ctx->classFilter);
                 publishBoxes(ctx, hdr, boxes);
             } else {
                 auto boxes = zm::detect::cuda_infer_nv12(

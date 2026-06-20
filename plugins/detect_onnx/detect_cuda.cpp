@@ -103,6 +103,26 @@ std::vector<Box> cuda_infer_nv12(Ort::Session& session,
     return boxes;
 }
 
+const float* cuda_preprocess_nv12(uint64_t y_ptr, int y_pitch, uint64_t uv_ptr, int uv_pitch,
+                                  int width, int height, int net, Letterbox& out_lb,
+                                  int crop_x, int crop_y, int crop_w, int crop_h) {
+    if (crop_w <= 0 || crop_h <= 0) { crop_x = 0; crop_y = 0; crop_w = width; crop_h = height; }
+    crop_x &= ~1; crop_y &= ~1; crop_w &= ~1; crop_h &= ~1;
+    if (crop_x + crop_w > width)  crop_w = (width  - crop_x) & ~1;
+    if (crop_y + crop_h > height) crop_h = (height - crop_y) & ~1;
+    if (crop_w <= 0 || crop_h <= 0) return nullptr;
+    out_lb = compute_letterbox(crop_w, crop_h, net);
+    const size_t n_floats = static_cast<size_t>(3) * net * net;
+    float* d = static_cast<float*>(g_input.get(n_floats * sizeof(float)));
+    if (!d) return nullptr;
+    if (launch_nv12_to_chw(reinterpret_cast<const uint8_t*>(y_ptr), y_pitch,
+                           reinterpret_cast<const uint8_t*>(uv_ptr), uv_pitch,
+                           crop_x, crop_y, crop_w, crop_h,
+                           out_lb.scale, out_lb.pad_x, out_lb.pad_y, net, d) != 0)
+        return nullptr;
+    return d;
+}
+
 MotionRoi cuda_motion_bbox(uint64_t y_ptr, int y_pitch, int width, int height,
                            std::vector<uint8_t>& prev_grid,
                            int ds, int pix_thr, int min_changed) {

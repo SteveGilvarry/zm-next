@@ -32,7 +32,7 @@ endif()
 # top-level CMake when ZM_WITH_CUDA=ON, reaching both the C++ and CUDA sources.
 if(ZM_WITH_CUDA)
     enable_language(CUDA)
-    target_sources(detect_onnx PRIVATE detect_cuda.cpp detect_cuda.cu)
+    target_sources(detect_onnx PRIVATE detect_cuda.cpp detect_cuda.cu detect_engine.cpp)
     target_link_libraries(detect_onnx PRIVATE CUDA::cudart)
     set_target_properties(detect_onnx PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
 endif()
