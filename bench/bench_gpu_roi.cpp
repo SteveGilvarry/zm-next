@@ -71,6 +71,7 @@ struct Ctx {
     std::string in, out;
     int net = 640; float conf = 0.25f;
     int ds = 8, thr = 25, minchg = 0, maxRegions = 8;
+    int only = 0;   // 0=all (compare), 1=full, 2=gated, 3=roi  (single-method for profiling)
     std::vector<uint8_t> prev;
     // stats
     int frames = 0, motion = 0, inf_full = 0, inf_gate = 0, inf_roi = 0;
@@ -94,14 +95,40 @@ static void on_frame(void* vc, const void* buf, size_t size) {
     const int w = (int)g->width, h = (int)g->height;
     if (!yp || !uvp) return;
 
+    // --- single-method modes (clean resource attribution) ---
+    if (c->only == 1) {  // full-frame inference every frame
+        ++c->frames;
+        auto tf = clk::now();
+        auto bf = zm::detect::cuda_infer_nv12(*c->sess, c->in, c->out, yp, ypitch, uvp, uvpitch, w, h, c->net, c->conf, {});
+        c->t_full += ms(tf); ++c->inf_full; c->det_full += (long)bf.size();
+        return;
+    }
     auto tm = clk::now();
     auto regions = zm::detect::cuda_motion_regions(yp, ypitch, w, h, c->prev, c->ds, c->thr, c->minchg, c->maxRegions);
     c->t_motion += ms(tm);
+    ++c->frames;
+    if (c->only == 2) {  // motion-gated full-frame inference (skip idle)
+        if (regions.empty()) return;
+        ++c->motion; ++c->inf_gate; c->total_regions += (long)regions.size();
+        auto tf = clk::now();
+        auto bf = zm::detect::cuda_infer_nv12(*c->sess, c->in, c->out, yp, ypitch, uvp, uvpitch, w, h, c->net, c->conf, {});
+        c->t_full += ms(tf); c->det_gate += (long)bf.size();
+        return;
+    }
+    if (c->only == 3) {  // motion-gated per-region batched ROI inference
+        if (regions.empty()) return;
+        ++c->motion; ++c->inf_roi; c->total_regions += (long)regions.size();
+        auto tr = clk::now();
+        auto br = zm::detect::cuda_infer_nv12_batch(*c->sess, c->in, c->out, yp, ypitch, uvp, uvpitch, w, h, regions, c->net, c->conf, {});
+        c->t_roi += ms(tr); c->det_roi += (long)br.size();
+        return;
+    }
 
+    // --- only == 0: run full + ROI and cross-compare (the analysis mode) ---
     auto tf = clk::now();
     auto bf = zm::detect::cuda_infer_nv12(*c->sess, c->in, c->out, yp, ypitch, uvp, uvpitch, w, h, c->net, c->conf, {});
     c->t_full += ms(tf);
-    ++c->frames; ++c->inf_full; c->det_full += (long)bf.size();
+    ++c->inf_full; c->det_full += (long)bf.size();
 
     if (regions.empty()) return;
     ++c->motion; ++c->inf_gate; c->det_gate += (long)bf.size();
@@ -129,11 +156,12 @@ struct Plugin { void* h = nullptr; void (*init)(zm_plugin_t*) = nullptr;
 
 int main(int argc, char** argv) {
     std::string input, model, plugdir = "plugins";
-    int maxf = 300, thr = 25, minchg = -1;
+    int maxf = 300, thr = 25, minchg = -1, loops = 1, only = 0;
     for (int i = 1; i < argc; ++i) { std::string a = argv[i]; auto nx = [&]{ return (i + 1 < argc) ? argv[++i] : ""; };
         if (a == "--input") input = nx(); else if (a == "--model") model = nx(); else if (a == "--plugins") plugdir = nx();
         else if (a == "--max-frames") maxf = std::atoi(nx()); else if (a == "--motion-threshold") thr = std::atoi(nx());
-        else if (a == "--min-changed") minchg = std::atoi(nx()); }
+        else if (a == "--min-changed") minchg = std::atoi(nx()); else if (a == "--loops") loops = std::atoi(nx());
+        else if (a == "--only") { std::string m = nx(); only = (m == "full") ? 1 : (m == "gated") ? 2 : (m == "roi") ? 3 : 0; } }
     if (input.empty() || model.empty()) { fprintf(stderr, "need --input and --model\n"); return 2; }
 
     Src s;
@@ -143,6 +171,7 @@ int main(int argc, char** argv) {
     Ctx ctx;
     ctx.ds = 8; ctx.thr = thr;
     ctx.minchg = (minchg < 0) ? std::max(8, (s.w / ctx.ds) * (s.h / ctx.ds) / 400) : minchg;  // per-region
+    ctx.only = only;
 
     Ort::Env env(ORT_LOGGING_LEVEL_ERROR, "gpuroi");
     Ort::SessionOptions so; so.SetIntraOpNumThreads(1); so.SetGraphOptimizationLevel(ORT_ENABLE_ALL);
@@ -160,19 +189,27 @@ int main(int argc, char** argv) {
     printf("\n=== GPU zero-copy ROI cascade: %dx%d %s | NVDEC->CUDA detect | grid %dx%d min_changed=%d ===\n",
            s.w, s.h, s.codec.c_str(), s.w / ctx.ds, s.h / ctx.ds, ctx.minchg);
     std::vector<uint8_t> buf;
-    for (auto& pk : s.pkts) {
-        buf.resize(sizeof(zm_frame_hdr_t) + pk.size());
-        auto* hd = reinterpret_cast<zm_frame_hdr_t*>(buf.data()); *hd = {};
-        hd->hw_type = ZM_FRAME_COMPRESSED; hd->bytes = (uint32_t)pk.size();
-        std::memcpy(buf.data() + sizeof(zm_frame_hdr_t), pk.data(), pk.size());
-        p.on_frame(&p, buf.data(), buf.size());
-    }
+    for (int L = 0; L < loops; ++L)
+        for (auto& pk : s.pkts) {
+            buf.resize(sizeof(zm_frame_hdr_t) + pk.size());
+            auto* hd = reinterpret_cast<zm_frame_hdr_t*>(buf.data()); *hd = {};
+            hd->hw_type = ZM_FRAME_COMPRESSED; hd->bytes = (uint32_t)pk.size();
+            std::memcpy(buf.data() + sizeof(zm_frame_hdr_t), pk.data(), pk.size());
+            p.on_frame(&p, buf.data(), buf.size());
+        }
     p.stop(&p);
 
     Ctx& c = ctx;
     double idle = c.frames ? 100.0 * (c.frames - c.motion) / c.frames : 0;
     printf("\nframes: %d   motion frames: %d   idle (skipped): %.1f%%\n", c.frames, c.motion, idle);
     printf("on-GPU motion check: %.3f ms/frame\n", c.frames ? c.t_motion / c.frames : 0);
+    {   // uniform machine-parsable summary line (works for every --only mode)
+        const char* mn = c.only == 1 ? "full" : c.only == 2 ? "gated" : c.only == 3 ? "roi" : "all";
+        const int ninf = c.inf_full + c.inf_gate + c.inf_roi;
+        const double tinf = c.t_full + c.t_roi;
+        printf("METHOD only=%s inferences=%d ms_per_inf=%.3f inf_per_s=%.0f motion_frames=%d frames=%d\n",
+               mn, ninf, ninf ? tinf / ninf : 0.0, tinf > 0 ? 1000.0 * ninf / tinf : 0.0, c.motion, c.frames);
+    }
     printf("\n%-14s %10s %12s %14s\n", "strategy", "inferences", "detections", "avg ms/inf");
     printf("%-14s %10d %12ld %14.2f\n", "full-frame",  c.inf_full, c.det_full, c.inf_full ? c.t_full / c.inf_full : 0);
     printf("%-14s %10d %12ld %14s\n",  "motion-gated", c.inf_gate, c.det_gate, "(=full)");

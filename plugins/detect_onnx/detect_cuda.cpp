@@ -24,6 +24,22 @@ struct DeviceBuffer {
     }
     ~DeviceBuffer() { if (ptr) cudaFree(ptr); }
 };
+// Grow-and-keep device scratch, reused across calls on the same thread so the hot
+// inference path doesn't cudaMalloc/cudaFree every frame (cuts host-side overhead).
+struct Scratch {
+    void* ptr = nullptr; size_t cap = 0;
+    void* get(size_t bytes) {
+        if (bytes > cap) {
+            if (ptr) cudaFree(ptr);
+            if (cudaMalloc(&ptr, bytes) != cudaSuccess) { ptr = nullptr; cap = 0; }
+            else cap = bytes;
+        }
+        return ptr;
+    }
+    ~Scratch() { if (ptr) cudaFree(ptr); }
+};
+thread_local Scratch g_input;   // CHW input tensor (single + batched)
+thread_local Scratch g_grid;    // downsampled luma motion grid
 }  // namespace
 
 std::vector<Box> cuda_infer_nv12(Ort::Session& session,
@@ -46,21 +62,21 @@ std::vector<Box> cuda_infer_nv12(Ort::Session& session,
 
     // Device input tensor (NCHW float), filled on-device by the fused kernel.
     const size_t n_floats = static_cast<size_t>(3) * net * net;
-    DeviceBuffer d_input(n_floats * sizeof(float));
-    if (!d_input.ptr) throw std::runtime_error("cudaMalloc(input) failed");
+    float* d_input = static_cast<float*>(g_input.get(n_floats * sizeof(float)));
+    if (!d_input) throw std::runtime_error("cudaMalloc(input) failed");
 
     int kerr = launch_nv12_to_chw(reinterpret_cast<const uint8_t*>(y_ptr), y_pitch,
                                   reinterpret_cast<const uint8_t*>(uv_ptr), uv_pitch,
                                   crop_x, crop_y, crop_w, crop_h,
                                   lb.scale, lb.pad_x, lb.pad_y, net,
-                                  static_cast<float*>(d_input.ptr));
+                                  d_input);
     if (kerr != 0) throw std::runtime_error("nv12_to_chw kernel launch failed");
 
     // Bind the device buffer directly as the model input — no host copy.
     Ort::MemoryInfo cudaMem("Cuda", OrtArenaAllocator, 0, OrtMemTypeDefault);
     const std::array<int64_t, 4> inShape{1, 3, net, net};
     Ort::Value inTensor = Ort::Value::CreateTensor<float>(
-        cudaMem, static_cast<float*>(d_input.ptr), n_floats, inShape.data(), inShape.size());
+        cudaMem, d_input, n_floats, inShape.data(), inShape.size());
 
     Ort::IoBinding binding(session);
     binding.BindInput(input_name.c_str(), inTensor);
@@ -92,13 +108,13 @@ MotionRoi cuda_motion_bbox(uint64_t y_ptr, int y_pitch, int width, int height,
                            int ds, int pix_thr, int min_changed) {
     const int sw = width / ds, sh = height / ds;
     const size_t n = static_cast<size_t>(sw) * sh;
-    DeviceBuffer d_grid(n);
-    if (!d_grid.ptr) throw std::runtime_error("cudaMalloc(grid) failed");
+    uint8_t* d_grid = static_cast<uint8_t*>(g_grid.get(n));
+    if (!d_grid) throw std::runtime_error("cudaMalloc(grid) failed");
     if (launch_luma_grid(reinterpret_cast<const uint8_t*>(y_ptr), y_pitch, width, height,
-                         ds, sw, sh, static_cast<uint8_t*>(d_grid.ptr)) != 0)
+                         ds, sw, sh, d_grid) != 0)
         throw std::runtime_error("luma_grid kernel launch failed");
     std::vector<uint8_t> cur(n);
-    cudaMemcpy(cur.data(), d_grid.ptr, n, cudaMemcpyDeviceToHost);  // tiny grid only
+    cudaMemcpy(cur.data(), d_grid, n, cudaMemcpyDeviceToHost);  // tiny grid only
 
     MotionRoi m;
     if (prev_grid.size() == n) {
@@ -133,13 +149,13 @@ std::vector<MotionRoi> cuda_motion_regions(uint64_t y_ptr, int y_pitch, int widt
                                            int ds, int pix_thr, int min_cells, int max_regions) {
     const int sw = width / ds, sh = height / ds;
     const size_t n = static_cast<size_t>(sw) * sh;
-    DeviceBuffer d_grid(n);
-    if (!d_grid.ptr) throw std::runtime_error("cudaMalloc(grid) failed");
+    uint8_t* d_grid = static_cast<uint8_t*>(g_grid.get(n));
+    if (!d_grid) throw std::runtime_error("cudaMalloc(grid) failed");
     if (launch_luma_grid(reinterpret_cast<const uint8_t*>(y_ptr), y_pitch, width, height,
-                         ds, sw, sh, static_cast<uint8_t*>(d_grid.ptr)) != 0)
+                         ds, sw, sh, d_grid) != 0)
         throw std::runtime_error("luma_grid kernel launch failed");
     std::vector<uint8_t> cur(n);
-    cudaMemcpy(cur.data(), d_grid.ptr, n, cudaMemcpyDeviceToHost);
+    cudaMemcpy(cur.data(), d_grid, n, cudaMemcpyDeviceToHost);
 
     std::vector<MotionRoi> regions;
     if (prev_grid.size() != n) { prev_grid.swap(cur); return regions; }
@@ -223,8 +239,8 @@ std::vector<Box> cuda_infer_nv12_batch(Ort::Session& session,
     if (N == 0) return result;
 
     const size_t per = static_cast<size_t>(3) * net * net;
-    DeviceBuffer d_input(per * N * sizeof(float));
-    if (!d_input.ptr) throw std::runtime_error("cudaMalloc(batch) failed");
+    float* d_input = static_cast<float*>(g_input.get(per * N * sizeof(float)));
+    if (!d_input) throw std::runtime_error("cudaMalloc(batch) failed");
 
     std::vector<Letterbox> lbs(N);
     std::vector<std::array<int, 2>> origin(N);
@@ -239,14 +255,14 @@ std::vector<Box> cuda_infer_nv12_batch(Ort::Session& session,
         if (launch_nv12_to_chw(reinterpret_cast<const uint8_t*>(y_ptr), y_pitch,
                                reinterpret_cast<const uint8_t*>(uv_ptr), uv_pitch,
                                cx, cy, cw, ch, lbs[i].scale, lbs[i].pad_x, lbs[i].pad_y, net,
-                               static_cast<float*>(d_input.ptr) + static_cast<size_t>(i) * per) != 0)
+                               d_input + static_cast<size_t>(i) * per) != 0)
             throw std::runtime_error("batch nv12_to_chw kernel launch failed");
     }
 
     Ort::MemoryInfo cudaMem("Cuda", OrtArenaAllocator, 0, OrtMemTypeDefault);
     const std::array<int64_t, 4> inShape{N, 3, net, net};
     Ort::Value inTensor = Ort::Value::CreateTensor<float>(
-        cudaMem, static_cast<float*>(d_input.ptr), per * N, inShape.data(), inShape.size());
+        cudaMem, d_input, per * N, inShape.data(), inShape.size());
     Ort::IoBinding binding(session);
     binding.BindInput(input_name.c_str(), inTensor);
     binding.BindOutput(output_name.c_str(), Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault));
