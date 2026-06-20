@@ -12,6 +12,9 @@
 #include "zm_plugin.h"
 #include "detect_cuda.hpp"            // cuda_infer_nv12, cuda_motion_bbox, MotionRoi, Box
 #include <onnxruntime_cxx_api.h>
+#ifdef BENCH_WITH_CUDA
+#include <cuda_runtime.h>
+#endif
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -157,11 +160,17 @@ struct Plugin { void* h = nullptr; void (*init)(zm_plugin_t*) = nullptr;
 int main(int argc, char** argv) {
     std::string input, model, plugdir = "plugins";
     int maxf = 300, thr = 25, minchg = -1, loops = 1, only = 0;
+    bool blocking = false;
     for (int i = 1; i < argc; ++i) { std::string a = argv[i]; auto nx = [&]{ return (i + 1 < argc) ? argv[++i] : ""; };
         if (a == "--input") input = nx(); else if (a == "--model") model = nx(); else if (a == "--plugins") plugdir = nx();
         else if (a == "--max-frames") maxf = std::atoi(nx()); else if (a == "--motion-threshold") thr = std::atoi(nx());
         else if (a == "--min-changed") minchg = std::atoi(nx()); else if (a == "--loops") loops = std::atoi(nx());
+        else if (a == "--blocking-sync") blocking = true;
         else if (a == "--only") { std::string m = nx(); only = (m == "full") ? 1 : (m == "gated") ? 2 : (m == "roi") ? 3 : 0; } }
+#ifdef BENCH_WITH_CUDA
+    // Make CUDA waits SLEEP the CPU instead of spin-waiting (set before any context).
+    if (blocking) cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+#endif
     if (input.empty() || model.empty()) { fprintf(stderr, "need --input and --model\n"); return 2; }
 
     Src s;

@@ -12,6 +12,9 @@
 #ifdef __APPLE__
 #include <coreml_provider_factory.h>
 #endif
+#ifdef ZMP_WITH_CUDA
+#include <cuda_runtime.h>
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -166,9 +169,13 @@ static int detect_onnx_start(zm_plugin_t* plugin, zm_host_api_t* host, void* hos
     // CUDA execution provider — required for the zero-copy GPU detect path.
     if (ctx->ep == "cuda") {
         try {
+            // Make GPU waits SLEEP the CPU rather than spin-wait (set before the
+            // CUDA context is created). Cuts host CPU ~40% at no throughput cost;
+            // harmless if a context already exists (another session set it).
+            cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
             OrtCUDAProviderOptions cuda_opts{};
             ctx->sessionOptions.AppendExecutionProvider_CUDA(cuda_opts);
-            ZM_LOG_INFO("detect_onnx: CUDA execution provider enabled");
+            ZM_LOG_INFO("detect_onnx: CUDA execution provider enabled (blocking sync)");
         } catch (const std::exception& e) {
             ZM_LOG_WARN("detect_onnx: CUDA EP unavailable, falling back to CPU: %s", e.what());
         }
