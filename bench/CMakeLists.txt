@@ -56,4 +56,16 @@ if(ZM_WITH_CUDA)
     target_link_libraries(bench_gpu_roi PRIVATE PkgConfig::BFFMPEG onnxruntime CUDA::cudart dl)
     target_compile_definitions(bench_gpu_roi PRIVATE BENCH_WITH_CUDA)
     set_target_properties(bench_gpu_roi PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+
+    # (4) shared batched inference engine demo (N producer threads -> 1 session)
+    find_package(Threads REQUIRED)
+    add_executable(bench_engine bench_engine.cpp
+        ${CMAKE_SOURCE_DIR}/plugins/detect_onnx/detect_engine.cpp)
+    target_compile_features(bench_engine PRIVATE cxx_std_17)
+    target_include_directories(bench_engine PRIVATE
+        ${CMAKE_SOURCE_DIR}/plugins/detect_onnx
+        ${ONNXRUNTIME_ROOT}/include)
+    target_link_directories(bench_engine PRIVATE ${ONNXRUNTIME_ROOT}/lib)
+    target_link_libraries(bench_engine PRIVATE onnxruntime CUDA::cudart Threads::Threads)
+    target_compile_definitions(bench_engine PRIVATE BENCH_WITH_CUDA)
 endif()
