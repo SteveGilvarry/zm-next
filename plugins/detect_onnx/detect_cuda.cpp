@@ -125,7 +125,8 @@ const float* cuda_preprocess_nv12(uint64_t y_ptr, int y_pitch, uint64_t uv_ptr, 
 
 MotionRoi cuda_motion_bbox(uint64_t y_ptr, int y_pitch, int width, int height,
                            std::vector<uint8_t>& prev_grid,
-                           int ds, int pix_thr, int min_changed) {
+                           int ds, int pix_thr, int min_changed,
+                           int luma_jump_thresh, float* prev_mean) {
     const int sw = width / ds, sh = height / ds;
     const size_t n = static_cast<size_t>(sw) * sh;
     uint8_t* d_grid = static_cast<uint8_t*>(g_grid.get(n));
@@ -136,8 +137,23 @@ MotionRoi cuda_motion_bbox(uint64_t y_ptr, int y_pitch, int width, int height,
     std::vector<uint8_t> cur(n);
     cudaMemcpy(cur.data(), d_grid, n, cudaMemcpyDeviceToHost);  // tiny grid only
 
+    // Global-luma-jump suppression (knob, default off). Mean of the downsampled
+    // grid; a large frame-to-frame swing is a whole-scene exposure change, not a
+    // mover, so suppress motion this frame. Disabled when luma_jump_thresh <= 0 or
+    // prev_mean == nullptr (default), keeping the legacy result byte-identical.
+    bool luma_jump = false;
+    if (luma_jump_thresh > 0 && prev_mean != nullptr && n > 0) {
+        double sum = 0.0;
+        for (size_t k = 0; k < n; ++k) sum += cur[k];
+        const float mean = static_cast<float>(sum / static_cast<double>(n));
+        if (prev_grid.size() == n &&
+            std::abs(mean - *prev_mean) > static_cast<float>(luma_jump_thresh))
+            luma_jump = true;
+        *prev_mean = mean;
+    }
+
     MotionRoi m;
-    if (prev_grid.size() == n) {
+    if (!luma_jump && prev_grid.size() == n) {
         int minx = sw, miny = sh, maxx = -1, maxy = -1, cnt = 0;
         for (int j = 0; j < sh; ++j) {
             for (int i = 0; i < sw; ++i) {
@@ -166,7 +182,8 @@ MotionRoi cuda_motion_bbox(uint64_t y_ptr, int y_pitch, int width, int height,
 
 std::vector<MotionRoi> cuda_motion_regions(uint64_t y_ptr, int y_pitch, int width, int height,
                                            std::vector<uint8_t>& prev_grid,
-                                           int ds, int pix_thr, int min_cells, int max_regions) {
+                                           int ds, int pix_thr, int min_cells, int max_regions,
+                                           int luma_jump_thresh, float* prev_mean) {
     const int sw = width / ds, sh = height / ds;
     const size_t n = static_cast<size_t>(sw) * sh;
     uint8_t* d_grid = static_cast<uint8_t*>(g_grid.get(n));
@@ -178,6 +195,21 @@ std::vector<MotionRoi> cuda_motion_regions(uint64_t y_ptr, int y_pitch, int widt
     cudaMemcpy(cur.data(), d_grid, n, cudaMemcpyDeviceToHost);
 
     std::vector<MotionRoi> regions;
+
+    // Global-luma-jump suppression (knob, default off). See cuda_motion_bbox /
+    // the header for semantics. On a whole-scene exposure jump we still refresh
+    // prev_grid (so next frame diffs cleanly) but return no regions. Disabled when
+    // luma_jump_thresh <= 0 or prev_mean == nullptr (default) => byte-identical.
+    if (luma_jump_thresh > 0 && prev_mean != nullptr && n > 0) {
+        double sum = 0.0;
+        for (size_t k = 0; k < n; ++k) sum += cur[k];
+        const float mean = static_cast<float>(sum / static_cast<double>(n));
+        const bool luma_jump = prev_grid.size() == n &&
+            std::abs(mean - *prev_mean) > static_cast<float>(luma_jump_thresh);
+        *prev_mean = mean;
+        if (luma_jump) { prev_grid.swap(cur); return regions; }
+    }
+
     if (prev_grid.size() != n) { prev_grid.swap(cur); return regions; }
 
     // Binary changed-cell mask (0=unchanged, 1=changed, 2=visited).

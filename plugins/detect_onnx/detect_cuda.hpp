@@ -61,17 +61,36 @@ struct MotionRoi { bool active = false; int x = 0, y = 0, w = 0, h = 0; int chan
 
 // Compute a single merged motion bounding box from the surface's luma vs the
 // previous frame's downsampled grid (updated in place). Only the grid crosses PCIe.
+//
+// Global-luma-jump suppression (A/B knob, default OFF): if luma_jump_thresh > 0,
+// the mean of the current downsampled grid is compared against *prev_mean (which
+// the caller owns and this fn updates in place, mirroring prev_grid). When the
+// absolute mean difference exceeds luma_jump_thresh — i.e. a whole-scene exposure
+// shift (headlights, auto-gain, IR-cut) rather than a real mover — the call
+// returns an inactive MotionRoi for this frame. luma_jump_thresh = 0 (the default)
+// disables the check entirely, so existing callers / benchmark numbers are
+// byte-identical. Pass prev_mean = nullptr to opt out even when a threshold is set.
 MotionRoi cuda_motion_bbox(uint64_t y_ptr, int y_pitch, int width, int height,
                            std::vector<uint8_t>& prev_grid,
-                           int ds, int pix_thr, int min_changed);
+                           int ds, int pix_thr, int min_changed,
+                           int luma_jump_thresh = 0, float* prev_mean = nullptr);
 
 // Like cuda_motion_bbox but returns SEPARATE motion regions via connected
 // components on the changed-cell grid (4-connectivity, overlapping boxes merged,
 // capped to max_regions by area, each >= min_cells). Lets detection run on each
 // distinct mover instead of one frame-spanning merged box.
+//
+// Global-luma-jump suppression (A/B knob, default OFF): identical semantics to
+// cuda_motion_bbox above. If luma_jump_thresh > 0 and the current grid mean
+// differs from *prev_mean by more than luma_jump_thresh, an empty region list is
+// returned for this frame (whole-scene exposure change, not real motion). The
+// prev_grid is still updated so differencing resumes cleanly next frame.
+// luma_jump_thresh = 0 (default) disables the check, keeping existing callers and
+// benchmark output byte-identical. prev_mean = nullptr also opts out.
 std::vector<MotionRoi> cuda_motion_regions(uint64_t y_ptr, int y_pitch, int width, int height,
                                            std::vector<uint8_t>& prev_grid,
-                                           int ds, int pix_thr, int min_cells, int max_regions);
+                                           int ds, int pix_thr, int min_cells, int max_regions,
+                                           int luma_jump_thresh = 0, float* prev_mean = nullptr);
 
 // Batched zero-copy ROI inference: preprocess every region's crop of the NV12
 // surface into one [N,3,net,net] device tensor, run a single batched session
