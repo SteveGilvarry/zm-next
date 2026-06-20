@@ -78,4 +78,11 @@ if(ZM_WITH_CUDA)
     target_link_directories(bench_backend PRIVATE ${ONNXRUNTIME_ROOT}/lib)
     target_link_libraries(bench_backend PRIVATE PkgConfig::BFFMPEG onnxruntime CUDA::cudart Threads::Threads dl)
     set_target_properties(bench_backend PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+
+    # (6) isolate the letterbox/resample step: GPU kernel vs CPU bilinear
+    add_executable(bench_preprocess bench_preprocess.cpp ${DET}/detect_cuda.cu)
+    target_compile_features(bench_preprocess PRIVATE cxx_std_17)
+    target_include_directories(bench_preprocess PRIVATE ${CMAKE_SOURCE_DIR}/core/include ${DET} ${ONNXRUNTIME_ROOT}/include)
+    target_link_libraries(bench_preprocess PRIVATE CUDA::cudart)
+    set_target_properties(bench_preprocess PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 endif()
