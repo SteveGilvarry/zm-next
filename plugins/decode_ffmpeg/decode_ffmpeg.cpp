@@ -66,6 +66,7 @@ static std::string get_av_error_string(int errnum) {
 
 struct DecoderCtx {
     int threads = 0;
+    std::vector<int> stream_filter;   // empty = decode every stream; else only these
     std::string scale = "orig";
     std::string output_format = "yuv420p";
     std::string codec_name = "h264";     // input codec fallback (h264/hevc/...)
@@ -247,6 +248,8 @@ static int process_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ct
     try {
         auto cfg = json::parse(json_cfg ? json_cfg : "{}");
         ctx->threads = cfg.value("threads", 0);
+        if (cfg.contains("stream_filter") && cfg["stream_filter"].is_array())
+            ctx->stream_filter = cfg["stream_filter"].get<std::vector<int>>();
         ctx->scale = cfg.value("scale", "orig");
         ctx->output_format = cfg.value("output_format", "yuv420p");
         // "codec" is an OPTIONAL override; without it the input codec is
@@ -309,6 +312,14 @@ static void process_on_frame(zm_plugin_t* plugin, const void* buf, size_t size) 
     if (hdr->hw_type != ZM_FRAME_COMPRESSED) {
         if (ctx->host && ctx->host->on_frame) ctx->host->on_frame(ctx->host_ctx, buf, size);
         return;
+    }
+    // Only decode the configured streams. A capture may fan out several streams
+    // (e.g. a 4K record-only stream + a 720p detect stream); drop the rest here so
+    // we never decode the expensive one. Recording reads compressed frames directly.
+    if (!ctx->stream_filter.empty()) {
+        bool want = false;
+        for (int s : ctx->stream_filter) if (s == static_cast<int>(hdr->stream_id)) { want = true; break; }
+        if (!want) return;
     }
     // Create the decoder on first use (codec auto-detected from StreamMetadata,
     // else the configured fallback). Skip the frame until a decoder can be made.
