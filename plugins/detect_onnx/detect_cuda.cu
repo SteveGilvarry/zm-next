@@ -7,6 +7,7 @@
 #ifdef ZMP_WITH_CUDA
 
 #include <cuda_runtime.h>
+#include <cstdlib>
 
 namespace zm::detect {
 
@@ -94,6 +95,47 @@ __global__ void luma_grid_kernel(const uint8_t* __restrict__ y, int y_pitch,
 
 }  // namespace
 
+// Hardware-bilinear variant: sample the NV12 planes through the GPU texture units
+// (cudaFilterModeLinear) instead of computing the 4-tap bilinear by hand. Same
+// math, the sampler does the interpolation. Selected by ZM_DETECT_TEX.
+//
+// A/B (2026-06, RTX 5070 Ti, 4K@640): texture was ~1.6% SLOWER (2.24 vs 2.21
+// ms/inf) with identical detections (11889 vs 11888). On per-frame NVDEC surfaces
+// the per-call texture-object create + sync + destroy outweighs the sampler, and
+// the kernel is bandwidth-bound anyway — so the MANUAL kernel stays the default.
+// Kept as an opt-in for other GPUs/workloads; falls back if textures can't be made.
+__global__ void nv12_to_chw_tex_kernel(cudaTextureObject_t yTex, cudaTextureObject_t uvTex,
+                                       int crop_x0, int crop_y0, int src_w, int src_h,
+                                       float scale, int pad_x, int pad_y, int net,
+                                       float* __restrict__ out) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int yy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= net || yy >= net) return;
+    const int plane = net * net;
+    float r = 114.0f / 255.0f, g = 114.0f / 255.0f, b = 114.0f / 255.0f;
+    const float sx = (x - pad_x + 0.5f) / scale - 0.5f;
+    const float sy = (yy - pad_y + 0.5f) / scale - 0.5f;
+    if (sx >= 0.0f && sy >= 0.0f && sx < src_w && sy < src_h) {
+        const float Y = tex2D<float>(yTex, crop_x0 + sx + 0.5f, crop_y0 + sy + 0.5f) * 255.0f;
+        const float2 uv = tex2D<float2>(uvTex, crop_x0 * 0.5f + sx * 0.5f + 0.5f,
+                                                crop_y0 * 0.5f + sy * 0.5f + 0.5f);
+        const float U = uv.x * 255.0f, V = uv.y * 255.0f;
+        const float Yf = Y - 16.0f, Uf = U - 128.0f, Vf = V - 128.0f;
+        float R = 1.164f * Yf + 1.596f * Vf;
+        float G = 1.164f * Yf - 0.392f * Uf - 0.813f * Vf;
+        float B = 1.164f * Yf + 2.017f * Uf;
+        R = fminf(fmaxf(R, 0.0f), 255.0f);
+        G = fminf(fmaxf(G, 0.0f), 255.0f);
+        B = fminf(fmaxf(B, 0.0f), 255.0f);
+        r = R / 255.0f; g = G / 255.0f; b = B / 255.0f;
+    }
+    out[0 * plane + yy * net + x] = r;
+    out[1 * plane + yy * net + x] = g;
+    out[2 * plane + yy * net + x] = b;
+}
+
+static bool tex_enabled() { static const bool e = (std::getenv("ZM_DETECT_TEX") != nullptr); return e; }
+
 // crop_x/crop_y/crop_w/crop_h select the source region to letterbox (origin must
 // be even for NV12 chroma alignment); pass the full frame for whole-frame detect.
 int launch_nv12_to_chw(const uint8_t* y_ptr, int y_pitch,
@@ -103,6 +145,36 @@ int launch_nv12_to_chw(const uint8_t* y_ptr, int y_pitch,
                        int net, float* d_out) {
     const dim3 block(16, 16);
     const dim3 grid((net + block.x - 1) / block.x, (net + block.y - 1) / block.y);
+
+    if (tex_enabled()) {
+        const int yW = crop_x + crop_w, yH = crop_y + crop_h;
+        cudaTextureDesc td{};
+        td.filterMode = cudaFilterModeLinear; td.readMode = cudaReadModeNormalizedFloat;
+        td.addressMode[0] = cudaAddressModeClamp; td.addressMode[1] = cudaAddressModeClamp;
+        td.normalizedCoords = 0;
+        cudaResourceDesc yr{}; yr.resType = cudaResourceTypePitch2D;
+        yr.res.pitch2D.devPtr = const_cast<uint8_t*>(y_ptr); yr.res.pitch2D.pitchInBytes = y_pitch;
+        yr.res.pitch2D.width = yW; yr.res.pitch2D.height = yH;
+        yr.res.pitch2D.desc = cudaCreateChannelDesc<unsigned char>();
+        cudaResourceDesc ur{}; ur.resType = cudaResourceTypePitch2D;
+        ur.res.pitch2D.devPtr = const_cast<uint8_t*>(uv_ptr); ur.res.pitch2D.pitchInBytes = uv_pitch;
+        ur.res.pitch2D.width = yW / 2; ur.res.pitch2D.height = yH / 2;
+        ur.res.pitch2D.desc = cudaCreateChannelDesc<uchar2>();
+        cudaTextureObject_t yTex = 0, uvTex = 0;
+        if (cudaCreateTextureObject(&yTex, &yr, &td, nullptr) == cudaSuccess &&
+            cudaCreateTextureObject(&uvTex, &ur, &td, nullptr) == cudaSuccess) {
+            nv12_to_chw_tex_kernel<<<grid, block>>>(yTex, uvTex, crop_x, crop_y, crop_w, crop_h,
+                                                    scale, pad_x, pad_y, net, d_out);
+            const int err = (int)cudaGetLastError();
+            cudaDeviceSynchronize();            // textures must outlive the kernel
+            cudaDestroyTextureObject(yTex); cudaDestroyTextureObject(uvTex);
+            return err;
+        }
+        if (yTex) cudaDestroyTextureObject(yTex);
+        if (uvTex) cudaDestroyTextureObject(uvTex);
+        // creation failed (pitch/alignment) -> fall through to the manual kernel
+    }
+
     nv12_to_chw_kernel<<<grid, block>>>(y_ptr, y_pitch, uv_ptr, uv_pitch,
                                         crop_x, crop_y, crop_w, crop_h,
                                         scale, pad_x, pad_y, net, d_out);
