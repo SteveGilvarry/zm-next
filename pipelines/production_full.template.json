@@ -1,0 +1,67 @@
+{
+  "_comment": [
+    "Production cascade rolling up the validated pieces, one camera, one worker:",
+    "  capture (main 4K + sub 720p)",
+    "    |- store_filesystem(stream 0)  -> record main stream compressed, no decode",
+    "    `- decode(stream 1, rgb24) -> motion_gate -> detect_onnx -> tracker -> alert_policy",
+    "Detection runs on the cheap 720p substream, only while motion is present",
+    "(motion_gate), the tracker gives persistent ids, and alert_policy emits ONE alert",
+    "per object instead of one per frame. Copy to pipelines/<name>.json with real",
+    "URLs/paths (that copy is git-ignored). Run from build/: ./zm-core --pipeline ..."
+  ],
+  "plugins": [
+    {
+      "id": "capture",
+      "kind": "capture_rtsp_multi",
+      "cfg": { "streams": [
+        { "stream_id": 0, "url": "rtsp://USER:PASS@CAMERA:554/Streaming/Channels/101", "transport": "tcp", "max_retry_attempts": -1 },
+        { "stream_id": 1, "url": "rtsp://USER:PASS@CAMERA:554/Streaming/Channels/102", "transport": "tcp", "max_retry_attempts": -1 }
+      ] },
+      "queue_depth": 32,
+      "children": [
+        {
+          "id": "record_main",
+          "kind": "store_filesystem",
+          "cfg": { "root": "/var/lib/zm/recordings", "monitor_id": 1, "max_secs": 300, "stream_filter": [0] },
+          "queue_depth": 120
+        },
+        {
+          "id": "decode_sub",
+          "kind": "decode_ffmpeg",
+          "cfg": { "stream_filter": [1], "output_format": "rgb24", "scale": "orig", "threads": 2 },
+          "queue_depth": 8,
+          "children": [
+            {
+              "id": "gate",
+              "kind": "motion_gate",
+              "cfg": { "frame_width": 1280, "frame_height": 720, "downscale": 4, "pixel_threshold": 20, "min_changed_pixels": 80, "cooldown_frames": 15, "gate": true, "stream_filter": [1] },
+              "queue_depth": 8,
+              "children": [
+                {
+                  "id": "detect",
+                  "kind": "detect_onnx",
+                  "cfg": { "model_path": "/path/to/yolo26n.onnx", "ep": "cpu", "conf_threshold": 0.35, "frame_width": 1280, "frame_height": 720, "stream_filter": [1] },
+                  "queue_depth": 2,
+                  "children": [
+                    {
+                      "id": "tracker",
+                      "kind": "tracker",
+                      "cfg": { "iou_threshold": 0.3, "max_age": 30, "min_hits": 3 },
+                      "children": [
+                        {
+                          "id": "alerts",
+                          "kind": "alert_policy",
+                          "cfg": { "classes": ["car", "truck", "bus", "person"], "stationary_sec": 3.0, "realert_on_move": true }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
