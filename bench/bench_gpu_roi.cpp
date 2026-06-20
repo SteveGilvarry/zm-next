@@ -70,11 +70,11 @@ struct Ctx {
     Ort::Session* sess = nullptr;
     std::string in, out;
     int net = 640; float conf = 0.25f;
-    int ds = 8, thr = 25, minchg = 0;
+    int ds = 8, thr = 25, minchg = 0, maxRegions = 8;
     std::vector<uint8_t> prev;
     // stats
     int frames = 0, motion = 0, inf_full = 0, inf_gate = 0, inf_roi = 0;
-    long det_full = 0, det_gate = 0, det_roi = 0, roi_only = 0, full_only = 0, matched = 0;
+    long det_full = 0, det_gate = 0, det_roi = 0, roi_only = 0, full_only = 0, matched = 0, total_regions = 0;
     double t_full = 0, t_roi = 0, t_motion = 0;
 };
 
@@ -95,7 +95,7 @@ static void on_frame(void* vc, const void* buf, size_t size) {
     if (!yp || !uvp) return;
 
     auto tm = clk::now();
-    MotionRoi m = zm::detect::cuda_motion_bbox(yp, ypitch, w, h, c->prev, c->ds, c->thr, c->minchg);
+    auto regions = zm::detect::cuda_motion_regions(yp, ypitch, w, h, c->prev, c->ds, c->thr, c->minchg, c->maxRegions);
     c->t_motion += ms(tm);
 
     auto tf = clk::now();
@@ -103,11 +103,12 @@ static void on_frame(void* vc, const void* buf, size_t size) {
     c->t_full += ms(tf);
     ++c->frames; ++c->inf_full; c->det_full += (long)bf.size();
 
-    if (!m.active) return;
+    if (regions.empty()) return;
     ++c->motion; ++c->inf_gate; c->det_gate += (long)bf.size();
+    c->total_regions += (long)regions.size();
 
-    auto tr = clk::now();
-    auto br = zm::detect::cuda_infer_nv12(*c->sess, c->in, c->out, yp, ypitch, uvp, uvpitch, w, h, c->net, c->conf, {}, m.x, m.y, m.w, m.h);
+    auto tr = clk::now();  // all regions detected in ONE batched inference
+    auto br = zm::detect::cuda_infer_nv12_batch(*c->sess, c->in, c->out, yp, ypitch, uvp, uvpitch, w, h, regions, c->net, c->conf, {});
     c->t_roi += ms(tr);
     ++c->inf_roi; c->det_roi += (long)br.size();
 
@@ -141,7 +142,7 @@ int main(int argc, char** argv) {
 
     Ctx ctx;
     ctx.ds = 8; ctx.thr = thr;
-    ctx.minchg = (minchg < 0) ? std::max(40, (s.w / ctx.ds) * (s.h / ctx.ds) / 200) : minchg;
+    ctx.minchg = (minchg < 0) ? std::max(8, (s.w / ctx.ds) * (s.h / ctx.ds) / 400) : minchg;  // per-region
 
     Ort::Env env(ORT_LOGGING_LEVEL_ERROR, "gpuroi");
     Ort::SessionOptions so; so.SetIntraOpNumThreads(1); so.SetGraphOptimizationLevel(ORT_ENABLE_ALL);
@@ -177,6 +178,8 @@ int main(int argc, char** argv) {
     printf("%-14s %10d %12ld %14s\n",  "motion-gated", c.inf_gate, c.det_gate, "(=full)");
     printf("%-14s %10d %12ld %14.2f\n", "roi-crop",    c.inf_roi,  c.det_roi,  c.inf_roi ? c.t_roi / c.inf_roi : 0);
     printf("\ngating saves %.1f%% of inferences (%d -> %d).\n", idle, c.inf_full, c.inf_gate);
+    printf("avg motion regions/frame: %.2f (all detected in ONE batched inference)\n",
+           c.motion ? (double)c.total_regions / c.motion : 0);
     printf("ROI vs full-frame on motion frames:  matched %ld | ROI-only %ld (full MISSED) | full-only %ld (ROI blind spot)\n",
            c.matched, c.roi_only, c.full_only);
     printf("note: avg ms/inf here is pure GPU preprocess+infer (no CPU 4K letterbox) — compare to bench_roi_cascade.\n\n");
