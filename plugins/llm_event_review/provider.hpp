@@ -68,11 +68,13 @@ public:
 class LocalOpenAICompat : public IVisionProvider {
 public:
     LocalOpenAICompat(std::string server_url, std::string model,
-                      std::string api_key, long timeout_sec)
+                      std::string api_key, long timeout_sec,
+                      bool enable_thinking = false)
         : serverUrl_(std::move(server_url)),
           model_(std::move(model)),
           apiKey_(std::move(api_key)),
-          timeoutSec_(timeout_sec > 0 ? timeout_sec : 60L) {}
+          timeoutSec_(timeout_sec > 0 ? timeout_sec : 60L),
+          enableThinking_(enable_thinking) {}
 
     std::string provider_id() const override { return "local"; }
     std::string model() const override { return model_; }
@@ -82,8 +84,16 @@ public:
         if (jpeg.empty()) return "";
 
         const std::string b64 = vlm::base64_encode(jpeg.data(), jpeg.size());
-        const std::string body =
-            vlm::build_chat_request_json(model_, prompt, b64);
+        // Build the canonical OpenAI-compatible body, then set chat_template_kwargs
+        // so reasoning ("thinking") models — e.g. Qwen3.5 — don't burn the token
+        // budget on a reasoning preamble; we want a one-sentence caption, not a
+        // thought process. Local servers (vLLM / llama-server / Ollama) ignore the
+        // kwarg for non-thinking models. (Phase-2 cloud adapters build their own
+        // wire shape, so this never leaks to Anthropic/Gemini.)
+        nlohmann::json bodyJson =
+            nlohmann::json::parse(vlm::build_chat_request_json(model_, prompt, b64));
+        bodyJson["chat_template_kwargs"]["enable_thinking"] = enableThinking_;
+        const std::string body = bodyJson.dump();
 
         std::string response;
         if (!httpPostJson(serverUrl_, body, apiKey_, timeoutSec_, response)) {
@@ -151,6 +161,7 @@ private:
     std::string model_;
     std::string apiKey_;
     long timeoutSec_;
+    bool enableThinking_;   // chat_template_kwargs.enable_thinking (false = caption mode)
 };
 
 // ---------------------------------------------------------------------------
@@ -180,12 +191,13 @@ private:
 //
 inline std::unique_ptr<IVisionProvider> make_provider(
     const std::string& provider, const std::string& server_url,
-    const std::string& model, const std::string& api_key, long timeout_sec) {
+    const std::string& model, const std::string& api_key, long timeout_sec,
+    bool enable_thinking = false) {
     // Phase 1: every provider name falls back to the local OpenAI-compatible
     // path. Cloud names are accepted but routed local until Phase 2 lands.
     (void)provider;
     return std::make_unique<LocalOpenAICompat>(server_url, model, api_key,
-                                               timeout_sec);
+                                               timeout_sec, enable_thinking);
 }
 
 }  // namespace llmrev

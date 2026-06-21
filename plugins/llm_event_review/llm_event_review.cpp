@@ -101,6 +101,10 @@ struct State {
         "image in one sentence, noting anything unusual.";
     long maxPixels = 1003520;       // ~1 MP cap on the longest-edge area
     long timeoutSec = 30;
+    bool enableThinking = false;    // chat_template_kwargs.enable_thinking; false =
+                                    // caption mode (reasoning models like Qwen3.5
+                                    // otherwise burn the token budget on a thought
+                                    // preamble). Ignored by non-thinking models.
     std::vector<std::string> classes;       // empty = all
     std::vector<uint32_t> streamFilter;     // empty = all
     std::vector<std::string> triggerEvents{"alert"};  // events we react to
@@ -444,6 +448,7 @@ int start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx,
             s->prompt = j.value("prompt", s->prompt);
             s->maxPixels = j.value("max_pixels", s->maxPixels);
             s->timeoutSec = j.value("timeout_sec", s->timeoutSec);
+            s->enableThinking = j.value("enable_thinking", s->enableThinking);
             s->debounceUsec = static_cast<uint64_t>(
                 j.value("debounce_sec", 10.0) * 1e6);
 
@@ -469,7 +474,8 @@ int start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx,
     }
 
     s->visionProvider = llmrev::make_provider(
-        s->provider, s->serverUrl, s->model, s->apiKey, s->timeoutSec);
+        s->provider, s->serverUrl, s->model, s->apiKey, s->timeoutSec,
+        s->enableThinking);
     if (s->provider != "local" && s->provider != "openai")
         ZM_LOG_WARN("llm_event_review: provider '%s' uses the OpenAI-compatible backend; "
                     "native Anthropic/Gemini adapters are Phase 2", s->provider.c_str());
