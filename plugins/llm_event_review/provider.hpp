@@ -44,8 +44,14 @@ public:
     virtual ~IVisionProvider() = default;
 
     // Run a single-image describe call. `jpeg` is a complete JPEG byte stream.
+    // (The image may itself be a montage of several frames tiled into one.)
     virtual std::string describe(const std::vector<uint8_t>& jpeg,
                                  const std::string& prompt) = 0;
+
+    // Run a TEXT-ONLY completion (no image). Used by the narrator pass to
+    // synthesize a story from a track's accumulated captions + trajectory —
+    // there is nothing new to *see*, only prior observations to reason over.
+    virtual std::string narrate(const std::string& prompt) = 0;
 
     // Identifier surfaced in the published "reasoning" event ("local", and in
     // Phase 2 "anthropic" | "openai" | "gemini").
@@ -101,6 +107,25 @@ public:
             return "";
         }
 
+        return vlm::parse_chat_response_text(response);
+    }
+
+    std::string narrate(const std::string& prompt) override {
+        // A plain text/chat completion: a single user message, no image block.
+        // Same chat_template_kwargs gate as describe() so reasoning models stay
+        // in answer mode rather than emitting a thought preamble.
+        nlohmann::json body;
+        body["model"] = model_;
+        body["messages"] = nlohmann::json::array({
+            nlohmann::json{{"role", "user"}, {"content", prompt}}});
+        body["max_tokens"] = 512;
+        body["chat_template_kwargs"]["enable_thinking"] = enableThinking_;
+        const std::string b = body.dump();
+
+        std::string response;
+        if (!httpPostJson(serverUrl_, b, apiKey_, timeoutSec_, response)) {
+            return "";
+        }
         return vlm::parse_chat_response_text(response);
     }
 
