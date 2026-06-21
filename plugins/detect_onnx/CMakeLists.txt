@@ -74,6 +74,22 @@ if(ZM_WITH_OPENVINO)
     message(STATUS "ZM_WITH_OPENVINO=ON: building OpenVINO HwBackend")
 endif()
 
+# ── Vulkan compute path (AMD/Intel iGPU + discrete AMD). OFF by default. ──────────
+# The fully-GPU-resident path validated on the RADV iGPU: VAAPI decode -> Vulkan
+# dma_buf import -> compute-shader motion + NV12->CHW preprocess -> ncnn-Vulkan YOLO.
+# ncnn ships its own bundled Vulkan, so inference is isolated in vulkan_ncnn_infer.cpp
+# (the only TU that includes ncnn) while hw_backend_vulkan.cpp uses the system Vulkan.
+option(ZM_WITH_VULKAN "Build the Vulkan compute HwBackend (AMD/Intel iGPU + discrete, ncnn-Vulkan)" OFF)
+if(ZM_WITH_VULKAN)
+    find_package(Vulkan REQUIRED)
+    find_package(ncnn CONFIG REQUIRED)
+    pkg_check_modules(VK_VA REQUIRED IMPORTED_TARGET libva libva-drm libavutil)
+    target_sources(detect_onnx PRIVATE hw_backend_vulkan.cpp vulkan_ncnn_infer.cpp)
+    target_link_libraries(detect_onnx PRIVATE Vulkan::Vulkan ncnn PkgConfig::VK_VA)
+    target_compile_definitions(detect_onnx PRIVATE ZM_WITH_VULKAN)
+    message(STATUS "ZM_WITH_VULKAN=ON: building Vulkan compute HwBackend (ncnn-Vulkan)")
+endif()
+
 # ── Metal path (Apple). Objective-C++ .mm — only ever compiled on APPLE so Linux
 # never feeds the .mm to the C++ compiler. Gated additionally by ZM_WITH_METAL. ─────
 if(APPLE)

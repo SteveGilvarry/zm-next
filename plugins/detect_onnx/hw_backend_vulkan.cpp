@@ -10,26 +10,24 @@
 // Validated standalone in bench/vk: 1b (import), 1b+ (motion gate, 0 mismatches),
 // 1c (preprocess), Phase 3 (ncnn-Vulkan inference). This file wires them together.
 //
-// HONEST STATUS (WIP — does not yet build): the proven kernels are consolidated
-// here behind the HwBackend interface, but ncnn ships its OWN bundled Vulkan
-// loader (ncnn/simplevk.h) whose macros collide with the system <vulkan/vulkan.h>
-// we use for the import/compute. The fix is a translation-unit split: keep the
-// raw-Vulkan VkCtx (import + motion + preprocess) in one TU that includes
-// vulkan.h, and the ncnn inference in a separate TU that includes ncnn headers,
-// communicating via the host CHW buffer. Until then this file is a reference for
-// the consolidation; the *validated* Vulkan path lives in bench/vk/ (1b/1b+/1c +
-// the ncnn-Vulkan inference prototype), all proven on the RADV iGPU.
+// STATUS: builds + links + registered as make_backend("vulkan") under ZM_WITH_VULKAN.
+// ncnn ships its OWN bundled Vulkan loader (ncnn/simplevk.h) whose macros collide
+// with the system <vulkan/vulkan.h> we use for the import/compute, so inference is
+// isolated in vulkan_ncnn_infer.cpp (the only TU that includes ncnn); this file uses
+// system Vulkan and hands it the host CHW buffer. The individual stages are all
+// validated standalone in bench/vk/ (1b import, 1b+ motion gate, 1c preprocess,
+// ncnn-Vulkan inference); end-to-end validation of the ASSEMBLED backend through the
+// plugin is the remaining step.
 //
-// The CHW handoff to ncnn also bounces through host memory (a 4.7MB copy) because
-// ncnn owns a separate VkDevice; the full zero-copy hand-off (preprocess writing
-// into an ncnn::VkMat on ncnn's device) is the follow-up after the TU split.
+// The CHW handoff to ncnn bounces through host memory (a 4.7MB copy) because ncnn
+// owns a separate VkDevice; the full zero-copy hand-off (preprocess writing into an
+// ncnn::VkMat on ncnn's device) is the follow-up optimization.
 
 #if defined(ZM_WITH_VULKAN)
 
 #include "detect_postprocess.hpp"
+#include "vulkan_ncnn_infer.hpp"     // ncnn isolated in its own TU (header conflict)
 #include <vulkan/vulkan.h>
-#include <ncnn/net.h>
-#include <ncnn/mat.h>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -167,11 +165,8 @@ public:
         net_ = net;
         // ncnn-Vulkan YOLO head model. Convention: <path-without-ext>.ncnn.param/.bin
         std::string base = path; auto dot=base.find_last_of('.'); if(dot!=std::string::npos) base=base.substr(0,dot);
-        ncnn_.opt.use_vulkan_compute = true;
-        if (ncnn_.load_param((base+".ncnn.param").c_str())) return false;
-        if (ncnn_.load_model((base+".ncnn.bin").c_str())) return false;
-        modelOK_ = true;
-        return true;   // VkCtx is lazily init'd on the first frame (needs dims)
+        modelOK_ = ncnnYolo_.load(base+".ncnn.param", base+".ncnn.bin");
+        return modelOK_;   // VkCtx is lazily init'd on the first frame (needs dims)
     }
 
     Surface acquire(uint64_t av_frame) override {
@@ -219,24 +214,9 @@ public:
 
     std::vector<Detection> infer(const DeviceTensor& t, float conf, const std::vector<int>& allow) override {
         if(!t.ptr||!modelOK_) return {};
-        // wrap our CHW (3,net,net) as an ncnn Mat; ncnn uploads to its Vulkan device.
-        ncnn::Mat in(net_, net_, 3, (void*)t.ptr); // w,h,c sharing our buffer
-        ncnn::Extractor ex=ncnn_.create_extractor();
-        ex.input("in0", in);
-        ncnn::Mat out; ex.extract("out0", out);   // [84, 8400] head
-        std::vector<Detection> dets;
-        const int C=out.h, A=out.w;  // C channels (84), A anchors
-        for (int a=0; a<A; ++a) {
-            float bestS=0; int bestC=-1;
-            for (int c=4; c<C; ++c){ float sc=out.row(c)[a]; if(sc>bestS){bestS=sc;bestC=c-4;} }
-            if (bestS<conf) continue;
-            if (!allow.empty() && std::find(allow.begin(),allow.end(),bestC)==allow.end()) continue;
-            float cx=out.row(0)[a],cy=out.row(1)[a],w=out.row(2)[a],h=out.row(3)[a];
-            Detection b; b.x=(cx-w/2 - t.lb.pad_x)/t.lb.scale; b.y=(cy-h/2 - t.lb.pad_y)/t.lb.scale;
-            b.w=w/t.lb.scale; b.h=h/t.lb.scale; b.confidence=bestS; b.class_id=bestC;
-            dets.push_back(b);
-        }
-        return dets;  // NOTE: caller/tracker handles NMS (parity with detect_onnx flow)
+        // ncnn-Vulkan inference is in its own TU (vulkan_ncnn_infer.cpp); hand it the
+        // host CHW + letterbox. NMS is left to the caller/tracker (detect_onnx flow).
+        return ncnnYolo_.infer(static_cast<const float*>(t.ptr), net_, t.lb, conf, allow);
     }
 
 private:
@@ -263,11 +243,11 @@ private:
     void run_preprocess(VkImageView yV, VkImageView uvV, int w, int h, const zm::detect::Letterbox& lb){
         VkDescriptorSetAllocateInfo da{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; da.descriptorPool=ctx_.pool; da.descriptorSetCount=1; da.pSetLayouts=&ctx_.pDsl; VkDescriptorSet set; vkAllocateDescriptorSets(ctx_.dev,&da,&set);
         VkDescriptorImageInfo y{ctx_.linear,yV,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},u{ctx_.linear,uvV,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}; VkDescriptorBufferInfo ow{ctx_.chwB,0,VK_WHOLE_SIZE};
-        VkWriteDescriptorSet w[3]={{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
-        w[0].dstSet=set;w[0].dstBinding=0;w[0].descriptorCount=1;w[0].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;w[0].pImageInfo=&y;
-        w[1].dstSet=set;w[1].dstBinding=1;w[1].descriptorCount=1;w[1].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;w[1].pImageInfo=&u;
-        w[2].dstSet=set;w[2].dstBinding=2;w[2].descriptorCount=1;w[2].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;w[2].pBufferInfo=&ow;
-        vkUpdateDescriptorSets(ctx_.dev,3,w,0,0);
+        VkWriteDescriptorSet wr[3]={{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+        wr[0].dstSet=set;wr[0].dstBinding=0;wr[0].descriptorCount=1;wr[0].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;wr[0].pImageInfo=&y;
+        wr[1].dstSet=set;wr[1].dstBinding=1;wr[1].descriptorCount=1;wr[1].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;wr[1].pImageInfo=&u;
+        wr[2].dstSet=set;wr[2].dstBinding=2;wr[2].descriptorCount=1;wr[2].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;wr[2].pBufferInfo=&ow;
+        vkUpdateDescriptorSets(ctx_.dev,3,wr,0,0);
         struct { int sw,sh,net; float scale; int px,py; } pc{w,h,net_,lb.scale,lb.pad_x,lb.pad_y};
         VkImageView dummy=yV; (void)dummy;
         dispatch(ctx_.pPipe,ctx_.pLayout,set,&pc,sizeof(pc),(net_+15)/16,(net_+15)/16,VK_NULL_HANDLE,yV,uvV);
@@ -287,7 +267,7 @@ private:
     }
 
     VkCtx ctx_; bool ctxOK_=false, modelOK_=false, hasPrev_=false;
-    ncnn::Net ncnn_;
+    NcnnYolo ncnnYolo_;
     int net_=640, ds_=8, thr_=18, minCells_=8;
 };
 

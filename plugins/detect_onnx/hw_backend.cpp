@@ -32,6 +32,9 @@ std::unique_ptr<HwBackend> make_metal_backend();
 #ifdef ZM_WITH_OPENVINO
 std::unique_ptr<HwBackend> make_openvino_backend();
 #endif
+#ifdef ZM_WITH_VULKAN
+std::unique_ptr<HwBackend> make_vulkan_backend();
+#endif
 
 std::unique_ptr<HwBackend> make_backend(const std::string& kind) {
 #ifdef ZMP_WITH_CUDA
@@ -45,6 +48,9 @@ std::unique_ptr<HwBackend> make_backend(const std::string& kind) {
 #endif
 #ifdef ZM_WITH_OPENVINO
     if (kind == "openvino") return make_openvino_backend();
+#endif
+#ifdef ZM_WITH_VULKAN
+    if (kind == "vulkan") return make_vulkan_backend();
 #endif
     (void)kind;
     return nullptr;   // unavailable backend -> caller falls back (e.g. to the CPU path)
