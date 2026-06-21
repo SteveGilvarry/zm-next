@@ -34,3 +34,8 @@ bench/models/
 bench/clips/
 bench/*.local
 bench/samples/
+
+# bench/metal build artifacts (keep .mm/.metal sources)
+bench/metal/metal_va_validate
+bench/metal/*.ppm
+bench/metal/*.png
