@@ -1,0 +1,23 @@
+{
+  "name": "person_alert",
+  "root": true,
+  "comment": "Person-gated record + notify. Cascade: camera -> motion-gated YOLO (decode_detect, class_filter=[0]=person only) -> a person detection event triggers BOTH store_event (pre/post-roll clip) and output_mqtt (publishes to zm-next/detection). Needs an MQTT broker (e.g. `mosquitto -p 1883`). Fill in the camera URL + model_path; on Apple, decode_detect auto-selects the Metal/ANE backend. Subscribe with: mosquitto_sub -t 'zm-next/#' -v",
+  "plugins": [
+    { "id": "capture", "kind": "capture_rtsp_multi",
+      "cfg": { "streams": [ { "stream_id": 0, "url": "rtsp://USER:PASS@CAMERA:554/Streaming/Channels/102", "transport": "tcp" } ] },
+      "children": [
+        { "id": "detect", "kind": "decode_detect",
+          "cfg": { "model_path": "/path/to/yolo26n_fp16.onnx", "hw": "auto",
+                   "input_size": 640, "conf_threshold": 0.40,
+                   "class_filter": [0], "roi_motion": true },
+          "queue_depth": 2 },
+        { "id": "record", "kind": "store_event",
+          "cfg": { "root": "/data/events", "trigger_types": ["detection"],
+                   "pre_roll_sec": 5, "post_roll_sec": 10 },
+          "queue_depth": 120 },
+        { "id": "notify", "kind": "output_mqtt",
+          "cfg": { "host": "localhost", "port": 1883, "base_topic": "zm-next" },
+          "queue_depth": 8 }
+      ] }
+  ]
+}
