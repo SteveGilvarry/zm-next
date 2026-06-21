@@ -37,5 +37,7 @@ bench/samples/
 
 # bench/metal build artifacts (keep .mm/.metal sources)
 bench/metal/metal_va_validate
+bench/metal/metal_coreml_infer
 bench/metal/*.ppm
 bench/metal/*.png
+bench/.venv-yolo/
