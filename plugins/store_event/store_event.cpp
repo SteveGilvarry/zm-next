@@ -50,6 +50,7 @@ extern "C" {
 #include <ctime>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -139,6 +140,10 @@ struct StoreEventState {
     std::string cur_path;
     AVStream* video_stream = nullptr;
     AVStream* audio_stream = nullptr;
+
+    // VLM "description" events captured during the current clip; written to a
+    // sidecar JSON on close so recordings are searchable by description.
+    std::vector<std::string> descriptions;
 };
 
 // Couples plugin->instance to the (leaked) state.
@@ -434,6 +439,35 @@ void close_clip(StoreEventState* st) {
     st->start_ts = 0;
     st->last_pts = 0;
 
+    // Sidecar JSON next to the clip — the VLM descriptions captured during the
+    // event, so recordings are searchable/greppable by what was seen. Written as
+    // "<clip>.json" (e.g. event-Monitor-0-...-.mkv.json).
+    {
+        json side;
+        side["clip"] = fs::path(path).filename().string();
+        side["path"] = path;
+        side["duration_usec"] = duration;
+        side["descriptions"] = json::array();
+        std::string joined;
+        for (const auto& d : st->descriptions) {
+            try {
+                json dj = json::parse(d);
+                side["descriptions"].push_back(dj);
+                if (dj.contains("text") && dj["text"].is_string()) {
+                    if (!joined.empty()) joined += " | ";
+                    joined += dj["text"].get<std::string>();
+                }
+            } catch (const std::exception&) { /* skip malformed */ }
+        }
+        side["text"] = joined;   // flat, grep-friendly summary of all descriptions
+        const std::string side_path = path + ".json";
+        std::ofstream f(side_path);
+        if (f) { f << side.dump(2); }
+        slog(st, ZM_LOG_INFO, "store_event: wrote sidecar %s (%zu descriptions)",
+             side_path.c_str(), st->descriptions.size());
+    }
+    st->descriptions.clear();
+
     if (st->host && st->host->publish_evt) {
         json ev = {{"event", "EventClip"}, {"path", path}, {"duration", duration}};
         st->host->publish_evt(st->host_ctx, ev.dump().c_str());
@@ -460,6 +494,7 @@ void start_recording(StoreEventState* st, uint32_t stream_id, int64_t now_usec) 
         return;  // codec params not ready, etc. (already logged)
     }
     st->recording = true;
+    st->descriptions.clear();   // fresh sidecar for this clip
     write_preroll(st);
     st->last_trigger_usec = now_usec;
 }
@@ -518,10 +553,20 @@ void event_cb(void* user, const char* json_event) {
         return;
     }
 
-    // Trigger detection: an event "type" in the configured trigger set.
     std::string type;
     if (j.contains("type") && j["type"].is_string())
         type = j["type"].get<std::string>();
+
+    // Capture VLM scene descriptions that land during an active clip; they're
+    // written to the sidecar JSON on close (see close_clip).
+    if (type == "description") {
+        std::lock_guard<std::mutex> lk(st->mtx);
+        if (st->recording && stream_allowed(st, j.value("stream_id", 0u)))
+            st->descriptions.push_back(json_event);
+        return;
+    }
+
+    // Trigger detection: an event "type" in the configured trigger set.
     if (!zm::storeevent::is_trigger(st->trigger_types, type))
         return;
 
