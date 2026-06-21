@@ -152,10 +152,14 @@ struct State {
     std::string montagePrompt =
         "You are a security camera analyst reviewing a sequence of [n] frames "
         "from one event, shown in chronological order (left to right, top to "
-        "bottom) spanning about [span_sec] seconds. Describe what the [label] "
-        "does across the sequence in one or two sentences — focus on movement and "
-        "intent (approaching, leaving, loitering, carrying or dropping "
-        "something), not a static scene description. Note anything unusual.";
+        "bottom) spanning about [span_sec] seconds. The framing follows one "
+        "[label]. In one or two sentences, describe only what is visually "
+        "observable about how the [label] moves across the sequence — direction "
+        "of travel, entering or leaving, stopping, or carrying a clearly visible "
+        "object. Report only what the frames actually show: do NOT guess the "
+        "subject's motive, intent, or destination, and do NOT invent details "
+        "that are not plainly visible. If nothing notable happens, say so "
+        "plainly.";
 
     // --- narrator / story synthesis (B) ---
     bool narrate = true;            // emit a track-close narrative
@@ -163,9 +167,13 @@ struct State {
     int narratorMinCaptions = 2;    // need at least this many reviews to narrate
     std::string narratorPrompt =
         "You are a security analyst. Below are sequential observations of a "
-        "single tracked [label] over time, with its movement path. Write a "
-        "2-3 sentence narrative of what this [label] did, emphasising movement "
-        "and apparent intent. Do not mention frame numbers or raw coordinates.";
+        "single tracked [label] over time, plus its movement path — the path is "
+        "the factual record of where it went. Write a 2-3 sentence factual "
+        "summary of what this [label] did, grounded in the movement path and the "
+        "observations. Describe only observable movement: direction, entering or "
+        "leaving, stopping, and how long it lingered. Do NOT infer motive, "
+        "intent, or destination, and do NOT add details not present in the "
+        "observations. Do not mention frame numbers or raw coordinates.";
 
     long timeoutSec = 30;
     bool enableThinking = false;    // chat_template_kwargs.enable_thinking; false =
