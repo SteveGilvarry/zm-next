@@ -7,13 +7,21 @@
 // do the motion diff + preprocess zero-copy via CVMetalTextureCache, and ONNX
 // Runtime runs the model through the CoreML execution provider.
 //
-//   *** NOT BUILT, NOT VALIDATED ON THIS MACHINE. ***
+//   *** BUILT + VALIDATED ON Apple M4 Pro (macOS, ORT 1.26 CoreML EP). ***
 //
-// This file was authored on a Linux/NVIDIA box where it cannot be compiled (no
-// Metal, no VideoToolbox, no CoreML, no clang Objective-C++ Apple SDK). It is a
-// faithful, complete-as-possible STARTING POINT for a Mac build. Every spot that
-// could not be verified against real Apple headers/behaviour is marked
-// "UNVALIDATED:" in a comment. See the checklist at the bottom of this file.
+// Originally authored on a Linux/NVIDIA box, then brought up and validated on
+// Apple silicon. The kernels and CoreML EP setup here were proven bit-exact
+// against CPU references via the standalone prototypes in bench/metal/
+// (metal_va_validate.mm M1-M4, metal_coreml_infer.mm M5) and this exact code is
+// exercised end-to-end by bench/metal/metal_backend_test.mm (make_backend("metal")
+// -> acquire -> motion -> preprocess -> infer, identical detections to the bench).
+// Key validated facts (former "UNVALIDATED:" notes, resolved):
+//   - VideoToolbox surface is IOSurface-backed 420v NV12 (video range) in data[3].
+//   - Y plane imports as R8Unorm, CbCr as RG8Unorm; .r=Cb .g=Cr (colours correct).
+//   - Motion downsample is POINT-SAMPLE (*255+0.5); preprocess is BILINEAR.
+//   - CoreML EP via the string-map options API; MLComputeUnits="ALL" uses the ANE.
+//   - The ANE win needs an fp16 model: fp32 falls back to ~CPU (13.9ms), fp16 runs
+//     on the ANE at ~2ms (8.4x vs CPU). Export the model with half=True.
 //
 // Build notes (to be wired into plugins/detect_onnx/CMakeLists.txt on the Mac side):
 //   - Compile as Objective-C++ (.mm). Needs -fobjc-arc OR manual retain/release;
@@ -28,6 +36,7 @@
 //     precompiled .metallib (see ZM_METAL_KERNELS_SRC note).
 
 #include "hw_backend.hpp"
+#include "zm_plugin.h"   // ZM_HW_VTB and the frame hw_type enum
 
 #if defined(__APPLE__) && defined(ZM_WITH_METAL)
 
@@ -43,6 +52,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 extern "C" {
@@ -51,22 +61,10 @@ extern "C" {
 #include <libavutil/pixfmt.h>
 }
 
-// ---------------------------------------------------------------------------
-// CoreML execution provider C API. ORT ships this in coreml_provider_factory.h.
-// Declared here defensively in case the header isn't on the include path of the
-// Linux box that authored this; on a real Mac build prefer the real header:
-//   #include <coreml_provider_factory.h>
-// UNVALIDATED: confirm the symbol name + flag enum against the installed ORT.
-#ifndef ZM_HAVE_COREML_PROVIDER_HEADER
-extern "C" OrtStatus* OrtSessionOptionsAppendExecutionProvider_CoreML(
-    OrtSessionOptions* options, uint32_t coreml_flags);
-// Common flag bits (see onnxruntime coreml_provider_factory.h):
-//   COREML_FLAG_USE_CPU_ONLY              = 0x001
-//   COREML_FLAG_ENABLE_ON_SUBGRAPH        = 0x002
-//   COREML_FLAG_ONLY_ENABLE_DEVICE_WITH_ANE = 0x004
-//   COREML_FLAG_ONLY_ALLOW_STATIC_INPUT_SHAPES = 0x008
-//   COREML_FLAG_CREATE_MLPROGRAM          = 0x010
-#endif
+// CoreML EP is configured through the modern string-map provider-options API
+// (Ort::SessionOptions::AppendExecutionProvider("CoreML", {...})), validated in
+// bench/metal/metal_coreml_infer.mm. The header just documents the option keys.
+#include <coreml_provider_factory.h>
 
 namespace zm::hw {
 namespace {
@@ -100,14 +98,14 @@ struct VerdictAtomic {
     atomic_uint sum_hi;
 };
 
-// Downsample the NV12 luma plane to a grid cell value (block average) and write it
-// into d_cur_grid. One thread per grid cell. `yTex` is an r8Unorm texture view of
-// the CVPixelBuffer's Y plane (luma), so reads are normalized [0,1]; we scale back
-// to 0..255 to match the CUDA integer-domain diff threshold.
+// Downsample the NV12 luma plane to a grid cell value and write it into d_cur_grid.
+// One thread per grid cell. `yTex` is an r8Unorm texture view of the CVPixelBuffer's
+// Y plane (validated: plane 0 is luma, sampling returns it in .r, [0,1]).
 //
-// UNVALIDATED: CVMetalTextureCache gives the Y plane as r8Unorm and CbCr as
-// rg8Unorm for kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange. Confirm plane
-// indices (0 = luma, 1 = chroma) and that sampling returns luma in .r.
+// VALIDATED (bench/metal/metal_va_validate.mm M2): POINT-SAMPLE at the cell origin
+// (i*ds, j*ds), value = read().r*255+0.5 — bit-exact (0 mismatches over 14400 cells)
+// vs a CPU readback of the locked CVPixelBuffer, matching the AMD/Vulkan
+// motion_downsample_img.comp. (A block average would NOT match the CPU/CUDA path.)
 kernel void luma_downsample(texture2d<float, access::read> yTex [[texture(0)]],
                             device uchar*  d_cur_grid          [[buffer(0)]],
                             constant int&  ds                  [[buffer(1)]],
@@ -119,19 +117,10 @@ kernel void luma_downsample(texture2d<float, access::read> yTex [[texture(0)]],
     if ((int)gid.x >= sw || (int)gid.y >= sh) return;
     const int w = frameDim.x, h = frameDim.y;
 
-    int x0 = (int)gid.x * ds;
-    int y0 = (int)gid.y * ds;
-    int x1 = min(x0 + ds, w);
-    int y1 = min(y0 + ds, h);
-
-    float acc = 0.0f; int n = 0;
-    for (int yy = y0; yy < y1; ++yy)
-        for (int xx = x0; xx < x1; ++xx) {
-            acc += yTex.read(uint2((uint)xx, (uint)yy)).r; // [0,1]
-            ++n;
-        }
-    float mean = (n > 0) ? (acc / (float)n) : 0.0f;
-    d_cur_grid[gid.y * sw + gid.x] = (uchar)clamp(mean * 255.0f + 0.5f, 0.0f, 255.0f);
+    int sx = (int)gid.x * ds; if (sx > w - 1) sx = w - 1;
+    int sy = (int)gid.y * ds; if (sy > h - 1) sy = h - 1;
+    float v = yTex.read(uint2((uint)sx, (uint)sy)).r;       // [0,1]
+    d_cur_grid[gid.y * sw + gid.x] = (uchar)clamp(v * 255.0f + 0.5f, 0.0f, 255.0f);
 }
 
 // Diff current grid vs previous grid; accumulate changed-count + bbox + luma-sum on
@@ -168,12 +157,18 @@ kernel void luma_diff(device const uchar* d_cur   [[buffer(0)]],
 // border. One thread per destination pixel (net x net). Output is a planar
 // [3,net,net] float buffer (R plane, then G, then B).
 //
-// yTex:   r8Unorm   luma   (full res)
-// uvTex:  rg8Unorm  chroma (half res, interleaved Cb=.r Cg=.g per the NV12 layout;
-//                    for VideoRange NV12 .r=Cb, .g=Cr)
+// yTex:   r8Unorm   luma   (full res)         sampled BILINEAR
+// uvTex:  rg8Unorm  chroma (half res; VideoRange NV12 .r=Cb, .g=Cr — VALIDATED:
+//                    colours render correctly, no channel swap)
 // crop:   (cx, cy, cw, ch) region of the SOURCE to sample; cw/ch==0 -> whole frame.
-kernel void nv12_to_chw(texture2d<float, access::read> yTex  [[texture(0)]],
-                        texture2d<float, access::read> uvTex [[texture(1)]],
+//
+// VALIDATED (bench/metal/metal_va_validate.mm M4): bilinear sampling + inverse
+// letterbox ((d - pad + 0.5)/scale - 0.5) + BT.601 limited-range (video-range 420v
+// confirmed in M1) produces an aspect-preserved, correctly-coloured CHW tensor —
+// matching the AMD/Vulkan nv12_to_chw.comp and the CPU letterbox path. (The CPU
+// path is bilinear, so bilinear here keeps detections numerically comparable.)
+kernel void nv12_to_chw(texture2d<float, access::sample> yTex  [[texture(0)]],
+                        texture2d<float, access::sample> uvTex [[texture(1)]],
                         device float* d_out                  [[buffer(0)]],
                         constant int&   net                  [[buffer(1)]],
                         constant float& scale                [[buffer(2)]],
@@ -187,36 +182,27 @@ kernel void nv12_to_chw(texture2d<float, access::read> yTex  [[texture(0)]],
     const int dx = (int)gid.x, dy = (int)gid.y;
     const int plane = N * N;
     const float PAD = 114.0f / 255.0f;
+    constexpr sampler smp(coord::normalized, address::clamp_to_edge, filter::linear);
 
-    // default to border
     float r = PAD, g = PAD, b = PAD;
 
     const int padx = pad.x, pady = pad.y;
-    // net-space content region (after letterbox padding)
-    // inverse-map dst pixel -> source pixel (nearest; CUDA path uses nearest too
-    // for the fused kernel — UNVALIDATED: confirm against detect_cuda.cu sampling).
-    const int srcOrgX = crop.x;
-    const int srcOrgY = crop.y;
+    const int srcOrgX = crop.x, srcOrgY = crop.y;
     const int srcW = (crop.z > 0) ? crop.z : frameDim.x;
     const int srcH = (crop.w > 0) ? crop.w : frameDim.y;
 
-    const float fx = ((float)(dx - padx)) / scale;
-    const float fy = ((float)(dy - pady)) / scale;
+    // inverse letterbox: model-space dst -> source pixel (pixel-centre convention)
+    const float fx = ((float)dx - (float)padx + 0.5f) / scale - 0.5f;
+    const float fy = ((float)dy - (float)pady + 0.5f) / scale - 0.5f;
 
     if (fx >= 0.0f && fy >= 0.0f && fx < (float)srcW && fy < (float)srcH) {
-        int sx = srcOrgX + (int)fx;
-        int sy = srcOrgY + (int)fy;
-        sx = clamp(sx, 0, frameDim.x - 1);
-        sy = clamp(sy, 0, frameDim.y - 1);
-
-        float Y  = yTex.read(uint2((uint)sx, (uint)sy)).r * 255.0f;
-        float2 uv = uvTex.read(uint2((uint)(sx / 2), (uint)(sy / 2))).rg * 255.0f;
-        float Cb = uv.x, Cr = uv.y;
-
-        // BT.601 limited range YUV->RGB (matches CUDA path)
-        float yf = 1.164f * (Y  - 16.0f);
-        float cb = Cb - 128.0f;
-        float cr = Cr - 128.0f;
+        // normalized coords into the FULL-frame textures (crop offset applied)
+        float u = ((float)srcOrgX + fx + 0.5f) / (float)frameDim.x;
+        float v = ((float)srcOrgY + fy + 0.5f) / (float)frameDim.y;
+        float  Y  = yTex.sample(smp, float2(u, v)).r * 255.0f;
+        float2 uv = uvTex.sample(smp, float2(u, v)).rg * 255.0f;   // bilinear chroma
+        float yf = 1.164f * (Y - 16.0f);
+        float cb = uv.x - 128.0f, cr = uv.y - 128.0f;
         float R = yf + 1.596f * cr;
         float G = yf - 0.392f * cb - 0.813f * cr;
         float B = yf + 2.017f * cb;
@@ -330,20 +316,26 @@ public:
 
         try {
             // --- ORT session with the CoreML execution provider ---
-            // CoreML routes the graph to the Neural Engine / GPU. The alternative
-            // is the (newer/experimental) Metal/MPS EP; CoreML is the supported one
-            // for ANE offload. UNVALIDATED end-to-end against a YOLO26 model.
+            // VALIDATED (bench/metal/metal_coreml_infer.mm): the string-map options
+            // API routes the graph to CoreML; MLComputeUnits="ALL" lets CoreML pick
+            // the Apple Neural Engine. ModelFormat=MLProgram gives the best op
+            // coverage; RequireStaticInputShapes suits our fixed [1,3,net,net] input.
+            //
+            // *** The ANE win needs an fp16 model. *** On an M4 Pro, fp32 yolo26n
+            // falls back to ~CPU (13.9ms) while fp16 runs on the ANE at ~2ms (8.4x
+            // vs CPU). Export with half=True. Override the units via $ZM_COREML_UNITS
+            // (CPUAndNeuralEngine / CPUAndGPU / CPUOnly / ALL) for A/B testing.
             Ort::SessionOptions so;
             so.SetIntraOpNumThreads(1);
             so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
-            uint32_t coreml_flags = 0;
-            // COREML_FLAG_CREATE_MLPROGRAM (0x010) is recommended for newer ORT to
-            // use the ML Program backend (better op coverage). UNVALIDATED: confirm
-            // the constant + that the model converts cleanly.
-            coreml_flags |= 0x010;
-            Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_CoreML(
-                static_cast<OrtSessionOptions*>(so), coreml_flags));
+            const char* unitsEnv = std::getenv("ZM_COREML_UNITS");
+            std::unordered_map<std::string, std::string> coreml_opts = {
+                {"MLComputeUnits", unitsEnv ? unitsEnv : "ALL"},
+                {"ModelFormat", "MLProgram"},
+                {"RequireStaticInputShapes", "1"},
+            };
+            so.AppendExecutionProvider("CoreML", coreml_opts);
 
             sess_ = std::make_unique<Ort::Session>(env_, model_.c_str(), so);
 
@@ -532,7 +524,7 @@ public:
         if (yRef)  CFRelease(yRef);
         if (uvRef) CFRelease(uvRef);
 
-        t.ptr = (void*)chwBuf_;    // opaque: an id<MTLBuffer> of 3*net*net floats
+        t.ptr = (__bridge void*)chwBuf_;  // opaque id<MTLBuffer>; chwBuf_ ivar keeps it alive
         return t;
     }
 

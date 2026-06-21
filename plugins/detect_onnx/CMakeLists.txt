@@ -97,8 +97,15 @@ if(APPLE)
     if(ZM_WITH_METAL)
         enable_language(OBJCXX)
         target_sources(detect_onnx PRIVATE hw_backend_metal.mm)
+        # The .mm uses ARC for id<MTL*> objects (manual CFRelease for CV*/CF*).
+        # Apply -fobjc-arc only to the Objective-C++ source, not the .cpp TUs.
+        set_source_files_properties(hw_backend_metal.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
         target_compile_definitions(detect_onnx PRIVATE ZM_WITH_METAL)
-        target_link_libraries(detect_onnx PRIVATE
+        # The .mm holds the VideoToolbox surface via AVFrame (av_frame_clone/free),
+        # so it needs the FFmpeg headers + libavutil at link time.
+        target_include_directories(detect_onnx PRIVATE ${ZM_FFMPEG_INCLUDES})
+        target_link_directories(detect_onnx PRIVATE ${ZM_FFMPEG_LIBDIRS})
+        target_link_libraries(detect_onnx PRIVATE ${ZM_FFMPEG_LIBS}
             "-framework Metal" "-framework CoreVideo" "-framework VideoToolbox"
             "-framework CoreMedia" "-framework Foundation" "-framework QuartzCore")
         message(STATUS "ZM_WITH_METAL=ON: building Metal HwBackend (Apple)")
