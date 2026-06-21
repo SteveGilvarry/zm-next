@@ -1,0 +1,32 @@
+#version 450
+// 1b+: fully GPU-resident motion gate on the imported VA surface. Downsample +
+// diff vs a device-resident prev grid in one pass; changed cells atomically
+// accumulate count + bbox into a tiny verdict. Only the ~20B verdict is read back
+// — parity with cuda_motion_bbox_gpudiff. prev[] persists across frames (caller
+// keeps the buffer); hasPrev=0 on the first frame just primes it.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform sampler2D luma;                       // imported VA Y plane (R8)
+layout(std430, binding = 1) buffer Prev    { uint prev[]; };      // device-resident prev grid
+layout(std430, binding = 2) buffer Verdict { int cnt; int minx; int miny; int maxx; int maxy; } v;
+
+layout(push_constant) uniform PC { int w; int h; int ds; int gw; int gh; int thr; int hasPrev; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint j = gl_GlobalInvocationID.y;
+    if (i >= uint(pc.gw) || j >= uint(pc.gh)) return;
+    int sx = int(i) * pc.ds; if (sx > pc.w - 1) sx = pc.w - 1;
+    int sy = int(j) * pc.ds; if (sy > pc.h - 1) sy = pc.h - 1;
+    uint cur = uint(texelFetch(luma, ivec2(sx, sy), 0).r * 255.0 + 0.5);
+    uint idx = j * uint(pc.gw) + i;
+    if (pc.hasPrev != 0) {
+        int dd = int(cur) - int(prev[idx]); if (dd < 0) dd = -dd;
+        if (dd > pc.thr) {
+            atomicAdd(v.cnt, 1);
+            atomicMin(v.minx, int(i)); atomicMin(v.miny, int(j));
+            atomicMax(v.maxx, int(i)); atomicMax(v.maxy, int(j));
+        }
+    }
+    prev[idx] = cur;
+}

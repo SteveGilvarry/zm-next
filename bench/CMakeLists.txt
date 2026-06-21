@@ -72,7 +72,7 @@ if(ZM_WITH_CUDA)
     # (5) HwBackend demo: drive real NVDEC surfaces through the backend interface
     set(DET ${CMAKE_SOURCE_DIR}/plugins/detect_onnx)
     add_executable(bench_backend bench_backend.cpp
-        ${DET}/hw_backend_cuda.cpp ${DET}/detect_cuda.cu ${DET}/detect_cuda.cpp ${DET}/detect_engine.cpp)
+        ${DET}/hw_backend.cpp ${DET}/hw_backend_cuda.cpp ${DET}/detect_cuda.cu ${DET}/detect_cuda.cpp ${DET}/detect_engine.cpp)
     target_compile_features(bench_backend PRIVATE cxx_std_17)
     target_include_directories(bench_backend PRIVATE ${CMAKE_SOURCE_DIR}/core/include ${DET} ${ONNXRUNTIME_ROOT}/include)
     target_link_directories(bench_backend PRIVATE ${ONNXRUNTIME_ROOT}/lib)

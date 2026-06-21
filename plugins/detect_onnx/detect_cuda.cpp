@@ -123,7 +123,7 @@ const float* cuda_preprocess_nv12(uint64_t y_ptr, int y_pitch, uint64_t uv_ptr, 
     return d;
 }
 
-MotionRoi cuda_motion_bbox(uint64_t y_ptr, int y_pitch, int width, int height,
+MotionRoi cuda_motion_bbox_cpudiff(uint64_t y_ptr, int y_pitch, int width, int height,
                            std::vector<uint8_t>& prev_grid,
                            int ds, int pix_thr, int min_changed,
                            int luma_jump_thresh, float* prev_mean) {
@@ -180,7 +180,90 @@ MotionRoi cuda_motion_bbox(uint64_t y_ptr, int y_pitch, int width, int height,
     return m;
 }
 
-std::vector<MotionRoi> cuda_motion_regions(uint64_t y_ptr, int y_pitch, int width, int height,
+// --- Fully GPU-resident bbox gate: downsample + diff on device, prev grid stays
+// on the device (ping-pong), only the ~24B verdict is read back. ---
+struct GpuDiffState {
+    void* d_cur = nullptr;      // current downsampled grid (device)
+    void* d_prev = nullptr;     // previous grid (device, ping-pong)
+    void* d_verdict = nullptr;  // MotionVerdict (device)
+    size_t n = 0;               // allocated grid cells
+    bool has_prev = false;      // a previous grid is available
+    bool mean_valid = false;    // prev_mean holds a real value
+    float prev_mean = 0.0f;
+    void ensure(size_t need) {
+        if (need > n) {
+            if (d_cur) cudaFree(d_cur);
+            if (d_prev) cudaFree(d_prev);
+            d_cur = d_prev = nullptr;
+            if (cudaMalloc(&d_cur, need) != cudaSuccess ||
+                cudaMalloc(&d_prev, need) != cudaSuccess)
+                throw std::runtime_error("cudaMalloc(motion grid) failed");
+            n = need; has_prev = false; mean_valid = false;
+        }
+        if (!d_verdict && cudaMalloc(&d_verdict, sizeof(MotionVerdict)) != cudaSuccess)
+            throw std::runtime_error("cudaMalloc(verdict) failed");
+    }
+    ~GpuDiffState() {
+        if (d_cur) cudaFree(d_cur);
+        if (d_prev) cudaFree(d_prev);
+        if (d_verdict) cudaFree(d_verdict);
+    }
+};
+
+GpuDiffState* gpudiff_state_create() { return new GpuDiffState(); }
+void gpudiff_state_destroy(GpuDiffState* st) { delete st; }
+
+MotionRoi cuda_motion_bbox_gpudiff(uint64_t y_ptr, int y_pitch, int width, int height,
+                                    GpuDiffState* st, int ds, int pix_thr, int min_changed,
+                                    int luma_jump_thresh) {
+    const int sw = width / ds, sh = height / ds;
+    const size_t n = static_cast<size_t>(sw) * sh;
+    st->ensure(n);
+
+    // Downsample this frame's luma into d_cur (on device).
+    if (launch_luma_grid(reinterpret_cast<const uint8_t*>(y_ptr), y_pitch, width, height,
+                         ds, sw, sh, static_cast<uint8_t*>(st->d_cur)) != 0)
+        throw std::runtime_error("luma_grid kernel launch failed");
+
+    // First frame: seed prev = cur so the diff yields no motion and a valid mean.
+    if (!st->has_prev) {
+        cudaMemcpy(st->d_prev, st->d_cur, n, cudaMemcpyDeviceToDevice);
+        st->has_prev = true;
+    }
+
+    // Diff on the device; read back only the verdict (~24 B).
+    const MotionVerdict init{0, sw, sh, -1, -1, 0};
+    cudaMemcpy(st->d_verdict, &init, sizeof(init), cudaMemcpyHostToDevice);
+    if (launch_luma_diff(static_cast<uint8_t*>(st->d_cur), static_cast<uint8_t*>(st->d_prev),
+                         sw, sh, pix_thr, st->d_verdict) != 0)
+        throw std::runtime_error("luma_diff kernel launch failed");
+    MotionVerdict v{};
+    cudaMemcpy(&v, st->d_verdict, sizeof(v), cudaMemcpyDeviceToHost);  // blocks => syncs
+
+    bool luma_jump = false;
+    if (luma_jump_thresh > 0 && n > 0) {
+        const float mean = static_cast<float>(static_cast<double>(v.sum) / static_cast<double>(n));
+        if (st->mean_valid &&
+            std::abs(mean - st->prev_mean) > static_cast<float>(luma_jump_thresh))
+            luma_jump = true;
+        st->prev_mean = mean; st->mean_valid = true;
+    }
+
+    MotionRoi m;
+    m.changed = v.cnt;
+    if (!luma_jump && v.cnt >= min_changed && v.maxx >= v.minx) {
+        m.active = true;
+        int x0 = v.minx * ds, y0 = v.miny * ds, x1 = (v.maxx + 1) * ds, y1 = (v.maxy + 1) * ds;
+        const int mx = (x1 - x0) / 5, my = (y1 - y0) / 5;  // 20% margin, matching the host path
+        x0 = std::max(0, x0 - mx); y0 = std::max(0, y0 - my);
+        x1 = std::min(width, x1 + mx); y1 = std::min(height, y1 + my);
+        m.x = x0; m.y = y0; m.w = x1 - x0; m.h = y1 - y0;
+    }
+    std::swap(st->d_cur, st->d_prev);  // ping-pong: prev <- cur, no copy
+    return m;
+}
+
+std::vector<MotionRoi> cuda_motion_regions_cpudiff(uint64_t y_ptr, int y_pitch, int width, int height,
                                            std::vector<uint8_t>& prev_grid,
                                            int ds, int pix_thr, int min_cells, int max_regions,
                                            int luma_jump_thresh, float* prev_mean) {
@@ -196,7 +279,7 @@ std::vector<MotionRoi> cuda_motion_regions(uint64_t y_ptr, int y_pitch, int widt
 
     std::vector<MotionRoi> regions;
 
-    // Global-luma-jump suppression (knob, default off). See cuda_motion_bbox /
+    // Global-luma-jump suppression (knob, default off). See cuda_motion_bbox_cpudiff /
     // the header for semantics. On a whole-scene exposure jump we still refresh
     // prev_grid (so next frame diffs cleanly) but return no regions. Disabled when
     // luma_jump_thresh <= 0 or prev_mean == nullptr (default) => byte-identical.

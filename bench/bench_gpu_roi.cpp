@@ -2,7 +2,7 @@
 // stays in VRAM, motion + crop + inference all run on the device.
 //
 // Drives the real decode_ffmpeg plugin in CUDA mode (emits ZM_HW_CUDA surfaces),
-// then per frame: on-GPU luma-diff motion (cuda_motion_bbox), full-frame GPU
+// then per frame: on-GPU luma-diff motion (cuda_motion_bbox_cpudiff), full-frame GPU
 // detect, and — when motion — a zero-copy ROI-crop GPU detect (cuda_infer_nv12
 // with a crop rect). Nothing but a tiny motion grid + the small output tensor
 // ever crosses PCIe; the frame itself never leaves the GPU.
@@ -10,7 +10,7 @@
 // Reuses the plugin's own detect_cuda kernels (compiled into this target).
 
 #include "zm_plugin.h"
-#include "detect_cuda.hpp"            // cuda_infer_nv12, cuda_motion_bbox, MotionRoi, Box
+#include "detect_cuda.hpp"            // cuda_infer_nv12, cuda_motion_bbox_cpudiff, MotionRoi, Box
 #include <onnxruntime_cxx_api.h>
 #ifdef BENCH_WITH_CUDA
 #include <cuda_runtime.h>
@@ -107,7 +107,7 @@ static void on_frame(void* vc, const void* buf, size_t size) {
         return;
     }
     auto tm = clk::now();
-    auto regions = zm::detect::cuda_motion_regions(yp, ypitch, w, h, c->prev, c->ds, c->thr, c->minchg, c->maxRegions);
+    auto regions = zm::detect::cuda_motion_regions_cpudiff(yp, ypitch, w, h, c->prev, c->ds, c->thr, c->minchg, c->maxRegions);
     c->t_motion += ms(tm);
     ++c->frames;
     if (c->only == 2) {  // motion-gated full-frame inference (skip idle)

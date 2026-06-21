@@ -189,6 +189,50 @@ int launch_luma_grid(const uint8_t* y_ptr, int y_pitch, int w, int h,
     return (int)cudaGetLastError();
 }
 
+namespace {
+// One thread per grid cell. Diffs cur vs prev; changed cells (|d|>thr) accumulate
+// count + bbox into the device verdict via atomics. Every thread also contributes
+// its cur value to a block-shared sum reduction (one atomicAdd per block) so the
+// grid mean is available on-device for global-luma-jump suppression — no grid
+// readback. A/B vs the CPU diff: bench/bench_motion_diff.cu.
+__global__ void luma_diff_kernel(const uint8_t* __restrict__ cur,
+                                 const uint8_t* __restrict__ prev,
+                                 int sw, int sh, int thr, MotionVerdict* v) {
+    extern __shared__ unsigned int s_sum[];
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = threadIdx.x;
+    const int total = sw * sh;
+    unsigned int myval = 0;
+    if (i < total) {
+        const int c = cur[i];
+        myval = static_cast<unsigned int>(c);
+        if (abs(c - static_cast<int>(prev[i])) > thr) {
+            const int x = i % sw, y = i / sw;
+            atomicAdd(&v->cnt, 1);
+            atomicMin(&v->minx, x); atomicMin(&v->miny, y);
+            atomicMax(&v->maxx, x); atomicMax(&v->maxy, y);
+        }
+    }
+    s_sum[t] = myval;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (t < s) s_sum[t] += s_sum[t + s];
+        __syncthreads();
+    }
+    if (t == 0) atomicAdd(&v->sum, static_cast<unsigned long long>(s_sum[0]));
+}
+}  // namespace
+
+int launch_luma_diff(const uint8_t* d_cur, const uint8_t* d_prev,
+                     int sw, int sh, int thr, void* d_verdict) {
+    const int total = sw * sh;
+    const int blk = 256;
+    const int grd = (total + blk - 1) / blk;
+    luma_diff_kernel<<<grd, blk, blk * sizeof(unsigned int)>>>(
+        d_cur, d_prev, sw, sh, thr, static_cast<MotionVerdict*>(d_verdict));
+    return (int)cudaGetLastError();
+}
+
 }  // namespace zm::detect
 
 #endif  // ZMP_WITH_CUDA

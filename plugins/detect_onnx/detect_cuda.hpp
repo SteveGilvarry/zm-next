@@ -70,24 +70,52 @@ struct MotionRoi { bool active = false; int x = 0, y = 0, w = 0, h = 0; int chan
 // returns an inactive MotionRoi for this frame. luma_jump_thresh = 0 (the default)
 // disables the check entirely, so existing callers / benchmark numbers are
 // byte-identical. Pass prev_mean = nullptr to opt out even when a threshold is set.
-MotionRoi cuda_motion_bbox(uint64_t y_ptr, int y_pitch, int width, int height,
+MotionRoi cuda_motion_bbox_cpudiff(uint64_t y_ptr, int y_pitch, int width, int height,
                            std::vector<uint8_t>& prev_grid,
                            int ds, int pix_thr, int min_changed,
                            int luma_jump_thresh = 0, float* prev_mean = nullptr);
 
-// Like cuda_motion_bbox but returns SEPARATE motion regions via connected
+// --- Fully GPU-resident motion gate (downsample + diff both on device) ---
+//
+// Verdict accumulated on the device by launch_luma_diff: changed-cell count +
+// bbox (in grid cells) + luma sum (for the mean / global-luma-jump check). Only
+// this ~24-byte struct is read back, so neither the frame NOR the grid crosses
+// PCIe — unlike cuda_motion_bbox_cpudiff, which copies the grid back and diffs on the CPU.
+struct MotionVerdict { int cnt; int minx; int miny; int maxx; int maxy; unsigned long long sum; };
+
+// Diff two device-resident grids (sw*sh cells) on the GPU. d_verdict must be
+// pre-initialized to {0, sw, sh, -1, -1, 0}. Defined in detect_cuda.cu. 0 == ok.
+int launch_luma_diff(const uint8_t* d_cur, const uint8_t* d_prev,
+                     int sw, int sh, int thr, void* d_verdict);
+
+// Opaque per-stream device state (the prev grid + verdict buffer live on the
+// device across calls). The caller owns one per stream; create in start(),
+// destroy in stop().
+struct GpuDiffState;
+GpuDiffState* gpudiff_state_create();
+void gpudiff_state_destroy(GpuDiffState* st);
+
+// Same semantics and output as cuda_motion_bbox_cpudiff, but the downsample AND the diff
+// run on the GPU and prev_grid stays on the device (ping-pong) — only the ~24B
+// verdict is read back. For grids finer than ~ds=32 this is faster than the host
+// diff and crosses orders of magnitude less PCIe (see bench/bench_motion_diff.cu).
+MotionRoi cuda_motion_bbox_gpudiff(uint64_t y_ptr, int y_pitch, int width, int height,
+                                    GpuDiffState* st, int ds, int pix_thr, int min_changed,
+                                    int luma_jump_thresh = 0);
+
+// Like cuda_motion_bbox_cpudiff but returns SEPARATE motion regions via connected
 // components on the changed-cell grid (4-connectivity, overlapping boxes merged,
 // capped to max_regions by area, each >= min_cells). Lets detection run on each
 // distinct mover instead of one frame-spanning merged box.
 //
 // Global-luma-jump suppression (A/B knob, default OFF): identical semantics to
-// cuda_motion_bbox above. If luma_jump_thresh > 0 and the current grid mean
+// cuda_motion_bbox_cpudiff above. If luma_jump_thresh > 0 and the current grid mean
 // differs from *prev_mean by more than luma_jump_thresh, an empty region list is
 // returned for this frame (whole-scene exposure change, not real motion). The
 // prev_grid is still updated so differencing resumes cleanly next frame.
 // luma_jump_thresh = 0 (default) disables the check, keeping existing callers and
 // benchmark output byte-identical. prev_mean = nullptr also opts out.
-std::vector<MotionRoi> cuda_motion_regions(uint64_t y_ptr, int y_pitch, int width, int height,
+std::vector<MotionRoi> cuda_motion_regions_cpudiff(uint64_t y_ptr, int y_pitch, int width, int height,
                                            std::vector<uint8_t>& prev_grid,
                                            int ds, int pix_thr, int min_cells, int max_regions,
                                            int luma_jump_thresh = 0, float* prev_mean = nullptr);

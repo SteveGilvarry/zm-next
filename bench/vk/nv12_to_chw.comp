@@ -1,0 +1,35 @@
+#version 450
+// 1c: GPU preprocess. Reads the imported VA Y (R8) + UV (R8G8 half-res) planes,
+// inverse-letterboxes (aspect-preserving), BT.601 limited-range YUV->RGB, /255,
+// writes a planar CHW float tensor — same math as the CUDA nv12_to_chw kernel and
+// the CPU letterbox path. Bilinear via linear-filtered samplers.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform sampler2D yPlane;    // R8, full res
+layout(binding = 1) uniform sampler2D uvPlane;   // R8G8, half res
+layout(std430, binding = 2) writeonly buffer Out { float chw[]; };  // 3*net*net
+
+layout(push_constant) uniform PC { int srcW; int srcH; int net; float scale; int padx; int pady; } pc;
+
+void main() {
+    uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
+    if (x >= uint(pc.net) || y >= uint(pc.net)) return;
+    int plane = pc.net * pc.net;
+    float r = 114.0/255.0, g = r, b = r;
+
+    // inverse letterbox: model-space -> source pixel
+    float sx = (float(x) - float(pc.padx) + 0.5) / pc.scale - 0.5;
+    float sy = (float(y) - float(pc.pady) + 0.5) / pc.scale - 0.5;
+    if (sx >= 0.0 && sy >= 0.0 && sx < float(pc.srcW) && sy < float(pc.srcH)) {
+        float Y  = texture(yPlane,  vec2((sx + 0.5)/float(pc.srcW), (sy + 0.5)/float(pc.srcH))).r * 255.0;
+        vec2  UV = texture(uvPlane, vec2((sx + 0.5)/float(pc.srcW), (sy + 0.5)/float(pc.srcH))).rg * 255.0;
+        float Yf = Y - 16.0, U = UV.x - 128.0, V = UV.y - 128.0;
+        float R = 1.164*Yf + 1.596*V;
+        float G = 1.164*Yf - 0.392*U - 0.813*V;
+        float B = 1.164*Yf + 2.017*U;
+        r = clamp(R,0.,255.)/255.; g = clamp(G,0.,255.)/255.; b = clamp(B,0.,255.)/255.;
+    }
+    chw[0*plane + int(y)*pc.net + int(x)] = r;
+    chw[1*plane + int(y)*pc.net + int(x)] = g;
+    chw[2*plane + int(y)*pc.net + int(x)] = b;
+}

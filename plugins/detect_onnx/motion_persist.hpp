@@ -5,7 +5,7 @@
 // A/B TUNING KNOB (Phase 0, default = pass-through / NEUTRAL).
 //
 // Header-only, no dependencies beyond the standard library, no CUDA. The motion
-// kernels (cuda_motion_regions / cuda_motion_bbox in detect_cuda.{hpp,cpp}) stay
+// kernels (cuda_motion_regions_cpudiff / cuda_motion_bbox_cpudiff in detect_cuda.{hpp,cpp}) stay
 // stateless across frames; the per-stream ring of recent activity lives HERE, in
 // caller-owned state, exactly like prev_grid / prev_mean.
 //
@@ -28,10 +28,10 @@
 //     applied BEFORE connected components. This is the most faithful place to
 //     gate — it suppresses transient cells before they ever form a region.
 //   * passes(): a region-level helper for callers that only have boxes (e.g. the
-//     existing cuda_motion_regions output). It samples the region's cells against
+//     existing cuda_motion_regions_cpudiff output). It samples the region's cells against
 //     the ring and reports whether enough of them are persistent.
 //
-// Because cuda_motion_regions currently returns only merged boxes (not the raw
+// Because cuda_motion_regions_cpudiff currently returns only merged boxes (not the raw
 // mask), the recommended Phase-0 wiring keeps the kernel untouched and applies
 // MotionPersist at the region level in the caller (see WIRING below). A future
 // refinement can expose the raw mask and use update_mask() for cell-exact gating.
@@ -46,7 +46,7 @@
 //       // ...to A/B-enable: persist = MotionPersist{2, 3}; // 2-of-3
 //   };
 //
-//   auto regions = zm::detect::cuda_motion_regions(yp, ypitch, w, h, c->prev,
+//   auto regions = zm::detect::cuda_motion_regions_cpudiff(yp, ypitch, w, h, c->prev,
 //                      c->ds, c->thr, c->minchg, c->maxRegions,
 //                      c->lumaJumpThresh, &c->prevMean);   // luma knob (also off by default)
 //
@@ -124,7 +124,7 @@ public:
     // unchanged (and pushes nothing, so toggling the knob later starts clean).
     //
     // sw/sh = downsampled grid dims (width/ds, height/ds); ds = the same
-    // downscale passed to cuda_motion_regions.
+    // downscale passed to cuda_motion_regions_cpudiff.
     std::vector<MotionRoi> filter_regions(const std::vector<MotionRoi>& regions,
                                           int sw, int sh, int ds);
 

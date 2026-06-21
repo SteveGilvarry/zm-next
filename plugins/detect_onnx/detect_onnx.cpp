@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <cstdlib>   // getenv (ZM_MOTION_REGIONS opt-in)
 #include <algorithm>
 
 #include "zm_plugin.h"
@@ -78,7 +79,10 @@ struct DetectOnnxCtx {
     int motionMinCells = 0;            // per-region min changed cells (0 = auto ~0.25%)
     int maxRegions = 8;
     double fullSweepSec = 2.0;         // periodic full-frame sweep to catch static objects
-    std::vector<uint8_t> prevGrid;     // previous downsampled luma grid (motion state)
+    std::vector<uint8_t> prevGrid;     // previous downsampled luma grid (CPU motion state, regions opt-in path)
+#ifdef ZMP_WITH_CUDA
+    zm::detect::GpuDiffState* gpuDiff = nullptr;  // device-resident prev grid (default gpudiff path), lazily created
+#endif
     uint64_t lastSweepUsec = 0;
     bool sweptOnce = false;
     bool sharedEngine = false;     // route full-frame CUDA detect through the shared engine
@@ -233,6 +237,9 @@ static int detect_onnx_start(zm_plugin_t* plugin, zm_host_api_t* host, void* hos
 static void detect_onnx_stop(zm_plugin_t* plugin) {
     auto* ctx = static_cast<DetectOnnxCtx*>(plugin->instance);
     if (ctx) {
+#ifdef ZMP_WITH_CUDA
+        if (ctx->gpuDiff) { zm::detect::gpudiff_state_destroy(ctx->gpuDiff); ctx->gpuDiff = nullptr; }
+#endif
         delete ctx;
         plugin->instance = nullptr;
     }
@@ -283,9 +290,25 @@ static void detect_onnx_on_frame(zm_plugin_t* plugin, const void* buf, size_t si
                 // Motion-gated, per-region ROI cascade with a periodic full sweep.
                 const int minCells = ctx->motionMinCells > 0 ? ctx->motionMinCells
                     : std::max(8, (gw / ctx->motionDownscale) * (gh / ctx->motionDownscale) / 400);
-                auto regions = zm::detect::cuda_motion_regions(
-                    g->plane_ptr[0], yp, gw, gh, ctx->prevGrid,
-                    ctx->motionDownscale, ctx->motionThreshold, minCells, ctx->maxRegions);
+                // Motion gate. DEFAULT: cuda_motion_bbox_gpudiff — fully GPU-resident
+                // (downsample AND diff on the device, prev grid stays device-resident,
+                // only a ~24B verdict crosses PCIe), yielding ONE merged ROI. Set
+                // ZM_MOTION_REGIONS=1 for the opt-in cuda_motion_regions_cpudiff
+                // multi-mover path, which copies the full grid back and runs CPU
+                // connected-components to detect each distinct mover separately.
+                static const bool useRegions = []{ const char* e = getenv("ZM_MOTION_REGIONS"); return e && *e == '1'; }();
+                std::vector<zm::detect::MotionRoi> regions;
+                if (useRegions) {
+                    regions = zm::detect::cuda_motion_regions_cpudiff(
+                        g->plane_ptr[0], yp, gw, gh, ctx->prevGrid,
+                        ctx->motionDownscale, ctx->motionThreshold, minCells, ctx->maxRegions);
+                } else {
+                    if (!ctx->gpuDiff) ctx->gpuDiff = zm::detect::gpudiff_state_create();
+                    auto m = zm::detect::cuda_motion_bbox_gpudiff(
+                        g->plane_ptr[0], yp, gw, gh, ctx->gpuDiff,
+                        ctx->motionDownscale, ctx->motionThreshold, minCells);
+                    if (m.active) regions.push_back(m);
+                }
                 const bool sweep = !ctx->sweptOnce ||
                     hdr->pts_usec >= ctx->lastSweepUsec + static_cast<uint64_t>(ctx->fullSweepSec * 1e6);
                 std::vector<zm::detect::Box> boxes;

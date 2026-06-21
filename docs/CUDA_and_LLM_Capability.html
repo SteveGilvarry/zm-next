@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zm-next — CUDA pipeline &amp; LLM event review</title>
+<style>
+  :root{--fg:#1c2128;--mut:#57606a;--accent:#0969da;--bg:#fff;--code:#f6f8fa;--bd:#d0d7de;--win:#1f6f3d}
+  @media (prefers-color-scheme:dark){
+    :root{--fg:#e6edf3;--mut:#9198a1;--accent:#4493f8;--bg:#0d1117;--code:#161b22;--bd:#30363d;--win:#3fb950}
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:16px/1.6 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:860px;margin:0 auto;padding:40px 24px 80px}
+  h1{font-size:30px;line-height:1.2;margin:0 0 4px}
+  h2{font-size:22px;margin:38px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--bd)}
+  h3{font-size:17px;margin:24px 0 8px}
+  p,li{color:var(--fg)}
+  .lede{color:var(--mut);font-size:15px}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  code{background:var(--code);border-radius:5px;padding:.15em .4em;font-size:.88em;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:14.5px}
+  th,td{border:1px solid var(--bd);padding:7px 11px;text-align:left;vertical-align:top}
+  th{background:var(--code)}
+  .meta{background:var(--code);border:1px solid var(--bd);border-radius:8px;padding:12px 16px;font-size:14px;color:var(--mut)}
+  .win{color:var(--win);font-weight:600}
+  .tldr{background:var(--code);border-left:3px solid var(--accent);border-radius:6px;padding:4px 18px;margin-top:14px}
+  ul{padding-left:22px}
+  li{margin:4px 0}
+  .foot{margin-top:50px;padding-top:14px;border-top:1px solid var(--bd);color:var(--mut);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>zm-next — CUDA pipeline &amp; LLM event review</h1>
+<p class="lede">Capability summary, weighted toward the zero-copy decode/detect path.</p>
+
+<p>zm-next is a plugin-based video-pipeline engine (next-gen ZoneMinder core). C++20, CMake + vcpkg.
+A <code>zm-core</code> process loads a JSON pipeline, <code>dlopen</code>s plugins
+(capture&nbsp;&rarr;&nbsp;decode&nbsp;&rarr;&nbsp;detect&nbsp;&rarr;&nbsp;output), runs each stage in
+its own thread, and passes frames over a stable C ABI (<code>zm_frame_hdr_t</code>).</p>
+
+<div class="meta"><strong>Reference box for the numbers below:</strong> RTX&nbsp;5070&nbsp;Ti
+(16&nbsp;GB, sm_120 Blackwell), Ryzen&nbsp;7&nbsp;9700X. Stack: FFmpeg&nbsp;8 (nvcodec/x264/x265),
+ONNX&nbsp;Runtime&nbsp;GPU (cuda12), CUDA&nbsp;12.9 / cuDNN&nbsp;9, vcpkg <code>x64-linux-dynamic</code>.</div>
+
+<h2>1. Zero-copy decode &rarr; detect path</h2>
+
+<p>The decoded surface <strong>never leaves VRAM</strong> from decode through inference — no host
+readback of the image, no re-upload. Only a kilobyte-sized motion grid crosses PCIe.</p>
+
+<h3>Stages (all on-device)</h3>
+<ol>
+<li><strong>NVDEC decode &rarr; NV12 surface in VRAM.</strong> FFmpeg <code>hw_frames_ctx</code> yields
+a CUDA device pointer (Y plane + interleaved UV), never a host buffer.</li>
+<li><strong>On-GPU motion gate.</strong> A CUDA kernel downsamples luma to a small grid
+(<code>launch_luma_grid</code>) and diffs it against the previous frame's grid. <strong>Only the grid
+crosses PCIe</strong> (a few KB), never the full frame. Optional whole-scene luma-jump suppression
+(headlights / IR-cut / auto-gain) is available as a config knob.</li>
+<li><strong>Preprocess NV12 &rarr; CHW on-device.</strong> A fused kernel
+(<code>launch_nv12_to_chw</code>, <code>detect_cuda.cu</code>) samples the NV12 surface — optionally
+just a motion ROI crop — into a planar normalized <code>3&times;net&times;net</code> float tensor:
+bilinear letterbox scale/pad, BT.601 YUV&rarr;RGB, /255, matching the CPU path.</li>
+<li><strong>Inference via ORT CUDA EP + IoBinding.</strong> The session input is
+<strong>bound directly to the device tensor</strong> from step&nbsp;3. NMS-free output is decoded to
+source-pixel boxes on-device, mapped back through the letterbox.</li>
+</ol>
+<p>Per-call scratch buffers are <code>thread_local</code>. The CUDA context uses
+<code>cudaDeviceScheduleBlockingSync</code> (blocking, not spin-wait), keeping detect-thread CPU low.</p>
+
+<h3>Measured (1080p h264, single stream, yolo26n)</h3>
+<table>
+<tr><th>Step</th><th>CPU</th><th>GPU zero-copy</th></tr>
+<tr><td>Decode</td><td>843 fps</td><td class="win">1579 fps (NVDEC in VRAM)</td></tr>
+<tr><td>Detect (one inference)</td><td>23.6 ms (CPU EP)</td><td class="win">1.80 ms (CUDA EP, device IoBinding)</td></tr>
+<tr><td>End-to-end decode&rarr;detect</td><td>31 fps</td><td class="win">387 fps</td></tr>
+</table>
+<p>Detect's VRAM footprint is <strong>~720&nbsp;MB</strong> (model + ORT/cuDNN + NVDEC surfaces).</p>
+
+<h3>Shared inference engine (multi-camera)</h3>
+<p>A single <strong>shared batched <code>InferenceEngine</code></strong> serves all camera threads: each
+thread preprocesses zero-copy and hands its device tensor to one ORT session that batches them. At
+8&nbsp;cameras this holds CPU around 30% and uses roughly half the VRAM of per-camera sessions, at the
+same throughput. The session is a process-lifetime singleton.</p>
+
+<h3>Fused decode+detect stage</h3>
+<p>The NVDEC surface is <strong>call-scoped</strong> — valid only inside <code>on_frame</code>. The
+<strong><code>decode_detect</code> plugin</strong> composes decode internally (via <code>dlopen</code>)
+and runs detect <strong>synchronously in the same <code>on_frame</code></strong>, so the surface lives
+across both stages with no copy. Surface lifetime is managed with <code>av_frame_clone</code> /
+<code>av_frame_free</code>.</p>
+
+<h3>Portability — HwBackend</h3>
+<p><code>HwBackend</code> abstracts the device path as
+<code>acquire / release / motion / preprocess / infer</code>. CUDA is the implemented backend; the
+interface leaves clean seams for <strong>VideoToolbox/Metal (Apple), OpenVINO (Intel), ROCm (AMD),
+DirectML (Windows)</strong> without touching plugin logic. The frame ABI carries <code>hw_type</code>
+(CPU/CUDA/VAAPI/VideoToolbox/DXVA).</p>
+
+<h2>2. LLM event review</h2>
+<p><code>llm_event_review</code> is a DETECT-triggered plugin: on a detection/alert event it grabs the
+latest decoded frame for that stream, JPEG-encodes it (downscaled so longest-edge area
+&le;&nbsp;~1&nbsp;MP), and asks a vision-LLM to describe the event.</p>
+<ul>
+<li><strong>Model-agnostic.</strong> Speaks the OpenAI-compatible <code>/v1/chat/completions</code>
+vision API, so the model is a <strong>config string + server URL</strong> — Qwen3-VL / Qwen2.5-VL /
+MiniCPM-V / InternVL, local or cloud, with no rebuild. <code>IVisionProvider</code> interface.</li>
+<li><strong>Per-track debounce</strong> on wall-clock (<code>steady_clock</code>, pruned) so a tracked
+object isn't reviewed repeatedly.</li>
+</ul>
+
+<h3>Local serving (vLLM on the 5070 Ti)</h3>
+<p>vLLM&nbsp;0.23, torch&nbsp;2.11+cu130. Default model
+<code>Qwen/Qwen3-VL-4B-Instruct-FP8</code> (8B also supported).</p>
+<ul>
+<li>On 16&nbsp;GB: <code>--enforce-eager</code> + a capped <code>--max-model-len</code> are required
+(otherwise KV cache can't fit and engine init fails).</li>
+<li><strong>4B</strong> @ <code>gpu-mem-util 0.60</code> / <code>max-model-len 4096</code> &rarr;
+<span class="win">~9.5&nbsp;GB used, ~6&nbsp;GB free</span> for the detector.</li>
+<li>Warm latency <strong>~0.5&ndash;0.8&nbsp;s/event</strong> (single frame); ~1.5&nbsp;s for a 6-frame
+montage.</li>
+</ul>
+
+<h3>Sharing one GPU with the detector</h3>
+<ul>
+<li><strong>VRAM:</strong> detect needs ~720&nbsp;MB; with the 4B at ~9.5&nbsp;GB there is comfortable
+headroom.</li>
+<li><strong>Compute:</strong> the SMs time-slice. Detect runs at 1.80&nbsp;ms idle and ~15&nbsp;ms while
+the LLM is actively generating — within budget for a few 30&nbsp;fps cameras (33&nbsp;ms/frame); review
+is low-QPS and debounced.</li>
+</ul>
+
+<h2>3. Integrated pipeline + metadata</h2>
+<p>End-to-end: <code>decode_ffmpeg &rarr; detect_onnx &rarr; tracker &rarr; llm_event_review</code>.</p>
+<ul>
+<li><strong>Tracker</strong> (<code>tracker_core.hpp</code>, SORT/IoU, persistent
+<code>track_id</code>s) provides stable counts. <code>min_hits</code> requires N IoU matches before a
+track is confirmed, so transient false detections are not counted; <code>max_age</code> keeps real
+tracks alive through detector dropouts.</li>
+<li><strong>VLM grounding.</strong> The VLM is grounded only on objective signals it cannot perceive
+from a still — trajectory/direction (from box-area trend), time, zone — and is not given the detector's
+count or confidence. Confidence is used as a <strong>router</strong>: high-confidence detections are
+trusted, marginal ones are blind-verified by the VLM (asked independently whether a subject is present),
+low ones dropped.</li>
+<li><strong>Motion via montage.</strong> Six stills tiled into one ~1&nbsp;MP image let the model read
+direction, speed and loitering while staying ~1 image / ~1000 tokens.</li>
+<li><strong>WebVTT metadata tracks.</strong> Detections, tracker IDs+trails, and LLM captions each
+export as a WebVTT track (<code>kind="metadata"</code> for JSON boxes, <code>kind="subtitles"</code>
+for text), rendered as three independently-toggleable layers over the video for event playback.</li>
+</ul>
+
+<h2>TL;DR</h2>
+<div class="tldr">
+<ul>
+<li><strong>Decode&rarr;detect stays in VRAM the whole way</strong> (NVDEC NV12 &rarr; on-GPU motion
+&rarr; on-GPU NV12&rarr;CHW &rarr; ORT CUDA EP via IoBinding). Only a KB-sized motion grid crosses PCIe.
+<strong>387 fps end-to-end vs 31 fps all-CPU</strong>, detect 1.80&nbsp;ms/inf, ~720&nbsp;MB.</li>
+<li><strong>Fused stage</strong> keeps the call-scoped NVDEC surface alive across decode+detect; a
+<strong>shared engine</strong> serves N cameras from one session; <strong>HwBackend</strong> leaves
+portability seams.</li>
+<li><strong>LLM review</strong> is model-agnostic over an OpenAI-compatible API, runs
+Qwen3-VL-4B-FP8 locally in ~9.5&nbsp;GB leaving room to co-run the detector, ~0.5&ndash;0.8&nbsp;s/event,
+integrated behind the tracker.</li>
+</ul>
+</div>
+
+<p class="foot">zm-next &middot; CUDA &amp; LLM capability summary. See also
+<code>docs/GPU_Pipeline.md</code>, <code>docs/AI_Architecture.md</code>,
+<code>docs/Research_Motion_and_LLM_Review.md</code>.</p>
+
+</div>
+</body>
+</html>

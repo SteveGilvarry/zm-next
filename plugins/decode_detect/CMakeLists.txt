@@ -15,6 +15,7 @@ pkg_check_modules(DDAV REQUIRED IMPORTED_TARGET libavutil)
 set(DET ${CMAKE_SOURCE_DIR}/plugins/detect_onnx)
 add_library(decode_detect MODULE
     decode_detect.cpp
+    ${DET}/hw_backend.cpp
     ${DET}/hw_backend_cuda.cpp
     ${DET}/detect_cuda.cu
     ${DET}/detect_cuda.cpp

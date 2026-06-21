@@ -1,0 +1,20 @@
+#version 450
+// Phase-1 motion kernel (milestone 1a form: reads a host-uploaded luma buffer;
+// 1b will swap binding 0 for a ycbcr-sampled VkImage imported from the VA surface).
+// Downsamples the luma plane to a gw x gh grid by point-sampling at stride ds —
+// the same coarse grid the CUDA/cpudiff path uses.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly  buffer InBuf  { uint pix[];  };  // one luma byte per uint
+layout(std430, binding = 1) writeonly buffer OutBuf { uint grid[]; };  // gw*gh cells
+
+layout(push_constant) uniform PC { int w; int h; int ds; int gw; int gh; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint j = gl_GlobalInvocationID.y;
+    if (i >= uint(pc.gw) || j >= uint(pc.gh)) return;
+    int sx = int(i) * pc.ds; if (sx > pc.w - 1) sx = pc.w - 1;
+    int sy = int(j) * pc.ds; if (sy > pc.h - 1) sy = pc.h - 1;
+    grid[j * uint(pc.gw) + i] = pix[uint(sy) * uint(pc.w) + uint(sx)];
+}
