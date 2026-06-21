@@ -26,6 +26,10 @@ static uint32_t get_u32(const uint8_t* p) {
 }
 
 int main(int argc, char** argv) {
+    // Line-buffer stdout so each printed frame/event is emitted immediately when
+    // piped (not held in a block buffer and flushed in bursts) — keeps a live feed
+    // through `wl_dump | grep ...` real-time.
+    setvbuf(stdout, nullptr, _IOLBF, 0);
     if (argc < 2) { std::cerr << "usage: wl_dump <socket> [seconds]\n"; return 2; }
     const std::string path = argv[1];
     const int seconds = argc > 2 ? atoi(argv[2]) : 5;
