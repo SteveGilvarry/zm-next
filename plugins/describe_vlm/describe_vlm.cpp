@@ -11,6 +11,7 @@
 // client. The HTTP call happens on a background thread so the pipeline thread is
 // never blocked. Every frame is forwarded downstream unchanged.
 //
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -38,6 +39,19 @@ using json = nlohmann::json;
 // ---------------------------------------------------------------------------
 // Plugin context
 // ---------------------------------------------------------------------------
+// Event-trigger state, shared with the host event callback (as a raw user
+// pointer). Leaked on stop so an in-flight callback never dangles (the callback
+// only ever touches THIS struct, never the soon-to-be-deleted ctx). When `types`
+// is empty the plugin keeps its legacy fixed-interval behaviour.
+struct TriggerState {
+    std::atomic<bool> running{true};
+    std::atomic<bool> fired{false};
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::vector<std::string> types;          // event "type"s that trigger a describe
+    std::vector<uint32_t> streamFilter;      // empty = any stream
+};
+
 struct DescribeVlmCtx {
     zm_host_api_t* host = nullptr;
     void* hostCtx = nullptr;
@@ -49,8 +63,15 @@ struct DescribeVlmCtx {
     std::string model = "moondream";
     std::string prompt =
         "Describe what is happening in this security camera image in one sentence.";
-    double intervalSec = 10.0;
+    double intervalSec = 10.0;            // in trigger mode: the min gap (cooldown) between describes
     std::vector<uint32_t> streamFilter;  // empty = all streams
+
+    // YOLO->VLM gating: when triggerTypes is non-empty the VLM only describes a
+    // frame after a matching event (e.g. "detection") fires, throttled to once
+    // per intervalSec. Empty = legacy fixed-interval behaviour. `trig` is leaked.
+    std::vector<std::string> triggerTypes;
+    TriggerState* trig = nullptr;
+    void* trigSub = nullptr;             // host subscription handle
 
     // Latest frame snapshot (protected by frameMutex)
     std::mutex frameMutex;
@@ -251,19 +272,49 @@ static void run_inference_cycle(DescribeVlmCtx* ctx) {
     ZM_LOG_INFO("describe_vlm: %s", text.c_str());
 }
 
+// Host event callback: a detection/motion event from an upstream stage (e.g.
+// decode_detect) arms a describe. Only touches the leaked TriggerState.
+static void describe_trigger_cb(void* user, const char* json_event) {
+    auto* ts = static_cast<TriggerState*>(user);
+    if (!ts || !ts->running.load() || !json_event) return;
+    try {
+        auto j = nlohmann::json::parse(json_event);
+        const std::string type = j.value("type", std::string());
+        if (std::find(ts->types.begin(), ts->types.end(), type) == ts->types.end()) return;
+        if (!ts->streamFilter.empty()) {
+            uint32_t sid = j.value("stream_id", 0u);
+            if (std::find(ts->streamFilter.begin(), ts->streamFilter.end(), sid) == ts->streamFilter.end())
+                return;
+        }
+        { std::lock_guard<std::mutex> lk(ts->mtx); ts->fired.store(true); }
+        ts->cv.notify_one();
+    } catch (const std::exception&) { /* ignore malformed events */ }
+}
+
 // ---------------------------------------------------------------------------
 // Background worker loop
 // ---------------------------------------------------------------------------
 static void worker_loop(DescribeVlmCtx* ctx) {
-    double intervalSec = ctx->intervalSec > 0.0 ? ctx->intervalSec : 10.0;
-    auto interval = std::chrono::duration<double>(intervalSec);
+    const double intervalSec = ctx->intervalSec > 0.0 ? ctx->intervalSec : 10.0;
+    const auto cooldown = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(intervalSec));
+    TriggerState* ts = ctx->trig;
+    const bool gated = ts && !ts->types.empty();
+    auto lastDescribe = std::chrono::steady_clock::now() - cooldown;  // allow an immediate first describe
 
     while (ctx->running.load()) {
         {
-            std::unique_lock<std::mutex> lk(ctx->cvMutex);
-            ctx->cv.wait_for(lk, interval, [ctx] { return !ctx->running.load(); });
+            std::unique_lock<std::mutex> lk(ts->mtx);
+            // Wake on: shutdown, a fired trigger, or (interval mode) the timeout tick.
+            ts->cv.wait_for(lk, cooldown, [&] { return !ctx->running.load() || ts->fired.load(); });
         }
         if (!ctx->running.load()) break;
+
+        const bool fired = ts->fired.exchange(false);
+        if (gated && !fired) continue;                       // trigger mode: only describe on a detection
+        auto now = std::chrono::steady_clock::now();
+        if (now - lastDescribe < cooldown) continue;         // throttle: at most once per intervalSec
+        lastDescribe = now;
         run_inference_cycle(ctx);
     }
 }
@@ -297,6 +348,10 @@ static int describe_vlm_start(zm_plugin_t* plugin, zm_host_api_t* host,
                     }
                 }
             }
+            if (j.contains("trigger_types") && j["trigger_types"].is_array()) {
+                for (const auto& v : j["trigger_types"])
+                    if (v.is_string()) ctx->triggerTypes.push_back(v.get<std::string>());
+            }
         } catch (const std::exception& e) {
             ZM_LOG_ERROR("describe_vlm: failed to parse config: %s", e.what());
             // continue with defaults
@@ -308,11 +363,26 @@ static int describe_vlm_start(zm_plugin_t* plugin, zm_host_api_t* host,
     // libcurl global init (idempotent enough for our single-plugin use).
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
+    // Trigger state (always created; the worker waits on its cv). In trigger mode
+    // (trigger_types set) subscribe to the host event bus so detections from an
+    // upstream YOLO stage arm a describe.
+    ctx->trig = new TriggerState;
+    ctx->trig->types = ctx->triggerTypes;
+    ctx->trig->streamFilter = ctx->streamFilter;
+    if (!ctx->triggerTypes.empty() && host && host->subscribe_evt)
+        ctx->trigSub = host->subscribe_evt(host_ctx, &describe_trigger_cb, ctx->trig);
+
     ctx->running.store(true);
     ctx->worker = std::thread(worker_loop, ctx);
 
-    ZM_LOG_INFO("describe_vlm started (server=%s, model=%s, interval=%.1fs)",
-                ctx->serverUrl.c_str(), ctx->model.c_str(), ctx->intervalSec);
+    if (ctx->triggerTypes.empty()) {
+        ZM_LOG_INFO("describe_vlm started (server=%s, model=%s, interval=%.1fs, mode=fixed-interval)",
+                    ctx->serverUrl.c_str(), ctx->model.c_str(), ctx->intervalSec);
+    } else {
+        std::string ts; for (auto& t : ctx->triggerTypes) ts += (ts.empty()?"":",") + t;
+        ZM_LOG_INFO("describe_vlm started (server=%s, model=%s, mode=triggered on [%s], cooldown=%.1fs)",
+                    ctx->serverUrl.c_str(), ctx->model.c_str(), ts.c_str(), ctx->intervalSec);
+    }
     return 0;
 }
 
@@ -320,10 +390,15 @@ static void describe_vlm_stop(zm_plugin_t* plugin) {
     auto* ctx = static_cast<DescribeVlmCtx*>(plugin->instance);
     if (!ctx) return;
 
+    // Stop new triggers first, then wake + join the worker.
+    if (ctx->trigSub && ctx->host && ctx->host->unsubscribe_evt)
+        ctx->host->unsubscribe_evt(ctx->hostCtx, ctx->trigSub);
+    if (ctx->trig) ctx->trig->running.store(false);
+
     ctx->running.store(false);
-    {
-        std::lock_guard<std::mutex> lk(ctx->cvMutex);
-        ctx->cv.notify_all();
+    if (ctx->trig) {                       // worker waits on the trigger state's cv
+        std::lock_guard<std::mutex> lk(ctx->trig->mtx);
+        ctx->trig->cv.notify_all();
     }
     if (ctx->worker.joinable()) {
         ctx->worker.join();
@@ -331,6 +406,8 @@ static void describe_vlm_stop(zm_plugin_t* plugin) {
 
     curl_global_cleanup();
 
+    // ctx->trig is intentionally leaked: a host callback may still be in flight
+    // after unsubscribe returns, and it only touches the TriggerState.
     delete ctx;
     plugin->instance = nullptr;
 }

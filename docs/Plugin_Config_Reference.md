@@ -73,8 +73,11 @@ optional with the defaults shown. Common keys:
 - **tracker** — `iou_threshold` (0.3), `max_age` (30), `min_hits` (3).
 - **analytics_rules** — `rules`: array of
   `{name, type:"intrusion"|"linecross"|"loiter", polygon|line, direction, seconds, classes, stream_id}`.
-- **describe_vlm** — `server_url` (OpenAI-compatible VLM), `model` ("moondream"),
-  `prompt`, `interval_sec` (10), `frame_width`/`frame_height`, `stream_filter`.
+- **describe_vlm** — `server_url` (OpenAI-compatible VLM), `model`,
+  `prompt`, `interval_sec` (10), `frame_width`/`frame_height`, `stream_filter`,
+  `trigger_types` (e.g. `["detection"]`): when set, the VLM describes a frame
+  only after a matching upstream event fires (the YOLO→VLM cascade gate),
+  throttled to once per `interval_sec`; empty = legacy fixed-interval.
 
 ## Outputs / store
 - **output_mqtt** — `host` ("localhost"), `port` (1883), `base_topic`
