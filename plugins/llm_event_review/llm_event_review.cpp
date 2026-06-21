@@ -100,6 +100,10 @@ struct ReviewJob {
     //     hits of one event; the decode thread keeps mutating the live ring). ---
     std::shared_ptr<std::vector<TimedThumb>> frames;
     double spanSec = 0.0;
+    // Per-track crop: one normalized centre per montage frame (follows the
+    // track's trajectory) + the crop window size. Empty/0 => full-frame montage.
+    std::vector<std::pair<float, float>> cropCenters;
+    float cropFrac = 0.0f;
     // --- Narrate: the track's accumulated captions + trajectory. ---
     std::vector<TrackHist::Caption> timeline;
     std::vector<TrackHist::Point> traj;
@@ -138,6 +142,13 @@ struct State {
                                     // within the server's max-model-len budget)
     long storeMaxPixels = 230400;   // per-thumbnail store cap (~640x360) -> bounds
                                     // ring memory: ~0.7MB * window*fps per stream
+    bool montageCrop = true;        // crop each tile to the track's bbox (follows
+                                    // the object via its trajectory) so the
+                                    // caption is about THAT track, not the scene
+    double montageCropMargin = 2.0; // bbox -> crop-window scale (context + slack
+                                    // for motion between samples)
+    double montageCropMinFrac = 0.25;  // smallest crop window (frac of frame), so
+                                       // tiny/fast objects keep context
     std::string montagePrompt =
         "You are a security camera analyst reviewing a sequence of [n] frames "
         "from one event, shown in chronological order (left to right, top to "
@@ -307,6 +318,37 @@ bool scaleRgb24(const uint8_t* src, int sw, int sh, int dw, int dh,
     return true;
 }
 
+// Bilinear rescale of a SUB-RECTANGLE of an RGB24 image into (dw,dh). The crop
+// rect (cx,cy,cw,ch) is in source pixels; it is clamped to the image. Used to
+// follow one track's bbox across the montage frames so the caption is about that
+// object, not the whole scene.
+bool scaleRgb24Crop(const uint8_t* src, int fullW, int fullH,
+                    int cx, int cy, int cw, int ch, int dw, int dh,
+                    std::vector<uint8_t>& out) {
+    out.clear();
+    if (!src || fullW <= 0 || fullH <= 0 || dw <= 0 || dh <= 0) return false;
+    if (cx < 0) { cw += cx; cx = 0; }
+    if (cy < 0) { ch += cy; cy = 0; }
+    if (cx + cw > fullW) cw = fullW - cx;
+    if (cy + ch > fullH) ch = fullH - cy;
+    if (cw < 2 || ch < 2) return false;
+    SwsContext* sws = sws_getContext(cw, ch, AV_PIX_FMT_RGB24,
+                                     dw, dh, AV_PIX_FMT_RGB24,
+                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!sws) return false;
+    out.resize(static_cast<size_t>(dw) * dh * 3);
+    // Point at the crop origin; keep the FULL-width stride so sws reads the
+    // sub-rectangle row by row.
+    const uint8_t* srcSlice[1] = {
+        src + (static_cast<size_t>(cy) * fullW + cx) * 3};
+    int srcStride[1] = {3 * fullW};
+    uint8_t* dstSlice[1] = {out.data()};
+    int dstStride[1] = {3 * dw};
+    sws_scale(sws, srcSlice, srcStride, 0, ch, dstSlice, dstStride);
+    sws_freeContext(sws);
+    return true;
+}
+
 // Pick a (dw,dh) preserving aspect with dw*dh <= maxPixels, even dims.
 void fitDims(int sw, int sh, long maxPixels, int& dw, int& dh) {
     dw = sw; dh = sh;
@@ -327,16 +369,24 @@ void fitDims(int sw, int sh, long maxPixels, int& dw, int& dh) {
 // gutter between cells so the model reads them as discrete frames). The grid is
 // `cols` wide and as many rows as needed; empty trailing cells stay gray.
 // ---------------------------------------------------------------------------
+// `centers` (when non-empty, one normalized (cx,cy) per frame) + `cropFrac`
+// (normalized window size, >0) crop each tile to follow one track; otherwise the
+// whole frame is tiled. `aspectW/aspectH` set the tile aspect (frame dims).
 bool buildMontage(const std::vector<TimedThumb>& frames, int cols,
-                  long montageMaxPixels, std::vector<uint8_t>& out,
-                  int& outW, int& outH) {
+                  long montageMaxPixels,
+                  const std::vector<std::pair<float, float>>& centers,
+                  float cropFrac, int aspectW, int aspectH,
+                  std::vector<uint8_t>& out, int& outW, int& outH) {
     out.clear();
     const int n = static_cast<int>(frames.size());
     if (n == 0 || cols <= 0) return false;
     const int rows = (n + cols - 1) / cols;
+    const bool doCrop =
+        cropFrac > 0.0f && static_cast<int>(centers.size()) == n;
 
-    // Source aspect from the first frame.
-    const int sw = frames[0].width, sh = frames[0].height;
+    // Tile aspect from the (cropped or full) frame geometry.
+    const int sw = aspectW > 0 ? aspectW : frames[0].width;
+    const int sh = aspectH > 0 ? aspectH : frames[0].height;
     if (sw <= 0 || sh <= 0) return false;
     const double aspect = static_cast<double>(sw) / sh;
 
@@ -356,9 +406,25 @@ bool buildMontage(const std::vector<TimedThumb>& frames, int cols,
 
     for (int i = 0; i < n; ++i) {
         std::vector<uint8_t> tile;
-        if (!scaleRgb24(frames[i].rgb.data(), frames[i].width, frames[i].height,
-                        tileW, tileH, tile))
-            continue;
+        const int fw = frames[i].width, fh = frames[i].height;
+        bool ok;
+        if (doCrop) {
+            // Equal normalized half-extents -> crop box keeps the frame aspect
+            // (no distortion when scaled into the frame-aspect tile). Clamp the
+            // centre so the box stays inside the frame.
+            const float half = cropFrac * 0.5f;
+            float ncx = std::min(std::max(centers[i].first, half), 1.0f - half);
+            float ncy = std::min(std::max(centers[i].second, half), 1.0f - half);
+            const int cw = std::max(2, static_cast<int>(cropFrac * fw));
+            const int ch = std::max(2, static_cast<int>(cropFrac * fh));
+            const int cx = static_cast<int>((ncx - half) * fw);
+            const int cy = static_cast<int>((ncy - half) * fh);
+            ok = scaleRgb24Crop(frames[i].rgb.data(), fw, fh, cx, cy, cw, ch,
+                                tileW, tileH, tile);
+        } else {
+            ok = scaleRgb24(frames[i].rgb.data(), fw, fh, tileW, tileH, tile);
+        }
+        if (!ok) continue;
         const int c = i % cols, r = i / cols;
         const int x0 = g + c * (tileW + g);
         const int y0 = g + r * (tileH + g);
@@ -539,8 +605,8 @@ void processJob(State* s, ReviewJob& job) {
     if (s->montage && frames.size() >= 2) {
         std::vector<uint8_t> canvas;
         int cw = 0, ch = 0;
-        if (buildMontage(frames, s->montageCols, s->montageMaxPixels, canvas,
-                         cw, ch) &&
+        if (buildMontage(frames, s->montageCols, s->montageMaxPixels,
+                         job.cropCenters, job.cropFrac, 0, 0, canvas, cw, ch) &&
             encodeRgb24ToJpeg(canvas.data(), cw, ch, s->montageMaxPixels, jpeg)) {
             isMontage = true;
         }
@@ -591,6 +657,7 @@ void processJob(State* s, ReviewJob& job) {
     if (isMontage) {
         evt["frame_count"] = n;
         evt["span_sec"] = job.spanSec;
+        evt["cropped"] = !job.cropCenters.empty() && job.cropFrac > 0.0f;
     }
     evt["inference_time_ms"] = ms;
 
@@ -704,10 +771,11 @@ void handleEvent(State* s, const std::string& msg) {
     struct Hit {
         int trackId; std::string label; std::string reason;
         bool hasBbox = false; float cx = 0, cy = 0;  // normalized centroid
+        float bw = 0, bh = 0;                         // normalized bbox size
     };
     std::vector<Hit> hits;
 
-    // Centroid from a [x,y,w,h] bbox, normalized by the configured frame dims.
+    // Centroid + size from a [x,y,w,h] bbox, normalized by the frame dims.
     auto centroid = [&](const json& obj, Hit& h) {
         if (s->frameWidth <= 0 || s->frameHeight <= 0) return;
         if (!obj.contains("bbox") || !obj["bbox"].is_array() ||
@@ -717,6 +785,8 @@ void handleEvent(State* s, const std::string& msg) {
         const double w = b[2].get<double>(), hgt = b[3].get<double>();
         h.cx = static_cast<float>((x + w / 2.0) / s->frameWidth);
         h.cy = static_cast<float>((y + hgt / 2.0) / s->frameHeight);
+        h.bw = static_cast<float>(w / s->frameWidth);
+        h.bh = static_cast<float>(hgt / s->frameHeight);
         h.hasBbox = true;
     };
 
@@ -817,6 +887,37 @@ void handleEvent(State* s, const std::string& msg) {
         job.frames = frames;       // shared montage frames for every hit
         job.spanSec = spanSec;
 
+        // Per-track crop: follow the object across the montage frames. For each
+        // selected frame, pick the trajectory point nearest in time so the crop
+        // tracks the moving object instead of a fixed box.
+        if (s->montage && s->montageCrop && h.hasBbox && frames->size() >= 2) {
+            const double frac = std::min(
+                1.0, std::max(s->montageCropMinFrac,
+                              std::max(h.bw, h.bh) * s->montageCropMargin));
+            std::vector<std::pair<float, float>> centers;
+            centers.reserve(frames->size());
+            std::lock_guard<std::mutex> lk(s->trackMutex);
+            auto it = s->trackHist.find(key);
+            const TrackHist* th =
+                (it != s->trackHist.end() && it->second.haveT0) ? &it->second
+                                                                : nullptr;
+            for (const auto& f : *frames) {
+                float bcx = h.cx, bcy = h.cy;  // fallback: latest centroid
+                if (th && !th->traj.empty()) {
+                    const double ft =
+                        std::chrono::duration<double>(f.t - th->t0).count();
+                    double best = 1e18;
+                    for (const auto& p : th->traj) {
+                        const double d = std::abs(p.tSec - ft);
+                        if (d < best) { best = d; bcx = p.cx; bcy = p.cy; }
+                    }
+                }
+                centers.emplace_back(bcx, bcy);
+            }
+            job.cropCenters = std::move(centers);
+            job.cropFrac = static_cast<float>(frac);
+        }
+
         {
             std::lock_guard<std::mutex> lk(s->jobMutex);
             s->jobs.push_back(std::move(job));
@@ -857,6 +958,9 @@ int start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx,
             s->montageSampleFps = j.value("montage_sample_fps", s->montageSampleFps);
             s->montageMaxPixels = j.value("montage_max_pixels", s->montageMaxPixels);
             s->storeMaxPixels = j.value("store_max_pixels", s->storeMaxPixels);
+            s->montageCrop = j.value("montage_crop", s->montageCrop);
+            s->montageCropMargin = j.value("montage_crop_margin", s->montageCropMargin);
+            s->montageCropMinFrac = j.value("montage_crop_min_frac", s->montageCropMinFrac);
             s->montagePrompt = j.value("montage_prompt", s->montagePrompt);
             if (s->montageFrames < 1) s->montageFrames = 1;
             if (s->montageCols < 1) s->montageCols = 1;

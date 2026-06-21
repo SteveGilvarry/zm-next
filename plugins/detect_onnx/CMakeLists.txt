@@ -40,6 +40,13 @@ if(ZM_WITH_CUDA)
     target_sources(detect_onnx PRIVATE
         hw_backend_cuda.cpp detect_cuda.cpp detect_cuda.cu detect_engine.cpp)
     target_link_libraries(detect_onnx PRIVATE CUDA::cudart)
+    # The CUDA decode/engine TUs use FFmpeg (av_frame_*, hwcontext) to handle
+    # NVDEC surfaces. Plugins load RTLD_LOCAL, so the symbols can't be borrowed
+    # from decode_ffmpeg at runtime — link avutil/avcodec ourselves or the plugin
+    # fails to load with "undefined symbol: av_frame_free".
+    target_include_directories(detect_onnx PRIVATE ${ZM_FFMPEG_INCLUDES})
+    target_link_directories(detect_onnx PRIVATE ${ZM_FFMPEG_LIBDIRS})
+    target_link_libraries(detect_onnx PRIVATE ${ZM_FFMPEG_LIBS})
     set_target_properties(detect_onnx PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
 endif()
 
