@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdlib>   // getenv (ZM_MOTION_REGIONS opt-in)
 #include <algorithm>
+#include <cmath>
 
 #include "zm_plugin.h"
 
@@ -68,6 +69,7 @@ struct DetectOnnxCtx {
     int frameWidth = 0;
     int frameHeight = 0;
     std::string ep = "cpu";
+    bool reid = false;                  // attach an appearance embedding per box
     std::vector<int> classFilter;       // empty = all
     std::vector<int> streamFilter;      // empty = all
     std::vector<std::string> classNames; // empty = use COCO-80
@@ -129,6 +131,7 @@ static int detect_onnx_start(zm_plugin_t* plugin, zm_host_api_t* host, void* hos
             ctx->confThreshold = j.value("conf_threshold", 0.25f);
             ctx->frameWidth = j.value("frame_width", 0);
             ctx->frameHeight = j.value("frame_height", 0);
+            ctx->reid = j.value("reid", false);
             ctx->ep = j.value("ep", std::string("cpu"));
             if (j.contains("class_filter") && j["class_filter"].is_array())
                 ctx->classFilter = j["class_filter"].get<std::vector<int>>();
@@ -245,10 +248,68 @@ static void detect_onnx_stop(zm_plugin_t* plugin) {
     }
 }
 
+// Cheap appearance embedding for ReID: a normalized HSV colour histogram over
+// the inner part of the box (H:16 + S:8 + V:8 = 32 bins, L2-normalized). It is
+// not a learned ReID descriptor, but it cleanly separates objects of different
+// colour (e.g. a white vs a dark car) so the tracker won't fuse them. The schema
+// (a "embedding" float array) is model-agnostic: a CNN ReID vector can replace
+// this later with no tracker change. Returns {} for a degenerate box.
+static std::vector<float> appearanceEmbed(const uint8_t* rgb, int fw, int fh,
+                                          const zm::detect::Box& b) {
+    constexpr int HB = 16, SB = 8, VB = 8;
+    std::vector<float> hist(HB + SB + VB, 0.f);
+    if (!rgb || fw <= 0 || fh <= 0) return {};
+    // Inner 70% of the box (trim background bleed at the edges), clamped.
+    const float mx = b.w * 0.15f, my = b.h * 0.15f;
+    int x0 = std::max(0, static_cast<int>(b.x + mx));
+    int y0 = std::max(0, static_cast<int>(b.y + my));
+    int x1 = std::min(fw, static_cast<int>(b.x + b.w - mx));
+    int y1 = std::min(fh, static_cast<int>(b.y + b.h - my));
+    if (x1 - x0 < 2 || y1 - y0 < 2) return {};
+    // Sample on a grid of ~24x24 to keep this O(constant) per box.
+    const int sx = std::max(1, (x1 - x0) / 24), sy = std::max(1, (y1 - y0) / 24);
+    int n = 0;
+    for (int y = y0; y < y1; y += sy) {
+        for (int x = x0; x < x1; x += sx) {
+            const uint8_t* p = rgb + (static_cast<size_t>(y) * fw + x) * 3;
+            const float r = p[0] / 255.f, g = p[1] / 255.f, bl = p[2] / 255.f;
+            const float mxc = std::max({r, g, bl}), mnc = std::min({r, g, bl});
+            const float v = mxc, delta = mxc - mnc;
+            const float s = mxc > 0.f ? delta / mxc : 0.f;
+            float h = 0.f;
+            if (delta > 0.f) {
+                if (mxc == r)      h = 60.f * (std::fmod((g - bl) / delta, 6.f));
+                else if (mxc == g) h = 60.f * ((bl - r) / delta + 2.f);
+                else               h = 60.f * ((r - g) / delta + 4.f);
+                if (h < 0.f) h += 360.f;
+            }
+            int hb = std::min(HB - 1, static_cast<int>(h / 360.f * HB));
+            int sb = std::min(SB - 1, static_cast<int>(s * SB));
+            int vb = std::min(VB - 1, static_cast<int>(v * VB));
+            hist[hb] += 1.f;
+            hist[HB + sb] += 1.f;
+            hist[HB + SB + vb] += 1.f;
+            ++n;
+        }
+    }
+    if (n == 0) return {};
+    // L2-normalize so the tracker can cosine-compare regardless of crop size.
+    float norm = 0.f;
+    for (float v : hist) norm += v * v;
+    if (norm > 0.f) {
+        norm = std::sqrt(norm);
+        for (float& v : hist) v /= norm;
+    }
+    return hist;
+}
+
 // Build and publish a "detection" event from decoded boxes (source-pixel coords).
+// When `rgb` is provided and ReID is on, attach an appearance embedding per box.
 static void publishBoxes(DetectOnnxCtx* ctx, const zm_frame_hdr_t* hdr,
-                         const std::vector<zm::detect::Box>& boxes) {
+                         const std::vector<zm::detect::Box>& boxes,
+                         const uint8_t* rgb = nullptr, int fw = 0, int fh = 0) {
     if (boxes.empty()) return;
+    const bool doReid = ctx->reid && rgb && fw > 0 && fh > 0;
     json detections = json::array();
     for (const auto& b : boxes) {
         std::string scratch;
@@ -257,6 +318,10 @@ static void publishBoxes(DetectOnnxCtx* ctx, const zm_frame_hdr_t* hdr,
         d["confidence"] = b.confidence;
         d["bbox"] = {b.x, b.y, b.w, b.h};
         d["class_id"] = b.class_id;
+        if (doReid) {
+            auto emb = appearanceEmbed(rgb, fw, fh, b);
+            if (!emb.empty()) d["embedding"] = emb;
+        }
         detections.push_back(std::move(d));
     }
     json evt;
@@ -421,7 +486,7 @@ static void detect_onnx_on_frame(zm_plugin_t* plugin, const void* buf, size_t si
         std::vector<zm::detect::Box> boxes =
             zm::detect::decode_nms_free(out, num, lb, ctx->confThreshold, ctx->classFilter);
 
-        publishBoxes(ctx, hdr, boxes);
+        publishBoxes(ctx, hdr, boxes, payload, w, h);
     } catch (const std::exception& e) {
         ZM_LOG_ERROR("detect_onnx: inference error: %s", e.what());
     }

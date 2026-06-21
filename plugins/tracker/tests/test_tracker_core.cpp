@@ -123,6 +123,43 @@ TEST(TrackerTest, UngatedAssociationAllowsCrossClassReuse) {
     EXPECT_EQ(tr.track_count(), 1u);
 }
 
+// Appearance gate: two SAME-class overlapping detections that look DIFFERENT
+// (orthogonal embeddings) must not share an id — this is the ReID fix for the
+// "two cars under one id" case that class gating alone can't catch.
+TEST(TrackerTest, AppearanceGateSplitsLookalikeOverlap) {
+    Tracker tr(0.3f, /*max_age=*/30, /*min_hits=*/1, /*class_gated=*/true,
+               /*appearance_threshold=*/0.5f, /*appearance_weight=*/0.3f);
+
+    Det a = makeDet(0, 0, 10, 10, /*cls=*/2);
+    a.embedding = {1.f, 0.f, 0.f};      // e.g. a white car
+    const int id0 = tr.update({a})[0];
+    EXPECT_NE(id0, 0);
+
+    Det b = makeDet(0, 0, 10, 10, /*cls=*/2);
+    b.embedding = {0.f, 1.f, 0.f};      // a different-looking car, same box+class
+    const int id1 = tr.update({b})[0];
+    EXPECT_NE(id1, 0);
+    EXPECT_NE(id1, id0);                 // appearance mismatch -> distinct id
+    EXPECT_EQ(tr.track_count(), 2u);
+}
+
+// Same class, same appearance, moving box -> stays one id (gate doesn't fragment
+// a real track whose colour is stable frame to frame).
+TEST(TrackerTest, AppearanceGateKeepsConsistentLook) {
+    Tracker tr(0.3f, 30, /*min_hits=*/1, /*class_gated=*/true,
+               /*appearance_threshold=*/0.5f, /*appearance_weight=*/0.3f);
+
+    Det a = makeDet(0, 0, 10, 10, /*cls=*/2);
+    a.embedding = {1.f, 0.f, 0.f};
+    const int id0 = tr.update({a})[0];
+
+    Det b = makeDet(1, 0, 10, 10, /*cls=*/2);
+    b.embedding = {0.9f, 0.1f, 0.f};    // nearly identical look
+    const int id1 = tr.update({b})[0];
+    EXPECT_EQ(id1, id0);
+    EXPECT_EQ(tr.track_count(), 1u);
+}
+
 // Greedy association: each detection matches at most one track.
 TEST(TrackerTest, OneToOneAssociation) {
     Tracker tr(0.3f, 30, /*min_hits=*/1);

@@ -51,6 +51,9 @@ struct TrackerState {
     int maxAge = 30;
     int minHits = 3;
     bool classGated = true;
+    float appearanceThreshold = 0.f;  // min cosine sim to allow a match (0=off)
+    float appearanceWeight = 0.f;     // blend of appearance into the match score
+    float embedAlpha = 0.1f;          // EMA weight on each new embedding
 
     // Per stream_id tracker. Guarded by `mutex`.
     std::mutex mutex;
@@ -60,8 +63,10 @@ struct TrackerState {
         auto it = trackers.find(streamId);
         if (it == trackers.end()) {
             it = trackers.emplace(
-                       streamId, zm::tracker::Tracker(iouThreshold, maxAge,
-                                                      minHits, classGated))
+                       streamId, zm::tracker::Tracker(
+                                     iouThreshold, maxAge, minHits, classGated,
+                                     appearanceThreshold, appearanceWeight,
+                                     embedAlpha))
                      .first;
         }
         return it->second;
@@ -87,6 +92,12 @@ bool parseBbox(const json& det, zm::tracker::Det& out) {
     out.h = b[3].get<float>();
     out.class_id = det.value("class_id", -1);
     out.confidence = det.value("confidence", 0.0f);
+    // Optional appearance embedding from the detector (ReID).
+    if (det.contains("embedding") && det["embedding"].is_array()) {
+        out.embedding.reserve(det["embedding"].size());
+        for (const auto& v : det["embedding"])
+            if (v.is_number()) out.embedding.push_back(v.get<float>());
+    }
     return true;
 }
 
@@ -138,6 +149,7 @@ void handleEvent(TrackerState* state, const std::string& msg) {
     for (std::size_t i = 0; i < detsJson.size(); ++i) {
         json d = detsJson[i];
         d["track_id"] = idForJson[i];
+        d.erase("embedding");  // tracker has consumed it; keep the event lean
         outDets.push_back(std::move(d));
     }
     out["detections"] = std::move(outDets);
@@ -169,6 +181,9 @@ int tracker_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx,
         state->maxAge = cfg.value("max_age", 30);
         state->minHits = cfg.value("min_hits", 3);
         state->classGated = cfg.value("class_gated", true);
+        state->appearanceThreshold = cfg.value("appearance_threshold", 0.f);
+        state->appearanceWeight = cfg.value("appearance_weight", 0.3f);
+        state->embedAlpha = cfg.value("embed_alpha", 0.1f);
     } catch (const std::exception& e) {
         ZM_LOG_ERROR("tracker: failed to parse config: %s", e.what());
     }
@@ -189,9 +204,11 @@ int tracker_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx,
             state);
     }
 
-    ZM_LOG_INFO("tracker: iou_threshold=%.2f max_age=%d min_hits=%d class_gated=%d",
+    ZM_LOG_INFO("tracker: iou_threshold=%.2f max_age=%d min_hits=%d class_gated=%d "
+                "appearance_threshold=%.2f (reid %s)",
                 state->iouThreshold, state->maxAge, state->minHits,
-                state->classGated);
+                state->classGated, state->appearanceThreshold,
+                state->appearanceThreshold > 0.f ? "on" : "off");
     return 0;
 }
 
