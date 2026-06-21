@@ -84,11 +84,16 @@ int main(int argc, char** argv) {
                                       << " pts=" << f.media().pts_us()
                                       << " bytes=" << paylen << "\n";
                         break;
-                    case wl::Frame::kEvent:
+                    case wl::Frame::kEvent: {
                         ++events;
-                        std::cout << "EVENT code=" << f.event().code()
-                                  << " msg=" << f.event().message().substr(0, 80) << "\n";
+                        const auto& ev = f.event();
+                        if (ev.code() == wl::Event::DESCRIPTION)
+                            std::cout << "DESCRIPTION: " << ev.description().text() << "\n";
+                        else
+                            std::cout << "EVENT code=" << ev.code()
+                                      << " msg=" << ev.message().substr(0, 120) << "\n";
                         break;
+                    }
                     case wl::Frame::kStats:
                         ++stats;
                         std::cout << "STATS sent=" << f.stats().messages_sent()
