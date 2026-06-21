@@ -2,18 +2,17 @@
 // protobuf messages (Hello / Media / Event / Stats / Bye). A live end-to-end
 // probe for the per-monitor worker interface. Usage: wl_dump <socket> [seconds]
 
+#include "zm/net_compat.hpp"   // winsock2 first on Windows; POSIX sockets elsewhere
 #include "worker_link.pb.h"
 
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
-#include <poll.h>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
 #include <string>
 #include <vector>
 #include <iostream>
+#include <thread>
+#include <chrono>
 
 namespace wl = zm::worker::v1;
 
@@ -30,13 +29,14 @@ int main(int argc, char** argv) {
     const std::string path = argv[1];
     const int seconds = argc > 2 ? atoi(argv[2]) : 5;
 
-    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    zm_net_init();   // WSAStartup on Windows; no-op on POSIX
+    int fd = static_cast<int>(::socket(AF_UNIX, SOCK_STREAM, 0));
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
     for (int i = 0; i < 200; ++i) {
         if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) break;
-        struct timespec ts{0, 10'000'000}; nanosleep(&ts, nullptr);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
         if (i == 199) { std::cerr << "could not connect to " << path << "\n"; return 1; }
     }
     std::cout << "connected to " << path << "\n";
@@ -49,17 +49,20 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> out;
     put_u32(out, (uint32_t)body.size()); put_u32(out, 0);
     out.insert(out.end(), body.begin(), body.end());
-    (void)!::write(fd, out.data(), out.size());
+    (void)!zm_writefd(fd, out.data(), out.size());
 
     std::string buf;
     int hello = 0, media = 0, events = 0, stats = 0, other = 0;
     long mediaBytes = 0;
     time_t end = time(nullptr) + seconds;
     while (time(nullptr) < end) {
-        pollfd pfd{fd, POLLIN, 0};
-        if (::poll(&pfd, 1, 200) <= 0) continue;
+        pollfd pfd{};
+        pfd.fd = static_cast<decltype(pfd.fd)>(fd);
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        if (zm_poll(&pfd, 1, 200) <= 0) continue;
         char tmp[65536];
-        ssize_t n = ::read(fd, tmp, sizeof(tmp));
+        ssize_t n = zm_readfd(fd, tmp, sizeof(tmp));
         if (n <= 0) break;
         buf.append(tmp, n);
         while (buf.size() >= 8) {
@@ -103,6 +106,6 @@ int main(int argc, char** argv) {
     std::cout << "--- summary: hello=" << hello << " media=" << media
               << " (" << mediaBytes << " bytes) events=" << events
               << " stats=" << stats << " other=" << other << " ---\n";
-    ::close(fd);
+    zm_closefd(fd);
     return 0;
 }

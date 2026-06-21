@@ -1,25 +1,37 @@
+// net_compat.hpp pulls in <winsock2.h> first on Windows (before any <windows.h>).
+#include "zm/net_compat.hpp"
+
 #include "zm/WorkerLink.hpp"
 #include "worker_link.pb.h"
 
 #include <gtest/gtest.h>
 
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
-#include <poll.h>
 #include <cstring>
 #include <string>
 #include <vector>
 #include <thread>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#if defined(_WIN32)
+#include <process.h>   // _getpid
+#endif
 
 namespace wlp = zm::worker::v1;
 
 namespace {
 
+inline int zm_getpid() {
+#if defined(_WIN32)
+    return _getpid();
+#else
+    return ::getpid();
+#endif
+}
+
 int connect_client(const std::string& path) {
-    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    zm_net_init();
+    int fd = static_cast<int>(::socket(AF_UNIX, SOCK_STREAM, 0));
     EXPECT_GE(fd, 0);
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
@@ -30,21 +42,24 @@ int connect_client(const std::string& path) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     ADD_FAILURE() << "could not connect to " << path;
-    ::close(fd);
+    zm_closefd(fd);
     return -1;
 }
 
 // Wait up to timeout_ms for the fd to become readable. Returns true if readable.
 bool wait_readable(int fd, int timeout_ms) {
-    pollfd p{fd, POLLIN, 0};
-    return ::poll(&p, 1, timeout_ms) > 0 && (p.revents & POLLIN);
+    pollfd p{};
+    p.fd = static_cast<decltype(p.fd)>(fd);
+    p.events = POLLIN;
+    p.revents = 0;
+    return zm_poll(&p, 1, timeout_ms) > 0 && (p.revents & POLLIN);
 }
 
 bool read_n(int fd, void* buf, size_t n) {
     size_t off = 0;
     auto* p = static_cast<uint8_t*>(buf);
     while (off < n) {
-        ssize_t r = ::read(fd, p + off, n - off);
+        ssize_t r = zm_readfd(fd, p + off, n - off);
         if (r <= 0) return false;
         off += static_cast<size_t>(r);
     }
@@ -79,15 +94,25 @@ void write_frame(int fd, const wlp::Frame& frame) {
     put(0, pb_len);
     put(4, 0);
     frame.SerializeToArray(buf.data() + 8, static_cast<int>(pb_len));
-    ASSERT_EQ(::write(fd, buf.data(), buf.size()), static_cast<ssize_t>(buf.size()));
+    ASSERT_EQ(zm_writefd(fd, buf.data(), buf.size()), static_cast<ssize_t>(buf.size()));
+}
+
+// AF_UNIX socket directory: Windows has no /tmp, so use %TEMP%.
+inline std::string sock_dir() {
+#if defined(_WIN32)
+    const char* t = std::getenv("TEMP");
+    return std::string(t ? t : ".") + "\\";
+#else
+    return "/tmp/";
+#endif
 }
 
 std::string temp_socket_path() {
-    return std::string("/tmp/zm_wl_test_") + std::to_string(::getpid()) + ".sock";
+    return sock_dir() + "zm_wl_test_" + std::to_string(zm_getpid()) + ".sock";
 }
 
 std::string temp_socket_path(int n) {
-    return std::string("/tmp/zm_wl_test_") + std::to_string(::getpid()) + "_" +
+    return sock_dir() + "zm_wl_test_" + std::to_string(zm_getpid()) + "_" +
            std::to_string(n) + ".sock";
 }
 
@@ -126,7 +151,7 @@ TEST(WorkerLinkTest, SnapshotOnConnectThenEvent) {
     EXPECT_EQ(ev.event().code(), wlp::Event::DETECTION);
     EXPECT_NE(ev.event().message().find("1234"), std::string::npos);
 
-    ::close(client);
+    zm_closefd(client);
     link.stop();
 }
 
@@ -159,7 +184,7 @@ TEST(WorkerLinkTest, CommandRequestResponse) {
     EXPECT_TRUE(resp.response().ok());
     EXPECT_NE(resp.response().data_json().find("3"), std::string::npos);
 
-    ::close(client);
+    zm_closefd(client);
     link.stop();
 }
 
@@ -192,7 +217,7 @@ TEST(WorkerLinkTest, EventsOnlyConsumerGetsNoMedia) {
     ASSERT_EQ(f.payload_case(), wlp::Frame::kEvent);
     EXPECT_EQ(f.event().code(), wlp::Event::CAPTURE_FAILED);
 
-    ::close(client);
+    zm_closefd(client);
     link.stop();
 }
 
@@ -220,7 +245,7 @@ TEST(WorkerLinkTest, VideoSubscriberReceivesMediaPayload) {
     EXPECT_EQ(f.media().pts_us(), 4242);
     EXPECT_EQ(body, au);  // payload arrived intact, alongside the protobuf
 
-    ::close(client);
+    zm_closefd(client);
     link.stop();
 }
 
@@ -248,7 +273,7 @@ TEST(WorkerLinkTest, StreamMetadataBecomesHello) {
     ASSERT_EQ(f.hello().extradata().size(), 4u);
     EXPECT_EQ(static_cast<uint8_t>(f.hello().extradata()[3]), 3);
 
-    ::close(client);
+    zm_closefd(client);
     link.stop();
 }
 
@@ -278,7 +303,7 @@ TEST(WorkerLinkTest, HelloReplayedToLateSubscriber) {
     EXPECT_EQ(f.hello().codec_id(), 27u);
     EXPECT_EQ(f.hello().width(), 1280u);
 
-    ::close(client);
+    zm_closefd(client);
     link.stop();
 }
 
@@ -301,7 +326,7 @@ TEST(WorkerLinkTest, ReconnectReceivesHelloAgain) {
         ASSERT_TRUE(read_frame(client, f)) << "attempt " << attempt;
         ASSERT_EQ(f.payload_case(), wlp::Frame::kHello) << "attempt " << attempt;
         EXPECT_EQ(f.hello().width(), 800u);
-        ::close(client);  // disconnect; the worker must reap us and serve the next
+        zm_closefd(client);  // disconnect; the worker must reap us and serve the next
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
     }
     link.stop();
@@ -338,7 +363,7 @@ TEST(WorkerLinkTest, ColdStartSubscribeAlwaysReceivesMedia) {
         }
         EXPECT_TRUE(gotMedia) << "trial " << t << ": consumer never received media";
 
-        ::close(client);
+        zm_closefd(client);
         link.stop();
     }
 }
@@ -366,7 +391,7 @@ TEST(WorkerLinkTest, HealthEventRefreshesSnapshot) {
     EXPECT_EQ(f.event().code(), wlp::Event::CONNECTION_FAILED);
     EXPECT_NE(f.event().message().find("dead input"), std::string::npos);
 
-    ::close(client);
+    zm_closefd(client);
     link.stop();
 }
 
@@ -386,6 +411,6 @@ TEST(WorkerLinkTest, PeriodicStats) {
     ASSERT_TRUE(read_frame(client, f));
     EXPECT_EQ(f.payload_case(), wlp::Frame::kStats);
 
-    ::close(client);
+    zm_closefd(client);
     link.stop();
 }

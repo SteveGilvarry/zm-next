@@ -22,7 +22,9 @@ static std::atomic<bool> g_shutdown{false};
 // stop; SIGHUP is reserved for reload/logrotate and is a no-op for now (so the
 // supervising daemon's logrot signal doesn't kill the worker).
 extern "C" void handle_signal(int sig) {
+#ifdef SIGHUP
     if (sig == SIGHUP) return;
+#endif
     g_shutdown.store(true);
 }
 
@@ -55,13 +57,15 @@ int main(int argc, char** argv) {
     // Install signal handlers so the supervising daemon can stop us cleanly.
     std::signal(SIGTERM, handle_signal);
     std::signal(SIGINT, handle_signal);
+#ifdef SIGHUP
     std::signal(SIGHUP, handle_signal);
+#endif
 
     // Find pipeline file if only directory is given
     if (pipelineFile.empty() && !pipelinesDir.empty()) {
         for (const auto& entry : fs::directory_iterator(pipelinesDir)) {
             if (entry.path().extension() == ".json") {
-                pipelineFile = entry.path();
+                pipelineFile = entry.path().string();
                 std::cout << "Using pipeline: " << pipelineFile << std::endl;
                 break;
             }

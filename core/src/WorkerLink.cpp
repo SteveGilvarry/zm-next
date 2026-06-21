@@ -1,19 +1,15 @@
+// net_compat.hpp pulls in <winsock2.h> on Windows and must precede any header
+// that could include <windows.h> (e.g. the protobuf-generated code), so it goes
+// first to keep the Winsock/WinSock2 ordering correct.
+#include "zm/net_compat.hpp"
+
 #include "zm/WorkerLink.hpp"
 
 #include "worker_link.pb.h"
 #include <nlohmann/json.hpp>
 
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/uio.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <poll.h>
-#include <fcntl.h>
 #include <csignal>
-#include <cerrno>
 #include <cstring>
-#include <ctime>
 #include <chrono>
 #include <iostream>
 
@@ -25,9 +21,10 @@ using json = nlohmann::json;
 namespace {
 
 int64_t now_usec() {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return static_cast<int64_t>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000;
+    // Portable wall-clock microseconds (replaces POSIX clock_gettime(CLOCK_REALTIME)).
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
 }
 
 void put_u32_le(uint8_t* p, uint32_t v) {
@@ -108,36 +105,41 @@ void WorkerLink::setTalkbackHandler(TalkbackHandler handler) {
 }
 
 bool WorkerLink::start() {
-    std::signal(SIGPIPE, SIG_IGN);
+#ifdef SIGPIPE
+    std::signal(SIGPIPE, SIG_IGN);   // no SIGPIPE on Windows
+#endif
+    zm_net_init();                   // WSAStartup on Windows; no-op on POSIX
 
     if (socket_path_.size() >= sizeof(sockaddr_un{}.sun_path)) {
         std::cerr << "[WorkerLink] socket path too long: " << socket_path_ << std::endl;
         return false;
     }
 
-    listen_fd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    listen_fd_ = static_cast<int>(::socket(AF_UNIX, SOCK_STREAM, 0));
     if (listen_fd_ < 0) {
-        std::cerr << "[WorkerLink] socket() failed: " << std::strerror(errno) << std::endl;
+        std::cerr << "[WorkerLink] socket() failed: " << zm_strerror(zm_last_error()) << std::endl;
         return false;
     }
-    ::unlink(socket_path_.c_str());
+    zm_unlink(socket_path_.c_str());
 
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     std::strncpy(addr.sun_path, socket_path_.c_str(), sizeof(addr.sun_path) - 1);
     if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         std::cerr << "[WorkerLink] bind(" << socket_path_ << ") failed: "
-                  << std::strerror(errno) << std::endl;
-        ::close(listen_fd_);
+                  << zm_strerror(zm_last_error()) << std::endl;
+        zm_closefd(listen_fd_);
         listen_fd_ = -1;
         return false;
     }
-    ::chmod(socket_path_.c_str(), 0660);
+#ifndef _WIN32
+    ::chmod(socket_path_.c_str(), 0660);   // AF_UNIX file perms; N/A on Windows
+#endif
     if (::listen(listen_fd_, 8) < 0) {
-        std::cerr << "[WorkerLink] listen() failed: " << std::strerror(errno) << std::endl;
-        ::close(listen_fd_);
+        std::cerr << "[WorkerLink] listen() failed: " << zm_strerror(zm_last_error()) << std::endl;
+        zm_closefd(listen_fd_);
         listen_fd_ = -1;
-        ::unlink(socket_path_.c_str());
+        zm_unlink(socket_path_.c_str());
         return false;
     }
 
@@ -152,9 +154,9 @@ bool WorkerLink::start() {
 void WorkerLink::stop() {
     if (!running_.exchange(false)) {
         if (listen_fd_ >= 0) {
-            ::close(listen_fd_);
+            zm_closefd(listen_fd_);
             listen_fd_ = -1;
-            ::unlink(socket_path_.c_str());
+            zm_unlink(socket_path_.c_str());
         }
         return;
     }
@@ -169,7 +171,7 @@ void WorkerLink::stop() {
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto& [fd, c] : clients_) {
             (void)c;
-            ::write(fd, bye->prefix.data(), bye->prefix.size());
+            zm_writefd(fd, bye->prefix.data(), bye->prefix.size());
         }
     }
 
@@ -179,14 +181,14 @@ void WorkerLink::stop() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto& [fd, c] : clients_)
-            ::close(fd);
+            zm_closefd(fd);
         clients_.clear();
     }
     if (listen_fd_ >= 0) {
-        ::close(listen_fd_);
+        zm_closefd(listen_fd_);
         listen_fd_ = -1;
     }
-    ::unlink(socket_path_.c_str());
+    zm_unlink(socket_path_.c_str());
 }
 
 WorkerLink::MessagePtr WorkerLink::buildFrameMessage(
@@ -232,20 +234,30 @@ void WorkerLink::enqueue(const MessagePtr& msg, bool video, bool audio, bool eve
 
 void WorkerLink::runLoop() {
     while (running_.load()) {
+        // Build pollfd entries via explicit field assignment: on Windows pollfd.fd
+        // is a SOCKET (unsigned) and the POLLIN/POLLOUT macros are ints, so a
+        // brace-init would be a narrowing conversion and fail to compile under MSVC.
         std::vector<pollfd> pfds;
-        pfds.push_back({listen_fd_, POLLIN, 0});
+        auto make_pollfd = [](int fd, short events) {
+            pollfd p{};
+            p.fd = static_cast<decltype(p.fd)>(fd);
+            p.events = events;
+            p.revents = 0;
+            return p;
+        };
+        pfds.push_back(make_pollfd(listen_fd_, POLLIN));
         {
             std::lock_guard<std::mutex> lock(mutex_);
             for (auto& [fd, c] : clients_) {
                 short ev = POLLIN;
                 if (!c.queue.empty()) ev |= POLLOUT;
-                pfds.push_back({fd, ev, 0});
+                pfds.push_back(make_pollfd(fd, ev));
             }
         }
 
-        int rc = ::poll(pfds.data(), pfds.size(), 200);
+        int rc = zm_poll(pfds.data(), static_cast<unsigned long>(pfds.size()), 200);
         if (rc < 0) {
-            if (errno == EINTR) continue;
+            if (zm_last_error() == ZM_EINTR) continue;
             break;
         }
 
@@ -255,7 +267,7 @@ void WorkerLink::runLoop() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (rc > 0) {
             for (size_t i = 1; i < pfds.size(); ++i) {
-                int fd = pfds[i].fd;
+                int fd = static_cast<int>(pfds[i].fd);
                 auto it = clients_.find(fd);
                 if (it == clients_.end()) continue;
                 Client& c = it->second;  // stable: we never erase mid-loop, only mark dead
@@ -287,12 +299,12 @@ void WorkerLink::runLoop() {
 }
 
 void WorkerLink::acceptClient() {
-    int cfd = ::accept(listen_fd_, nullptr, nullptr);
+    int cfd = static_cast<int>(::accept(listen_fd_, nullptr, nullptr));
     if (cfd < 0) return;
 
     std::lock_guard<std::mutex> lock(mutex_);
     if (clients_.size() >= cfg_.max_clients) {
-        ::close(cfd);
+        zm_closefd(cfd);
         return;
     }
     Client c;
@@ -309,7 +321,7 @@ void WorkerLink::acceptClient() {
 
 void WorkerLink::onClientReadable(Client& c) {
     char buf[4096];
-    ssize_t n = ::read(c.fd, buf, sizeof(buf));
+    ssize_t n = zm_readfd(c.fd, buf, sizeof(buf));
     if (n <= 0) { c.dead = true; return; }
     c.inbuf.append(buf, static_cast<size_t>(n));
 
@@ -399,10 +411,11 @@ void WorkerLink::onClientWritable(Client& c) {
             ++iovcnt;
         }
 
-        ssize_t w = ::writev(c.fd, iov, iovcnt);
+        ssize_t w = zm_writev(c.fd, iov, iovcnt);
         if (w < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return; // try again on next POLLOUT
-            if (errno == EINTR) continue;
+            const int err = zm_last_error();
+            if (err == ZM_EAGAIN || err == ZM_EWOULDBLOCK) return; // retry on next POLLOUT
+            if (err == ZM_EINTR) continue;
             c.dead = true;
             return;
         }
@@ -422,7 +435,7 @@ void WorkerLink::reapDead() {
     // Caller holds mutex_. Erase clients marked dead by an I/O failure or hangup.
     for (auto it = clients_.begin(); it != clients_.end();) {
         if (it->second.dead) {
-            ::close(it->first);
+            zm_closefd(it->first);
             it = clients_.erase(it);
         } else {
             ++it;

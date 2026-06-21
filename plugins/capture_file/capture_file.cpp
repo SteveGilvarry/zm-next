@@ -429,7 +429,7 @@ static void capture_file_on_frame(zm_plugin_t* plugin, const void* buf, size_t s
 
 extern "C" {
 
-__attribute__((visibility("default")))
+ZM_PLUGIN_EXPORT
 void zm_plugin_init(zm_plugin_t* plugin) {
     if (!plugin) {
         return;
@@ -446,7 +446,7 @@ void zm_plugin_init(zm_plugin_t* plugin) {
 }
 
 // Compatibility alias (matches capture_rtsp_multi).
-__attribute__((visibility("default")))
+ZM_PLUGIN_EXPORT
 void init_plugin(zm_plugin_t* plugin) {
     zm_plugin_init(plugin);
 }

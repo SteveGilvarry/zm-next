@@ -117,6 +117,20 @@ typedef struct zm_plugin_s {
 #define ZM_PLUGIN_EXPORT_SYMBOL "zm_plugin_init"
 typedef void (*zm_plugin_init_fn)(zm_plugin_t*);
 
+// Cross-platform symbol-export decoration for the plugin entry point.
+// MSVC needs __declspec(dllexport) to place zm_plugin_init in the DLL export
+// table (so the host's GetProcAddress finds it); GCC/Clang use the visibility
+// attribute (the TUs are built with -fvisibility=hidden).
+#ifndef ZM_PLUGIN_EXPORT
+#  if defined(_WIN32)
+#    define ZM_PLUGIN_EXPORT __declspec(dllexport)
+#  elif defined(__GNUC__) || defined(__clang__)
+#    define ZM_PLUGIN_EXPORT __attribute__((visibility("default")))
+#  else
+#    define ZM_PLUGIN_EXPORT
+#  endif
+#endif
+
 // =============================================================================
 // PLUGIN LOGGING UTILITIES
 // =============================================================================

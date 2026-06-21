@@ -1,21 +1,13 @@
 #include <gtest/gtest.h>
 #include "zm/PluginManager.hpp"
 #include "zm_plugin.h"
-#include <dlfcn.h>
+#include "zm/dl_compat.hpp"
 #include <filesystem>
 
 using namespace zm;
 using namespace std::filesystem;
 
-#ifdef _WIN32
-#define PLUGIN_EXT ".dll"
-#else
-#ifdef __APPLE__
-#define PLUGIN_EXT ".dylib"
-#else
-#define PLUGIN_EXT ".so"
-#endif
-#endif
+#define PLUGIN_EXT ZM_PLUGIN_EXT
 
 TEST(PluginManagerTest, LoadHelloPlugin) {
     PluginManager pm;
@@ -33,8 +25,8 @@ TEST(PluginManagerTest, LoadHelloPlugin) {
     void* handle = pm.getHandle(0);
     ASSERT_NE(handle, nullptr);
     using init_fn_t = void(*)(zm_plugin_t*);
-    auto init_fn = (init_fn_t)dlsym(handle, "zm_plugin_init");
-    ASSERT_NE(init_fn, nullptr) << dlerror();
+    auto init_fn = (init_fn_t)zm_dlsym(handle, "zm_plugin_init");
+    ASSERT_NE(init_fn, nullptr) << zm_dlerror();
 
     zm_plugin_t plugin;
     init_fn(&plugin);
@@ -56,7 +48,7 @@ TEST(PluginManagerTest, LoadHelloPlugin) {
 
     // cleanup
     using cleanup_fn_t = void(*)(zm_plugin_t*);
-    auto cleanup_fn = (cleanup_fn_t)dlsym(handle, "cleanup_plugin");
+    auto cleanup_fn = (cleanup_fn_t)zm_dlsym(handle, "cleanup_plugin");
     ASSERT_NE(cleanup_fn, nullptr);
     cleanup_fn(&plugin);
 }

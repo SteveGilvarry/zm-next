@@ -26,7 +26,7 @@ static void hello_on_frame(zm_plugin_t* plugin, const void* buf, size_t size) {
     (*counter)++;
 }
 
-extern "C" void zm_plugin_init(zm_plugin_t* plugin) {
+extern "C" ZM_PLUGIN_EXPORT void zm_plugin_init(zm_plugin_t* plugin) {
     // Allocate counter
     int* counter = (int*)std::malloc(sizeof(int));
     *counter = 0;
@@ -38,7 +38,7 @@ extern "C" void zm_plugin_init(zm_plugin_t* plugin) {
     plugin->on_frame = hello_on_frame;
 }
 
-extern "C" void cleanup_plugin(zm_plugin_t* plugin) {
+extern "C" ZM_PLUGIN_EXPORT void cleanup_plugin(zm_plugin_t* plugin) {
     if (plugin->instance) {
         std::free(plugin->instance);
         plugin->instance = nullptr;

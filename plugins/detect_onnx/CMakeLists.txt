@@ -90,6 +90,17 @@ if(ZM_WITH_VULKAN)
     message(STATUS "ZM_WITH_VULKAN=ON: building Vulkan compute HwBackend (ncnn-Vulkan)")
 endif()
 
+# ── DirectML path (Windows / DirectX 12). OFF by default. The lowest-friction GPU
+# inference path on Windows: ORT's DirectML EP runs YOLO on any DX12 device
+# (Intel Arc/Xe iGPU, AMD, NVIDIA) with no model conversion. The DML provider
+# factory ships in the onnxruntime-directml redistributable (dml_provider_factory.h
+# in the ORT include dir), so no extra link target is needed beyond ORT itself. ──
+option(ZM_WITH_DIRECTML "Build the DirectML (DX12) execution-provider path (Windows)" OFF)
+if(ZM_WITH_DIRECTML)
+    target_compile_definitions(detect_onnx PRIVATE ZM_WITH_DIRECTML)
+    message(STATUS "ZM_WITH_DIRECTML=ON: DirectML EP available (ep=\"dml\")")
+endif()
+
 # ── Metal path (Apple). Objective-C++ .mm — only ever compiled on APPLE so Linux
 # never feeds the .mm to the C++ compiler. Gated additionally by ZM_WITH_METAL. ─────
 if(APPLE)
@@ -110,6 +121,12 @@ target_include_directories(detect_onnx PRIVATE
     ${ORT_INCLUDE}
 )
 
+# On Windows, the DirectML/D3D headers drag in <windows.h>, whose min/max macros
+# break std::min/std::max in detect_postprocess.hpp. Suppress them globally.
+if(WIN32)
+    target_compile_definitions(detect_onnx PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 target_link_libraries(detect_onnx PRIVATE
     zmcore
     nlohmann_json::nlohmann_json
@@ -125,7 +142,9 @@ set_target_properties(detect_onnx PROPERTIES
     CXX_STANDARD_REQUIRED ON
 )
 
-target_compile_options(detect_onnx PRIVATE "-fvisibility=hidden")
+if(NOT MSVC)
+    target_compile_options(detect_onnx PRIVATE "-fvisibility=hidden")
+endif()
 
 # Unit tests for the pure pre/post-processing (no ONNX Runtime needed).
 add_executable(test_detect_postprocess tests/test_detect_postprocess.cpp)

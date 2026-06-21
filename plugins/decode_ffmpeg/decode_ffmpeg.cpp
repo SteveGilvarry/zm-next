@@ -401,6 +401,17 @@ static void process_on_frame(zm_plugin_t* plugin, const void* buf, size_t size) 
         // continue through the normal swscale path (no zero-copy consumer exists
         // for those surfaces today). Software frames skip this.
         if (avf->hw_frames_ctx && avf->format == ctx->hw_pix_fmt) {
+            // One-time confirmation that decode produced a hardware surface (e.g.
+            // AV_PIX_FMT_D3D11 for d3d11va on the Intel media engine) before the
+            // CPU download. Lets a probe verify the HW-decode path is truly active.
+            static bool s_logged_hw_surface = false;
+            if (!s_logged_hw_surface) {
+                s_logged_hw_surface = true;
+                const char* pfn = av_get_pix_fmt_name((AVPixelFormat)avf->format);
+                log(ctx->host, ctx->host_ctx, 1,
+                    std::string("decode_ffmpeg: HW surface decoded (format=") +
+                    (pfn ? pfn : "?") + ", hwaccel=" + ctx->hwaccel + ")");
+            }
             if (!ctx->sw_frame) ctx->sw_frame = av_frame_alloc();
             const int64_t pts = avf->best_effort_timestamp;
             if (av_hwframe_transfer_data(ctx->sw_frame, avf, 0) < 0) {
@@ -540,7 +551,7 @@ static void process_on_frame(zm_plugin_t* plugin, const void* buf, size_t size) 
     av_frame_free(&avf);
 }
 
-extern "C" __attribute__((visibility("default"))) void zm_plugin_init(zm_plugin_t* plugin) {
+extern "C" ZM_PLUGIN_EXPORT void zm_plugin_init(zm_plugin_t* plugin) {
     if (!plugin) return;
     plugin->version = 1;
     plugin->type = ZM_PLUGIN_PROCESS;

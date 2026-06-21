@@ -5,9 +5,54 @@
 #include "zm_plugin.h"
 #include "zm/EventBus.hpp"
 #include "zm/StageRunner.hpp"
-#include <dlfcn.h>
 #include <iostream>
 #include <cstring>
+#include <string>
+
+// ── Cross-platform dynamic-loader shim ────────────────────────────────────────
+// POSIX uses dlopen/dlsym/dlclose/dlerror (libdl); Windows uses the Win32
+// LoadLibrary/GetProcAddress/FreeLibrary family. The plugin "handle" is a
+// void* on both (HMODULE is a pointer), so PluginManager stores it unchanged.
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+namespace {
+inline void* zm_dlopen(const char* path) {
+    return reinterpret_cast<void*>(::LoadLibraryA(path));
+}
+inline void* zm_dlsym(void* handle, const char* sym) {
+    return reinterpret_cast<void*>(
+        ::GetProcAddress(reinterpret_cast<HMODULE>(handle), sym));
+}
+inline void zm_dlclose(void* handle) {
+    ::FreeLibrary(reinterpret_cast<HMODULE>(handle));
+}
+inline std::string zm_dlerror() {
+    DWORD e = ::GetLastError();
+    if (!e) return "(no error)";
+    char* msg = nullptr;
+    ::FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+                         FORMAT_MESSAGE_IGNORE_INSERTS,
+                     nullptr, e, 0, reinterpret_cast<char*>(&msg), 0, nullptr);
+    std::string s = msg ? msg : "(unknown error)";
+    if (msg) ::LocalFree(msg);
+    return s;
+}
+} // namespace
+#else
+#include <dlfcn.h>
+namespace {
+inline void* zm_dlopen(const char* path) { return ::dlopen(path, RTLD_NOW); }
+inline void* zm_dlsym(void* handle, const char* sym) { return ::dlsym(handle, sym); }
+inline void zm_dlclose(void* handle) { ::dlclose(handle); }
+inline std::string zm_dlerror() { const char* e = ::dlerror(); return e ? e : "(no error)"; }
+} // namespace
+#endif
 
 // Global host API for v1 plugins
 // Route plugin logs to stdout so VS Code Debug Console can capture them
@@ -65,16 +110,16 @@ PluginManager::PluginManager() {
 
 PluginManager::~PluginManager() {
     for (auto &handle : handles_) {
-        dlclose(handle);
+        zm_dlclose(handle);
     }
 }
 
 
 // Legacy: load a single plugin (for tests)
 bool PluginManager::loadPlugin(const std::string &path) {
-    void *handle = dlopen(path.c_str(), RTLD_NOW);
+    void *handle = zm_dlopen(path.c_str());
     if (!handle) {
-        std::cerr << "Failed to load plugin: " << dlerror() << std::endl;
+        std::cerr << "Failed to load plugin: " << zm_dlerror() << std::endl;
         return false;
     }
     handles_.push_back(handle);
@@ -85,16 +130,16 @@ bool PluginManager::loadPlugin(const std::string &path) {
 bool PluginManager::loadPipeline(const std::vector<PluginConfig>& pipeline) {
     pipeline_.clear();
     for (const auto& pcfg : pipeline) {
-        void* handle = dlopen(pcfg.path.c_str(), RTLD_NOW);
+        void* handle = zm_dlopen(pcfg.path.c_str());
         if (!handle) {
-            std::cerr << "Failed to load plugin: " << pcfg.path << ": " << dlerror() << std::endl;
+            std::cerr << "Failed to load plugin: " << pcfg.path << ": " << zm_dlerror() << std::endl;
             return false;
         }
         using init_fn_t = void(*)(zm_plugin_t*);
-        auto init_fn = (init_fn_t)dlsym(handle, "zm_plugin_init");
+        auto init_fn = (init_fn_t)zm_dlsym(handle, "zm_plugin_init");
         if (!init_fn) {
             std::cerr << "zm_plugin_init not found in " << pcfg.path << std::endl;
-            dlclose(handle);
+            zm_dlclose(handle);
             return false;
         }
         PluginInstance inst;

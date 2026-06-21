@@ -523,12 +523,8 @@ static void motion_pixel_diff_on_frame(zm_plugin_t* plugin, const void* buf, siz
     }
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-#define ZM_PLUGIN_EXPORT __attribute__((visibility("default")))
-#else
-#define ZM_PLUGIN_EXPORT
-#endif
-
+// ZM_PLUGIN_EXPORT is provided by zm_plugin.h (MSVC __declspec(dllexport) vs
+// GCC/Clang visibility).
 ZM_PLUGIN_EXPORT void zm_plugin_init(zm_plugin_t* plugin) {
     plugin->version = 1;
     plugin->type = ZM_PLUGIN_DETECT;

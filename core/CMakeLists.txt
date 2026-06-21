@@ -7,13 +7,11 @@ project(zmcore LANGUAGES CXX)
 # incompatible). Core gets nlohmann_json / Boost / SQLite from their imported
 # targets instead.
 
-# Core library
-include(FetchContent)
-FetchContent_Declare(
-  googletest
-  URL https://github.com/google/googletest/archive/release-1.12.0.zip
-)
-FetchContent_MakeAvailable(googletest)
+# GTest comes from vcpkg (find_package called in the top-level CMakeLists so the
+# imported GTest::gtest_main target is visible in every subdirectory). The old
+# FetchContent(googletest) download was removed: it required network access at
+# configure time and a second googletest build.
+find_package(GTest CONFIG REQUIRED)
 
 find_package(Boost REQUIRED)
 find_package(Threads REQUIRED)
@@ -29,9 +27,15 @@ find_package(nlohmann_json 3.2.0 REQUIRED)
 add_library(zm_worker_link STATIC src/WorkerLink.cpp)
 target_include_directories(zm_worker_link PUBLIC include)
 target_compile_features(zm_worker_link PUBLIC cxx_std_20)
-target_compile_options(zm_worker_link PRIVATE -Wall -Werror)
+if(NOT MSVC)
+    target_compile_options(zm_worker_link PRIVATE -Wall -Werror)
+endif()
 target_link_libraries(zm_worker_link PUBLIC zm_proto
     PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+# WorkerLink.cpp uses Winsock2 (AF_UNIX socket, WSAPoll, WSASend) on Windows.
+if(WIN32)
+    target_link_libraries(zm_worker_link PRIVATE ws2_32)
+endif()
 
 add_library(zmcore STATIC
     src/PluginManager.cpp
@@ -48,9 +52,13 @@ target_include_directories(zmcore PUBLIC include)
 
 # C++20 and optimization flags
 target_compile_features(zmcore PUBLIC cxx_std_20)
-target_compile_options(zmcore PRIVATE -Wall -Werror)
-set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -flto")
+# GCC/Clang-only flags. MSVC uses its own defaults (set per-config by CMake) and
+# would mis-handle -g/-O0/-march/-flto and flood on /Wall, so gate them out.
+if(NOT MSVC)
+    target_compile_options(zmcore PRIVATE -Wall -Werror)
+    set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -flto")
+endif()
 target_link_libraries(zmcore PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
 # WorkerLink (and transitively the protobuf worker-link types) — PUBLIC so
 # consumers of zmcore can use them.
@@ -77,7 +85,11 @@ add_test(NAME EventBusTest COMMAND $<TARGET_FILE:test_eventbus>)
 add_executable(test_plugin_manager tests/test_plugin_manager.cpp)
 # Pass CMake binary directory to test for plugin path resolution
 target_compile_definitions(test_plugin_manager PRIVATE TEST_CMAKE_BINARY_DIR="${CMAKE_BINARY_DIR}")
-target_link_libraries(test_plugin_manager PRIVATE zmcore GTest::gtest_main Threads::Threads dl)
+# libdl is POSIX-only (PluginManager uses LoadLibrary on Windows); link it only there.
+target_link_libraries(test_plugin_manager PRIVATE zmcore GTest::gtest_main Threads::Threads)
+if(NOT WIN32)
+    target_link_libraries(test_plugin_manager PRIVATE ${CMAKE_DL_LIBS})
+endif()
 add_test(NAME PluginManagerTest COMMAND $<TARGET_FILE:test_plugin_manager>)
 
 # Unit tests for PipelineLoader

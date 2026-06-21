@@ -12,6 +12,9 @@
 #ifdef __APPLE__
 #include <coreml_provider_factory.h>
 #endif
+#ifdef ZM_WITH_DIRECTML
+#include <dml_provider_factory.h>   // DirectML EP (DX12) — Windows GPU inference
+#endif
 #ifdef ZMP_WITH_CUDA
 #include <cuda_runtime.h>
 #include "detect_engine.hpp"
@@ -173,6 +176,27 @@ static int detect_onnx_start(zm_plugin_t* plugin, zm_host_api_t* host, void* hos
         ZM_LOG_WARN("detect_onnx: CoreML EP not available on this platform, falling back to CPU");
 #endif
     }
+
+    // DirectML execution provider — runs the model on any DX12 device (Intel
+    // Arc/Xe iGPU, AMD, NVIDIA) on Windows. Lowest-friction GPU path: no model
+    // conversion. DML requires the memory pattern optimizer off and sequential
+    // execution; if anything fails we leave the CPU EP in place.
+    if (ctx->ep == "dml" || ctx->ep == "directml") {
+#ifdef ZM_WITH_DIRECTML
+        try {
+            ctx->sessionOptions.DisableMemPattern();
+            ctx->sessionOptions.SetExecutionMode(ORT_SEQUENTIAL);
+            Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_DML(
+                static_cast<OrtSessionOptions*>(ctx->sessionOptions), /*device_id=*/0));
+            ZM_LOG_INFO("detect_onnx: DirectML execution provider enabled (DX12 device 0)");
+        } catch (const std::exception& e) {
+            ZM_LOG_WARN("detect_onnx: DirectML EP unavailable, falling back to CPU: %s", e.what());
+        }
+#else
+        ZM_LOG_WARN("detect_onnx: ep=\"%s\" requested but built without ZM_WITH_DIRECTML; "
+                    "rebuild with -DZM_WITH_DIRECTML=ON. Falling back to CPU.", ctx->ep.c_str());
+#endif
+    }
 #ifdef ZMP_WITH_CUDA
     // CUDA execution provider — required for the zero-copy GPU detect path.
     if (ctx->ep == "cuda") {
@@ -209,8 +233,16 @@ static int detect_onnx_start(zm_plugin_t* plugin, zm_host_api_t* host, void* hos
     // Construct a per-instance session unless the shared engine owns inference.
     if (!ctx->engineReady && !ctx->modelPath.empty() && ctx->env) {
         try {
+#ifdef _WIN32
+            // ORT's Session ctor takes const ORTCHAR_T* (== const wchar_t* on
+            // Windows); widen the UTF-8 model path.
+            std::wstring wmodel(ctx->modelPath.begin(), ctx->modelPath.end());
+            ctx->session = std::make_unique<Ort::Session>(
+                *ctx->env, wmodel.c_str(), ctx->sessionOptions);
+#else
             ctx->session = std::make_unique<Ort::Session>(
                 *ctx->env, ctx->modelPath.c_str(), ctx->sessionOptions);
+#endif
 
             Ort::AllocatorWithDefaultOptions allocator;
             auto inName = ctx->session->GetInputNameAllocated(0, allocator);
@@ -429,12 +461,8 @@ static void detect_onnx_on_frame(zm_plugin_t* plugin, const void* buf, size_t si
     forwardFrame(ctx, buf, size);
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-#define ZM_PLUGIN_EXPORT __attribute__((visibility("default")))
-#else
-#define ZM_PLUGIN_EXPORT
-#endif
-
+// ZM_PLUGIN_EXPORT is provided by zm_plugin.h (handles MSVC __declspec(dllexport)
+// vs GCC/Clang visibility).
 ZM_PLUGIN_EXPORT void zm_plugin_init(zm_plugin_t* plugin) {
     plugin->version = 1;
     plugin->type = ZM_PLUGIN_DETECT;

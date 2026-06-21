@@ -34,3 +34,10 @@ bench/models/
 bench/clips/
 bench/*.local
 bench/samples/
+
+# compiled benchmark/probe binaries and co-located runtime DLLs (Windows)
+bench/*.exe
+bench/*.obj
+bench/*.dll
+bench/*.pdb
+bench/*.ilk

@@ -86,6 +86,10 @@ else()
     message(STATUS "ZM_WITH_CUDA=OFF: CPU/software decode + detect (default)")
 endif()
 
+# GTest from vcpkg. Resolved at the top level so the imported GTest::gtest_main
+# target is visible in every add_subdirectory below (core/, plugins/, bench/).
+find_package(GTest CONFIG REQUIRED)
+
 # Include CTest for add_test / enable_testing support
 include(CTest)
 enable_testing()
@@ -115,6 +119,12 @@ target_include_directories(zm-core PRIVATE ${Boost_INCLUDE_DIRS} /opt/homebrew/i
 add_executable(wl_dump tools/wl_dump.cpp)
 target_link_libraries(wl_dump PRIVATE zm_proto)
 target_compile_features(wl_dump PRIVATE cxx_std_20)
+# wl_dump.cpp includes zm/net_compat.hpp (core/include) on all platforms.
+target_include_directories(wl_dump PRIVATE core/include)
+# ...and uses Winsock2 on Windows (AF_UNIX client socket).
+if(WIN32)
+    target_link_libraries(wl_dump PRIVATE ws2_32)
+endif()
 
 # Integration smoke test: drives the built zm-core + plugins through capture_file
 # scenarios (decode/record/socket) and asserts end-to-end behavior. Skips itself

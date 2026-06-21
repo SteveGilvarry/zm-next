@@ -1,7 +1,7 @@
 // test_decode.cpp - GTest for decode_ffmpeg plugin
 #include <gtest/gtest.h>
 #include "zm_plugin.h"
-#include <dlfcn.h>
+#include "zm/dl_compat.hpp"
 #include <vector>
 #include <fstream>
 #include <cstring>
@@ -45,24 +45,18 @@ static void load_packets(const std::string& path) {
 TEST(DecodeFfmpeg, DecodesSampleH264) {
     // Load plugin
     std::string binDir = TEST_CMAKE_BINARY_DIR;
-#ifdef _WIN32
-    constexpr const char* PLUGIN_EXT = ".dll";
-#elif defined(__APPLE__)
-    constexpr const char* PLUGIN_EXT = ".dylib";
-#else
-    constexpr const char* PLUGIN_EXT = ".so";
-#endif
+    constexpr const char* PLUGIN_EXT = ZM_PLUGIN_EXT;
     path buildPath = path(binDir) / "plugins" / "decode_ffmpeg" / (std::string("decode_ffmpeg") + PLUGIN_EXT);
     path srcPath = path("plugins") / "decode_ffmpeg" / (std::string("decode_ffmpeg") + PLUGIN_EXT);
     path pluginPath;
     if (exists(buildPath)) pluginPath = buildPath;
     else if (exists(srcPath)) pluginPath = srcPath;
     else FAIL() << "Cannot find plugin at " << buildPath << " or " << srcPath;
-    void* handle = dlopen(pluginPath.c_str(), RTLD_NOW);
-    ASSERT_NE(handle, nullptr) << dlerror();
+    void* handle = zm_dlopen(pluginPath.string().c_str());
+    ASSERT_NE(handle, nullptr) << zm_dlerror();
     using init_fn_t = void(*)(zm_plugin_t*);
-    auto init_fn = (init_fn_t)dlsym(handle, "zm_plugin_init");
-    ASSERT_NE(init_fn, nullptr) << dlerror();
+    auto init_fn = (init_fn_t)zm_dlsym(handle, "zm_plugin_init");
+    ASSERT_NE(init_fn, nullptr) << zm_dlerror();
     zm_plugin_t plugin;
     init_fn(&plugin);
     zm_host_api_t host = {0};
@@ -95,7 +89,7 @@ TEST(DecodeFfmpeg, DecodesSampleH264) {
     }
     plugin.stop(&plugin);
     EXPECT_GT(yuv_frames.load(), 0) << "No YUV frames decoded";
-    dlclose(handle);
+    zm_dlclose(handle);
 }
 
 int main(int argc, char** argv) {
