@@ -1,7 +1,7 @@
 {
   "name": "person_alert",
   "root": true,
-  "comment": "Person-gated record + notify. Cascade: camera -> motion-gated YOLO (decode_detect, class_filter=[0]=person only) -> a person detection event triggers BOTH store_event (pre/post-roll clip) and output_mqtt (publishes to zm-next/detection). Needs an MQTT broker (e.g. `mosquitto -p 1883`). Fill in the camera URL + model_path; on Apple, decode_detect auto-selects the Metal/ANE backend. Subscribe with: mosquitto_sub -t 'zm-next/#' -v",
+  "comment": "Person-gated record + RICH notify. Cascade: camera -> motion-gated YOLO (decode_detect, class_filter=[0]=person only). A person detection event fans out to: store_event (pre/post-roll clip), describe_vlm (VLM describes the frame, triggered by the detection), and output_mqtt. output_mqtt publishes the bare detection to zm-next/detection AND the VLM description+detection (a single rich alert: text + label/bbox/confidence) to zm-next/description. Needs an MQTT broker (`mosquitto -p 1883`) and a local VLM server (bench/metal/run_mlx_vlm_server.sh). Fill in camera URL, model_path, and the VLM model id; on Apple decode_detect auto-selects Metal/ANE. Watch: mosquitto_sub -t 'zm-next/#' -v",
   "plugins": [
     { "id": "capture", "kind": "capture_rtsp_multi",
       "cfg": { "streams": [ { "stream_id": 0, "url": "rtsp://USER:PASS@CAMERA:554/Streaming/Channels/102", "transport": "tcp" } ] },
@@ -15,6 +15,16 @@
           "cfg": { "root": "/data/events", "trigger_types": ["detection"],
                    "pre_roll_sec": 5, "post_roll_sec": 10 },
           "queue_depth": 120 },
+        { "id": "decode", "kind": "decode_ffmpeg",
+          "cfg": { "output_format": "rgb24", "scale": "720p" }, "queue_depth": 4,
+          "children": [
+            { "id": "describe", "kind": "describe_vlm",
+              "cfg": { "server_url": "http://localhost:8081/v1/chat/completions",
+                       "model": "mlx-community/Qwen3-VL-8B-Instruct-4bit",
+                       "prompt": "Describe this security-camera scene in one short sentence; focus on the person and what they are doing.",
+                       "trigger_types": ["detection"], "interval_sec": 5,
+                       "frame_width": 1280, "frame_height": 720 },
+              "queue_depth": 2 } ] },
         { "id": "notify", "kind": "output_mqtt",
           "cfg": { "host": "localhost", "port": 1883, "base_topic": "zm-next" },
           "queue_depth": 8 }

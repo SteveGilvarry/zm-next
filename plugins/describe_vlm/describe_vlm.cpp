@@ -50,6 +50,7 @@ struct TriggerState {
     std::condition_variable cv;
     std::vector<std::string> types;          // event "type"s that trigger a describe
     std::vector<uint32_t> streamFilter;      // empty = any stream
+    std::string lastTrigger;                 // JSON of the event that armed the describe (guarded by mtx)
 };
 
 struct DescribeVlmCtx {
@@ -72,6 +73,7 @@ struct DescribeVlmCtx {
     std::vector<std::string> triggerTypes;
     TriggerState* trig = nullptr;
     void* trigSub = nullptr;             // host subscription handle
+    std::string curTrigger;             // trigger JSON for the in-flight describe (worker thread only)
 
     // Latest frame snapshot (protected by frameMutex)
     std::mutex frameMutex;
@@ -266,6 +268,23 @@ static void run_inference_cycle(DescribeVlmCtx* ctx) {
     evt["stream_id"] = streamId;
     evt["pts_usec"] = ptsUsec;
 
+    // Embed the detection that triggered this describe, so the published event (and
+    // thus the MQTT payload) is a single rich alert: VLM text + what was detected.
+    if (!ctx->curTrigger.empty()) {
+        try {
+            auto tj = json::parse(ctx->curTrigger);
+            evt["trigger_type"] = tj.value("type", std::string("detection"));
+            if (tj.contains("detections") && tj["detections"].is_array()) {
+                evt["detections"] = tj["detections"];
+                const auto& dets = tj["detections"];
+                if (!dets.empty() && dets[0].is_object()) {   // top hit for convenience
+                    evt["label"] = dets[0].value("label", std::string());
+                    evt["confidence"] = dets[0].value("confidence", 0.0);
+                }
+            }
+        } catch (const std::exception&) { /* leave the description as-is */ }
+    }
+
     if (ctx->host && ctx->host->publish_evt) {
         ctx->host->publish_evt(ctx->hostCtx, evt.dump().c_str());
     }
@@ -286,7 +305,7 @@ static void describe_trigger_cb(void* user, const char* json_event) {
             if (std::find(ts->streamFilter.begin(), ts->streamFilter.end(), sid) == ts->streamFilter.end())
                 return;
         }
-        { std::lock_guard<std::mutex> lk(ts->mtx); ts->fired.store(true); }
+        { std::lock_guard<std::mutex> lk(ts->mtx); ts->fired.store(true); ts->lastTrigger = json_event; }
         ts->cv.notify_one();
     } catch (const std::exception&) { /* ignore malformed events */ }
 }
@@ -315,6 +334,8 @@ static void worker_loop(DescribeVlmCtx* ctx) {
         auto now = std::chrono::steady_clock::now();
         if (now - lastDescribe < cooldown) continue;         // throttle: at most once per intervalSec
         lastDescribe = now;
+        // Snapshot the detection that armed this describe, to embed in the event.
+        { std::lock_guard<std::mutex> lk(ts->mtx); ctx->curTrigger = fired ? ts->lastTrigger : std::string(); }
         run_inference_cycle(ctx);
     }
 }
