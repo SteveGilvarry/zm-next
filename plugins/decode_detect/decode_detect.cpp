@@ -68,7 +68,9 @@ void publish(Ctx* c, const zm_frame_hdr_t* hdr, const std::vector<zm::hw::Detect
 void on_decoded(void* vc, const void* buf, size_t size) {
     Ctx* c = static_cast<Ctx*>(vc);
     const auto* hdr = static_cast<const zm_frame_hdr_t*>(buf);
-    if (!c->be || hdr->hw_type != ZM_HW_CUDA ||
+    // Accept any zero-copy GPU surface descriptor (CUDA or VideoToolbox); the
+    // backend's acquire() interprets it for its platform.
+    if (!c->be || (hdr->hw_type != ZM_HW_CUDA && hdr->hw_type != ZM_HW_VTB) ||
         size < sizeof(zm_frame_hdr_t) + sizeof(zm_gpu_frame_t)) return;
     const auto* g = reinterpret_cast<const zm_gpu_frame_t*>(static_cast<const uint8_t*>(buf) + sizeof(zm_frame_hdr_t));
     auto& be = *c->be;
@@ -100,7 +102,12 @@ void fwd_pub(void* hc, const char* j) { Ctx* c = (Ctx*)hc; if (c->host && c->hos
 int start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx, const char* json_cfg) {
     auto* c = new Ctx(); c->host = host; c->hostCtx = host_ctx;
     zm_plugin_set_log_context(host, host_ctx);
-    std::string hw = "cuda", decPath = "plugins/decode_ffmpeg/decode_ffmpeg.so", codec;
+    std::string hw = "auto", decPath, codec;
+#if defined(__APPLE__)
+    decPath = "plugins/decode_ffmpeg/decode_ffmpeg.dylib";
+#else
+    decPath = "plugins/decode_ffmpeg/decode_ffmpeg.so";
+#endif
     try {
         auto j = json::parse(json_cfg ? json_cfg : "{}");
         c->model = j.value("model_path", std::string());
@@ -112,9 +119,31 @@ int start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx, const char* 
         hw = j.value("hw", hw); decPath = j.value("decode_path", decPath); codec = j.value("codec", std::string());
     } catch (const std::exception& e) { ZM_LOG_ERROR("decode_detect: config parse failed: %s", e.what()); }
 
-    c->be = zm::hw::make_backend(hw);
-    if (!c->be) { ZM_LOG_ERROR("decode_detect: backend '%s' unavailable (pass-through)", hw.c_str()); plugin->instance = c; return 0; }
+    // Resolve "auto" to the platform's preferred backend, trying in order until one
+    // is both compiled in and available (make_backend returns null otherwise).
+    std::vector<std::string> order;
+    if (hw == "auto") {
+#if defined(__APPLE__)
+        order = {"metal"};
+#else
+        order = {"cuda", "vaapi", "vulkan", "openvino"};
+#endif
+    } else {
+        order = {hw};
+    }
+    std::string chosen;
+    for (const auto& k : order) { c->be = zm::hw::make_backend(k); if (c->be) { chosen = k; break; } }
+    if (!c->be) { ZM_LOG_ERROR("decode_detect: no backend for hw='%s' (pass-through)", hw.c_str()); plugin->instance = c; return 0; }
     if (!c->be->load_model(c->model, c->net)) ZM_LOG_ERROR("decode_detect: load_model('%s') failed", c->model.c_str());
+
+    // The inner decode's hwaccel must produce the surface kind the backend expects.
+    auto hwaccelFor = [](const std::string& b) -> std::string {
+        if (b == "metal")  return "videotoolbox";
+        if (b == "cuda")   return "cuda";
+        if (b == "vaapi" || b == "vulkan") return "vaapi";
+        return "none";
+    };
+    const std::string decHwaccel = hwaccelFor(chosen);
 
     c->decLib = dlopen(decPath.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!c->decLib) { ZM_LOG_ERROR("decode_detect: dlopen %s: %s", decPath.c_str(), dlerror()); plugin->instance = c; return 0; }
@@ -123,13 +152,13 @@ int start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx, const char* 
     init(&c->dec);
     c->decHost.log = fwd_log; c->decHost.on_frame = on_decoded; c->decHost.publish_evt = fwd_pub;
     c->decHost.subscribe_evt = fwd_sub; c->decHost.unsubscribe_evt = fwd_unsub;
-    json dcfg; dcfg["hwaccel"] = "cuda"; dcfg["output_format"] = "yuv420p"; dcfg["scale"] = "orig";
+    json dcfg; dcfg["hwaccel"] = decHwaccel; dcfg["output_format"] = "yuv420p"; dcfg["scale"] = "orig";
     if (!codec.empty()) dcfg["codec"] = codec;
     if (c->dec.start(&c->dec, &c->decHost, c, dcfg.dump().c_str()) == 0) c->decStarted = true;
     else ZM_LOG_ERROR("decode_detect: internal decode start failed");
 
-    ZM_LOG_INFO("decode_detect: fused decode+detect via %s backend (roi_motion=%d)",
-                c->be ? c->be->name() : "none", static_cast<int>(c->roiMotion));
+    ZM_LOG_INFO("decode_detect: fused decode+detect via %s backend (hwaccel=%s, roi_motion=%d)",
+                chosen.c_str(), decHwaccel.c_str(), static_cast<int>(c->roiMotion));
     plugin->instance = c;
     return 0;
 }

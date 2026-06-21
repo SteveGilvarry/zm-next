@@ -397,9 +397,36 @@ static void process_on_frame(zm_plugin_t* plugin, const void* buf, size_t size) 
             continue;  // next frame; skip the CPU swscale path below
         }
 
-        // Non-CUDA hardware frame (VideoToolbox/VAAPI/QSV): download to CPU and
-        // continue through the normal swscale path (no zero-copy consumer exists
-        // for those surfaces today). Software frames skip this.
+        // Zero-copy VideoToolbox path (Apple): pass the CVPixelBuffer surface
+        // through as a GPU descriptor (the AVFrame holds it in data[3]) instead of
+        // downloading to CPU. The Metal HwBackend acquire()s it (av_frame_clone
+        // refs the CVPixelBuffer), so it survives past this synchronous on_frame —
+        // same contract as the CUDA path above.
+        if (avf->format == AV_PIX_FMT_VIDEOTOOLBOX) {
+            zm_gpu_frame_t g{};
+            g.hw_type = ZM_HW_VTB;
+            g.width = avf->width;
+            g.height = avf->height;
+            g.pix_fmt = static_cast<uint32_t>(AV_PIX_FMT_NV12);  // VTB surface is NV12
+            g.av_frame = reinterpret_cast<uint64_t>(avf);
+
+            std::vector<uint8_t> out_buf(sizeof(zm_frame_hdr_t) + sizeof(zm_gpu_frame_t));
+            zm_frame_hdr_t out_hdr = *hdr;
+            out_hdr.hw_type = ZM_HW_VTB;
+            out_hdr.bytes = sizeof(zm_gpu_frame_t);
+            out_hdr.pts_usec = avf->best_effort_timestamp;
+            memcpy(out_buf.data(), &out_hdr, sizeof(zm_frame_hdr_t));
+            memcpy(out_buf.data() + sizeof(zm_frame_hdr_t), &g, sizeof(zm_gpu_frame_t));
+
+            if (ctx->host && ctx->host->on_frame)
+                ctx->host->on_frame(ctx->host_ctx, out_buf.data(), out_buf.size());
+            av_frame_unref(avf);
+            continue;  // skip the CPU download/swscale path below
+        }
+
+        // Non-CUDA hardware frame (VAAPI/QSV): download to CPU and continue through
+        // the normal swscale path (no zero-copy consumer exists for those surfaces
+        // today). Software frames skip this.
         if (avf->hw_frames_ctx && avf->format == ctx->hw_pix_fmt) {
             if (!ctx->sw_frame) ctx->sw_frame = av_frame_alloc();
             const int64_t pts = avf->best_effort_timestamp;

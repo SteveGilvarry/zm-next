@@ -1,0 +1,14 @@
+{
+  "name": "apple_metal_detect",
+  "root": true,
+  "plugins": [
+    { "id": "capture", "kind": "capture_file",
+      "cfg": { "path": "/path/to/clip.mp4", "stream_id": 0, "loop": false, "realtime": true },
+      "children": [
+        { "id": "detect", "kind": "decode_detect",
+          "cfg": { "model_path": "/path/to/yolo26n_fp16.onnx", "hw": "auto",
+                   "input_size": 640, "conf_threshold": 0.25 },
+          "queue_depth": 4 }
+      ] }
+  ]
+}
