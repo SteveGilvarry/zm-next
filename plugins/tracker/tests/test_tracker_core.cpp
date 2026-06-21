@@ -92,6 +92,37 @@ TEST(TrackerTest, NonOverlappingGetsNewId) {
     EXPECT_EQ(tr.track_count(), 2u);
 }
 
+// Class gating: a track must NOT re-acquire an overlapping detection of a
+// different class. Otherwise a departed object's lingering track poaches a new
+// object of another type, fusing two identities under one id.
+TEST(TrackerTest, ClassGatedAssociationSplitsByClass) {
+    Tracker tr(0.3f, /*max_age=*/30, /*min_hits=*/1, /*class_gated=*/true);
+
+    // A "person" (class 0) occupies a box and is confirmed.
+    std::vector<Det> a = {makeDet(0, 0, 10, 10, /*cls=*/0)};
+    const int personId = tr.update(a)[0];
+    EXPECT_NE(personId, 0);
+
+    // Next frame a "car" (class 2) sits on the SAME box. With gating it cannot
+    // inherit the person's id — it must spawn a new, distinct track.
+    std::vector<Det> b = {makeDet(0, 0, 10, 10, /*cls=*/2)};
+    const int carId = tr.update(b)[0];
+    EXPECT_NE(carId, 0);
+    EXPECT_NE(carId, personId);
+    EXPECT_EQ(tr.track_count(), 2u);
+}
+
+// With gating OFF, the same overlapping cross-class detection re-uses the id
+// (documents the old behaviour the gate prevents).
+TEST(TrackerTest, UngatedAssociationAllowsCrossClassReuse) {
+    Tracker tr(0.3f, /*max_age=*/30, /*min_hits=*/1, /*class_gated=*/false);
+
+    const int id0 = tr.update({makeDet(0, 0, 10, 10, /*cls=*/0)})[0];
+    const int id1 = tr.update({makeDet(0, 0, 10, 10, /*cls=*/2)})[0];
+    EXPECT_EQ(id1, id0);              // same id across classes
+    EXPECT_EQ(tr.track_count(), 1u);
+}
+
 // Greedy association: each detection matches at most one track.
 TEST(TrackerTest, OneToOneAssociation) {
     Tracker tr(0.3f, 30, /*min_hits=*/1);

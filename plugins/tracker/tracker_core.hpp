@@ -75,13 +75,17 @@ inline float iou(const Det& d, const Track& t) {
 class Tracker {
 public:
     Tracker() = default;
-    Tracker(float iou_threshold, int max_age, int min_hits)
-        : iou_threshold_(iou_threshold), max_age_(max_age), min_hits_(min_hits) {}
+    Tracker(float iou_threshold, int max_age, int min_hits,
+            bool class_gated = true)
+        : iou_threshold_(iou_threshold), max_age_(max_age), min_hits_(min_hits),
+          class_gated_(class_gated) {}
 
-    void set_params(float iou_threshold, int max_age, int min_hits) {
+    void set_params(float iou_threshold, int max_age, int min_hits,
+                    bool class_gated = true) {
         iou_threshold_ = iou_threshold;
         max_age_ = max_age;
         min_hits_ = min_hits;
+        class_gated_ = class_gated;
     }
 
     // Advance the tracker by one detection batch. Returns a vector parallel to
@@ -105,6 +109,14 @@ public:
             pairs.reserve(nT * nD);
             for (std::size_t ti = 0; ti < nT; ++ti) {
                 for (std::size_t di = 0; di < nD; ++di) {
+                    // Class-gated association: never let a track of one class
+                    // re-acquire a detection of another (a "person" track must
+                    // not poach a passing "car"). This is the main guard against
+                    // a single track_id spanning two distinct objects. (-1 is
+                    // "unknown" and matches anything so untyped dets still track.)
+                    if (class_gated_ && dets[di].class_id != tracks_[ti].class_id &&
+                        dets[di].class_id != -1 && tracks_[ti].class_id != -1)
+                        continue;
                     const float s = iou(dets[di], tracks_[ti]);
                     if (s >= iou_threshold_) pairs.push_back({s, ti, di});
                 }
@@ -162,6 +174,7 @@ public:
     float iou_threshold() const { return iou_threshold_; }
     int max_age() const { return max_age_; }
     int min_hits() const { return min_hits_; }
+    bool class_gated() const { return class_gated_; }
 
 private:
     std::vector<Track> tracks_;
@@ -169,6 +182,7 @@ private:
     float iou_threshold_ = 0.3f;
     int max_age_ = 30;
     int min_hits_ = 3;
+    bool class_gated_ = true;
 };
 
 }  // namespace zm::tracker

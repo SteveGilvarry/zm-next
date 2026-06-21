@@ -50,6 +50,7 @@ struct TrackerState {
     float iouThreshold = 0.3f;
     int maxAge = 30;
     int minHits = 3;
+    bool classGated = true;
 
     // Per stream_id tracker. Guarded by `mutex`.
     std::mutex mutex;
@@ -58,8 +59,9 @@ struct TrackerState {
     zm::tracker::Tracker& trackerFor(int streamId) {
         auto it = trackers.find(streamId);
         if (it == trackers.end()) {
-            it = trackers.emplace(streamId,
-                                  zm::tracker::Tracker(iouThreshold, maxAge, minHits))
+            it = trackers.emplace(
+                       streamId, zm::tracker::Tracker(iouThreshold, maxAge,
+                                                      minHits, classGated))
                      .first;
         }
         return it->second;
@@ -166,6 +168,7 @@ int tracker_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx,
         state->iouThreshold = cfg.value("iou_threshold", 0.3f);
         state->maxAge = cfg.value("max_age", 30);
         state->minHits = cfg.value("min_hits", 3);
+        state->classGated = cfg.value("class_gated", true);
     } catch (const std::exception& e) {
         ZM_LOG_ERROR("tracker: failed to parse config: %s", e.what());
     }
@@ -186,8 +189,9 @@ int tracker_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx,
             state);
     }
 
-    ZM_LOG_INFO("tracker: iou_threshold=%.2f max_age=%d min_hits=%d",
-                state->iouThreshold, state->maxAge, state->minHits);
+    ZM_LOG_INFO("tracker: iou_threshold=%.2f max_age=%d min_hits=%d class_gated=%d",
+                state->iouThreshold, state->maxAge, state->minHits,
+                state->classGated);
     return 0;
 }
 
