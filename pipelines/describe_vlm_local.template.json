@@ -1,0 +1,25 @@
+{
+  "name": "describe_vlm_local",
+  "root": true,
+  "comment": "Scene description via a LOCAL mlx-vlm Qwen vision server on Apple silicon. Start it first: bench/metal/run_mlx_vlm_server.sh (serves Qwen3.5-2B on :8080, OpenAI-compatible; it strips the MTP weights mlx-vlm can't load yet). Set the 'model' below to what the server reports at GET /v1/models (the local mtp-stripped dir path, e.g. .../bench/models/Qwen3.5-2B-OptiQ-4bit-nomtp). describe_vlm POSTs a decoded RGB frame (JPEG) every interval_sec and emits a DESCRIPTION event. Validated on M4 Pro: ~4s/frame for the 2B at 720p, fully offline.",
+  "plugins": [
+    { "id": "capture", "kind": "capture_file",
+      "cfg": { "path": "/path/to/clip.mp4", "stream_id": 0, "loop": true, "realtime": true },
+      "children": [
+        { "id": "decode", "kind": "decode_ffmpeg",
+          "cfg": { "output_format": "rgb24", "scale": "720p" }, "queue_depth": 4,
+          "children": [
+            { "id": "describe", "kind": "describe_vlm",
+              "cfg": {
+                "server_url": "http://localhost:8080/v1/chat/completions",
+                "model": "REPLACE_WITH_MODEL_FROM_/v1/models",
+                "prompt": "Describe this security-camera scene in one short sentence. Note any people or vehicles.",
+                "interval_sec": 5,
+                "frame_width": 1280,
+                "frame_height": 720
+              },
+              "queue_depth": 2 }
+          ] }
+      ] }
+  ]
+}
