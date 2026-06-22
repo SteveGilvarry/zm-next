@@ -1,0 +1,54 @@
+{
+  "_comment": [
+    "Windows + Intel Arc end-to-end detect pipeline: capture_file -> decode_ffmpeg",
+    "(RGB24) -> detect_onnx running YOLO on the GPU via the ONNX Runtime DirectML",
+    "execution provider (ep=\"dml\", DX12). Set ep=\"cpu\" to fall back to the CPU EP.",
+    "",
+    "Runtime deployment note: detect_onnx.dll needs onnxruntime.dll AND a matching",
+    "DirectML.dll next to the LOADING EXE (zm-core.exe), because Windows searches the",
+    "exe directory + System32 before the plugin's own folder -- otherwise the inbox",
+    "System32 onnxruntime.dll is loaded and the version mismatches. Use the DirectML",
+    "version the ORT build pins (e.g. ORT 1.20.x -> DirectML 1.15.2).",
+    "",
+    "Copy to pipelines/<name>.json and fill in real paths (that copy is gitignored).",
+    "frame_width/frame_height MUST match the decoded frame size."
+  ],
+  "name": "e2e_dml_detect",
+  "root": true,
+  "plugins": [
+    {
+      "id": "capture",
+      "kind": "capture_file",
+      "cfg": {
+        "path": "C:/path/to/clip.mp4",
+        "stream_id": 0,
+        "loop": true,
+        "realtime": true
+      },
+      "queue_depth": 16,
+      "children": [
+        {
+          "id": "decode",
+          "kind": "decode_ffmpeg",
+          "cfg": { "output_format": "rgb24", "scale": "orig", "threads": 2 },
+          "queue_depth": 8,
+          "children": [
+            {
+              "id": "detect",
+              "kind": "detect_onnx",
+              "cfg": {
+                "model_path": "C:/path/to/yolo26n_static.onnx",
+                "ep": "dml",
+                "input_size": 640,
+                "conf_threshold": 0.25,
+                "frame_width": 1280,
+                "frame_height": 720
+              },
+              "queue_depth": 2
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
