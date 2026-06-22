@@ -1,7 +1,7 @@
 {
   "_comment": [
     "Full GPU zero-copy pipeline in one worker. capture (main + sub):",
-    "  store_filesystem(stream 0) records the main stream compressed;",
+    "  store(mode=continuous, stream 0) records the main stream compressed;",
     "  decode_detect(stream 1) is the FUSED stage: NVDEC decode + on-GPU motion +",
     "  on-GPU detect (shared batched engine) in one synchronous call, so the surface",
     "  never leaves VRAM or crosses a queue. tracker + alert_policy dedup to one alert",
@@ -21,8 +21,8 @@
       "children": [
         {
           "id": "record_main",
-          "kind": "store_filesystem",
-          "cfg": { "root": "/var/lib/zm/recordings", "monitor_id": 1, "max_secs": 300, "stream_filter": [0] },
+          "kind": "store",
+          "cfg": { "mode": "continuous", "root": "/var/lib/zm/recordings", "monitor_id": 1, "max_secs": 300, "stream_filter": [0] },
           "queue_depth": 120
         },
         {

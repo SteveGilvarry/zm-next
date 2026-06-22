@@ -12,23 +12,20 @@
 #include <chrono>
 #include <cstdint>
 
-// Forward-declare the generated protobuf Frame so this header stays protobuf-free.
-namespace zm { namespace worker { namespace v1 { class Frame; } } }
-
 namespace zm {
 
 // The per-monitor worker link: one Unix domain socket
-// (${ZM_PATH_SOCKS}/stream_{monitor_id}.sock) serving the worker_link.proto
-// contract to multiple consumers at once. Bidirectional on one connection:
-//   push  (server->client): Hello / Media / Keyframe / Stats / Event / Bye
-//   pull  (client->server): Subscribe / Command  ->  Response
+// (${ZM_PATH_SOCKS}/stream_{monitor_id}.sock) serving the canonical stream
+// socket protocol (zm/stream_socket_protocol.hpp) to multiple consumers at once.
+// Byte-compatible with the ZoneMinder zmc producer and the zm-api consumer.
+//   push  (server->client, canonical): Hello / Media / Keyframe / Stats / Event / Bye
+//   pull  (client->server, zm-next extension): Subscribe / Command -> Response, Talkback
 //
-// Wire unit: u32 pb_len, u32 payload_len, [Frame protobuf], [raw payload].
-// The bulk media payload rides ALONGSIDE the protobuf, never inside it: a single
-// refcounted buffer is shared across every consumer queue and written with
-// writev(), so the payload is never copied per-consumer and protobuf only ever
-// serializes the small metadata Frame. (Mirrors zmc's StreamSocket Message
-// design; preserves its zero-copy fan-out.)
+// Wire unit: [24-byte canonical header][payload]. For control frames
+// (Hello/Event/Stats/Bye) the header is followed by a small TLV/blob body kept
+// in `prefix`; for Media/Keyframe the header is `prefix` and the access unit is
+// the refcounted `payload` — one buffer shared across every consumer queue and
+// written with writev(), so the payload is never copied per-consumer.
 //
 // The producer never blocks on consumers: each consumer has a bounded queue; on
 // overflow the oldest non-control messages are dropped (observable as Frame
@@ -102,8 +99,8 @@ public:
 
 private:
     // One serialized message shared across all consumer queues. `prefix` holds
-    // the 8-byte length header + the serialized protobuf Frame (built once);
-    // `payload` holds the refcounted media bytes (null for control/event frames).
+    // the 24-byte canonical header plus any TLV/blob body (built once); `payload`
+    // holds the refcounted media bytes (null for control/event frames).
     struct Message {
         std::vector<uint8_t> prefix;
         std::shared_ptr<const std::vector<uint8_t>> payload;
@@ -136,11 +133,16 @@ private:
     void onClientWritable(Client& c);
     void enqueue(const MessagePtr& msg, bool video, bool audio, bool events);
     void reapDead();             // close + erase clients marked dead (mutex held)
-    // Serialize a protobuf Frame (+ optional refcounted payload) into a shared
-    // Message: prefix = [u32 pb_len][u32 payload_len][Frame bytes].
-    MessagePtr buildFrameMessage(const zm::worker::v1::Frame& frame,
-                                 std::shared_ptr<const std::vector<uint8_t>> payload,
-                                 bool control);
+    // Build a control message (Hello/Event/Stats/Bye/Response): prefix = 24-byte
+    // canonical header + `body`, no media payload, never dropped.
+    MessagePtr makeControl(uint8_t type, uint8_t stream, uint8_t flags,
+                           uint32_t sequence, int64_t pts_us,
+                           std::vector<uint8_t> body, bool control = true);
+    // Build a media message (Media/Keyframe): prefix = 24-byte canonical header,
+    // `payload` is the refcounted access unit shared across consumer queues.
+    MessagePtr makeMedia(uint8_t type, uint8_t stream, uint8_t flags,
+                         uint32_t sequence, int64_t pts_us,
+                         std::shared_ptr<const std::vector<uint8_t>> payload);
 
     uint32_t monitor_id_;
     std::string socket_path_;
@@ -155,13 +157,17 @@ private:
     TalkbackHandler talkbackHandler_;
 
     uint32_t event_sequence_{0};
-    uint32_t media_sequence_{0};
+    uint32_t sequence_[2]{0, 0};     // per-stream media counter, indexed by wire StreamId (Video, Audio)
     uint32_t generation_{0};
-    MessagePtr snapshot_;            // replayed on connect
-    // Latest Hello per stream kind (video/audio), replayed when a client
-    // subscribes so a late consumer can initialize its decoder without waiting
-    // for the next generation bump.
-    std::unordered_map<uint32_t, MessagePtr> helloByStream_;
+    MessagePtr snapshot_;            // current-status EVENT, replayed on connect
+    // Cached HELLOs (per stream) + the most recent keyframe, replayed to each
+    // new consumer on connect so it can init its decoder and render immediately
+    // without waiting for the next generation bump / GOP.
+    MessagePtr hello_video_;
+    MessagePtr hello_audio_;
+    MessagePtr keyframe_;
+    std::vector<uint8_t> hello_video_body_;  // for change detection (skip no-op generation bumps)
+    std::vector<uint8_t> hello_audio_body_;
     std::chrono::steady_clock::time_point last_stats_;
 };
 

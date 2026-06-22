@@ -53,7 +53,7 @@ cat > "$WORK/base.json" <<JSON
  {"id":"cap","kind":"capture_file","cfg":{"path":"$WORK/h264.mp4","stream_id":0,"loop":false,"realtime":false},
   "children":[
    {"id":"dec","kind":"decode_ffmpeg","cfg":{"output_format":"rgb24"},"queue_depth":8},
-   {"id":"st","kind":"store_filesystem","cfg":{"root":"$WORK/base_rec","monitor_id":701},"queue_depth":120}]}]}
+   {"id":"st","kind":"store","cfg":{"mode":"continuous","root":"$WORK/base_rec","monitor_id":701},"queue_depth":120}]}]}
 JSON
 "$ZMCORE" --pipeline "$WORK/base.json" --socket "$WORK/s701.sock" --monitor-id 701 >"$WORK/c701.log" 2>&1 &
 WPID=$!; PIDS+=("$WPID"); wait_sock "$WORK/s701.sock"; sleep 4; kill $WPID 2>/dev/null; wait $WPID 2>/dev/null
@@ -76,7 +76,7 @@ if ffmpeg -y -f lavfi -i testsrc=duration=4:size=640x480:rate=15 \
  {"id":"cap","kind":"capture_file","cfg":{"path":"$WORK/hevc.mp4","stream_id":0,"loop":false,"realtime":false},
   "children":[
    {"id":"dec","kind":"decode_ffmpeg","cfg":{"output_format":"rgb24"},"queue_depth":8},
-   {"id":"st","kind":"store_filesystem","cfg":{"root":"$WORK/hevc_rec","monitor_id":702},"queue_depth":120}]}]}
+   {"id":"st","kind":"store","cfg":{"mode":"continuous","root":"$WORK/hevc_rec","monitor_id":702},"queue_depth":120}]}]}
 JSON
   "$ZMCORE" --pipeline "$WORK/hevc.json" --socket "$WORK/s702.sock" --monitor-id 702 >"$WORK/c702.log" 2>&1 &
   WPID=$!; PIDS+=("$WPID"); wait_sock "$WORK/s702.sock"; sleep 4; kill $WPID 2>/dev/null; wait $WPID 2>/dev/null
@@ -98,7 +98,7 @@ cat > "$WORK/loop.json" <<JSON
 {"name":"loop","root":true,"plugins":[
  {"id":"cap","kind":"capture_file","cfg":{"path":"$WORK/loop.mp4","stream_id":0,"loop":true,"realtime":true},
   "children":[
-   {"id":"st","kind":"store_filesystem","cfg":{"root":"$WORK/loop_rec","monitor_id":703},"queue_depth":120}]}]}
+   {"id":"st","kind":"store","cfg":{"mode":"continuous","root":"$WORK/loop_rec","monitor_id":703},"queue_depth":120}]}]}
 JSON
 "$ZMCORE" --pipeline "$WORK/loop.json" --socket "$WORK/s703.sock" --monitor-id 703 >"$WORK/c703.log" 2>&1 &
 WPID=$!; PIDS+=("$WPID"); wait_sock "$WORK/s703.sock"; sleep 7; kill $WPID 2>/dev/null; wait $WPID 2>/dev/null
@@ -118,7 +118,7 @@ cat > "$WORK/b3.json" <<JSON
  {"id":"cap","kind":"capture_file","cfg":{"path":"$WORK/h264.mp4","stream_id":0,"loop":false,"realtime":false},
   "children":[
    {"id":"dec","kind":"decode_ffmpeg","cfg":{"output_format":"rgb24"},
-    "children":[{"id":"st","kind":"store_filesystem","cfg":{"root":"$WORK/b3_rec","monitor_id":704}}]}]}]}
+    "children":[{"id":"st","kind":"store","cfg":{"mode":"continuous","root":"$WORK/b3_rec","monitor_id":704}}]}]}]}
 JSON
 "$ZMCORE" --pipeline "$WORK/b3.json" --socket "$WORK/s704.sock" --monitor-id 704 >"$WORK/c704.log" 2>&1 &
 WPID=$!; PIDS+=("$WPID"); wait_sock "$WORK/s704.sock"; sleep 3; kill $WPID 2>/dev/null; wait $WPID 2>/dev/null
@@ -131,16 +131,17 @@ echo "[5] dead input surfaces a health event [B6]"
 cat > "$WORK/b6.json" <<JSON
 {"name":"b6","root":true,"plugins":[
  {"id":"cap","kind":"capture_file","cfg":{"path":"$WORK/does_not_exist.mp4","stream_id":0,"loop":false,"realtime":false},
-  "children":[{"id":"st","kind":"store_filesystem","cfg":{"root":"$WORK/b6_rec","monitor_id":705}}]}]}
+  "children":[{"id":"st","kind":"store","cfg":{"mode":"continuous","root":"$WORK/b6_rec","monitor_id":705}}]}]}
 JSON
 "$ZMCORE" --pipeline "$WORK/b6.json" --socket "$WORK/s705.sock" --monitor-id 705 >"$WORK/c705.log" 2>&1 &
 WPID=$!; PIDS+=("$WPID")
 if wait_sock "$WORK/s705.sock"; then
   sleep 0.5
   "$WLDUMP" "$WORK/s705.sock" 2 >"$WORK/wl705.log" 2>&1
-  # CONNECTION_FAILED is event code 2; replayed via the connect snapshot.
-  grep -q "EVENT code=2" "$WORK/wl705.log" && pass "CONNECTION_FAILED surfaced on socket" \
-                                           || fail "no health event for dead input"
+  # CONNECTION_FAILED is event code 0x0101 (canonical wire); replayed via the
+  # connect snapshot and printed by wl_dump as "EVENT code=0x101".
+  grep -q "EVENT code=0x101" "$WORK/wl705.log" && pass "CONNECTION_FAILED surfaced on socket" \
+                                               || fail "no health event for dead input"
 else fail "worker socket never came up"; fi
 kill -0 $WPID 2>/dev/null && pass "worker still alive (no crash on dead input)" || fail "worker crashed on dead input"
 kill $WPID 2>/dev/null; wait $WPID 2>/dev/null
@@ -153,7 +154,7 @@ cat > "$WORK/rot.json" <<JSON
 {"name":"rot","root":true,"plugins":[
  {"id":"cap","kind":"capture_file","cfg":{"path":"$WORK/h264.mp4","stream_id":0,"loop":false,"realtime":false},
   "children":[
-   {"id":"st","kind":"store_filesystem","cfg":{"root":"$WORK/rot_rec","monitor_id":707,"max_secs":2},"queue_depth":120}]}]}
+   {"id":"st","kind":"store","cfg":{"mode":"continuous","root":"$WORK/rot_rec","monitor_id":707,"max_secs":2},"queue_depth":120}]}]}
 JSON
 "$ZMCORE" --pipeline "$WORK/rot.json" --socket "$WORK/s707.sock" --monitor-id 707 >"$WORK/c707.log" 2>&1 &
 WPID=$!; PIDS+=("$WPID"); wait_sock "$WORK/s707.sock"; sleep 4; kill $WPID 2>/dev/null; wait $WPID 2>/dev/null
@@ -178,7 +179,7 @@ if ffmpeg -y -f lavfi -i testsrc=duration=4:size=640x480:rate=15 \
 {"name":"av","root":true,"plugins":[
  {"id":"cap","kind":"capture_file","cfg":{"path":"$WORK/av.mp4","stream_id":0,"loop":false,"realtime":false,"forward_audio":true},
   "children":[
-   {"id":"st","kind":"store_filesystem","cfg":{"root":"$WORK/av_rec","monitor_id":706},"queue_depth":120}]}]}
+   {"id":"st","kind":"store","cfg":{"mode":"continuous","root":"$WORK/av_rec","monitor_id":706},"queue_depth":120}]}]}
 JSON
   "$ZMCORE" --pipeline "$WORK/av.json" --socket "$WORK/s706.sock" --monitor-id 706 >"$WORK/c706.log" 2>&1 &
   WPID=$!; PIDS+=("$WPID"); wait_sock "$WORK/s706.sock"; sleep 4; kill $WPID 2>/dev/null; wait $WPID 2>/dev/null

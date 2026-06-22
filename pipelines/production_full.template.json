@@ -2,7 +2,7 @@
   "_comment": [
     "Production cascade rolling up the validated pieces, one camera, one worker:",
     "  capture (main 4K + sub 720p)",
-    "    |- store_filesystem(stream 0)  -> record main stream compressed, no decode",
+    "    |- store(mode=continuous, stream 0) -> record main stream compressed, no decode",
     "    `- decode(stream 1, rgb24) -> motion_gate -> detect_onnx -> tracker -> alert_policy",
     "Detection runs on the cheap 720p substream, only while motion is present",
     "(motion_gate), the tracker gives persistent ids, and alert_policy emits ONE alert",
@@ -21,8 +21,8 @@
       "children": [
         {
           "id": "record_main",
-          "kind": "store_filesystem",
-          "cfg": { "root": "/var/lib/zm/recordings", "monitor_id": 1, "max_secs": 300, "stream_filter": [0] },
+          "kind": "store",
+          "cfg": { "mode": "continuous", "root": "/var/lib/zm/recordings", "monitor_id": 1, "max_secs": 300, "stream_filter": [0] },
           "queue_depth": 120
         },
         {

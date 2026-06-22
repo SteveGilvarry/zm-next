@@ -3,6 +3,7 @@
 #include "zm/PluginManager.hpp"
 #include "zm/EventBus.hpp"
 #include "zm/WorkerLink.hpp"
+#include <nlohmann/json.hpp>
 #include <iostream>
 #include <filesystem>
 #include <string>
@@ -112,6 +113,12 @@ int main(int argc, char** argv) {
             } else if (name == "reload") {
                 // Hot reload is Phase 2 — daemon should restart the process for now.
                 r.ok = false; r.message = "not_implemented";
+            } else if (name == "assign_recording") {
+                // Plugin-targeted command: dispatch the full command JSON onto the
+                // in-process event bus so the store plugin (subscribed via the host
+                // API) can match it by clip_token. `args` is the raw command JSON.
+                EventBus::instance().publish("plugin_event", args);
+                r.ok = true; r.message = "dispatched";
             } else {
                 r.ok = false; r.message = "unknown_command: " + name;
             }
@@ -133,6 +140,14 @@ int main(int argc, char** argv) {
         // WorkerLink maps them onto protobuf Event frames.
         WorkerLink* wl = link.get();
         EventBus::instance().subscribe("plugin_event", [wl](const std::string& evt) {
+            // Inbound plugin-targeted commands are re-published on this same bus to
+            // reach the plugins (see the command handler above). Don't echo those
+            // back out to socket consumers — and never call back into WorkerLink
+            // here (this runs under WorkerLink's lock during command dispatch).
+            if (evt.find("\"cmd\"") != std::string::npos) {
+                auto j = nlohmann::json::parse(evt, nullptr, /*allow_exceptions=*/false);
+                if (j.is_object() && j.contains("cmd")) return;
+            }
             wl->publishEventJson(evt);
         });
 

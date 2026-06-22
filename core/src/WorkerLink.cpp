@@ -1,6 +1,6 @@
 #include "zm/WorkerLink.hpp"
+#include "zm/stream_socket_protocol.hpp"
 
-#include "worker_link.pb.h"
 #include <nlohmann/json.hpp>
 
 #include <sys/socket.h>
@@ -19,7 +19,7 @@
 
 namespace zm {
 
-namespace pb = zm::worker::v1;
+namespace ss = zm::stream_socket;
 using json = nlohmann::json;
 
 namespace {
@@ -30,24 +30,20 @@ int64_t now_usec() {
     return static_cast<int64_t>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000;
 }
 
-void put_u32_le(uint8_t* p, uint32_t v) {
-    p[0] = static_cast<uint8_t>(v & 0xff);
-    p[1] = static_cast<uint8_t>((v >> 8) & 0xff);
-    p[2] = static_cast<uint8_t>((v >> 16) & 0xff);
-    p[3] = static_cast<uint8_t>((v >> 24) & 0xff);
-}
-
 uint32_t get_u32_le(const uint8_t* p) {
     return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
            (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
 }
 
-// Map a plugin EventBus JSON payload onto an Event code. Plugins currently emit
-// ad-hoc {"type":...} objects; lifecycle types map to their codes, motion/zone
-// types to DETECTION, everything else to UNSPECIFIED. The raw JSON is preserved
-// in `message` until plugins emit fully-structured events (Phase 3).
-// Minimal base64 decoder (the capture plugin base64-encodes codec extradata in
-// its StreamMetadata event; core is FFmpeg-free so we decode it here).
+// zm-next internal stream kind (1 = video, 2 = audio; matches the proto
+// STREAM_KIND_* values the producers pass) → canonical wire StreamId.
+uint8_t wire_stream(uint32_t internal) {
+    return internal == 2u ? static_cast<uint8_t>(ss::StreamId::Audio)
+                          : static_cast<uint8_t>(ss::StreamId::Video);
+}
+
+// Minimal base64 decoder: the capture plugin base64-encodes codec extradata in
+// its StreamMetadata event; core is FFmpeg-free so we decode it here.
 std::vector<uint8_t> base64_decode(const std::string& in) {
     static const auto val = [](char c) -> int {
         if (c >= 'A' && c <= 'Z') return c - 'A';
@@ -60,7 +56,7 @@ std::vector<uint8_t> base64_decode(const std::string& in) {
     std::vector<uint8_t> out;
     int buf = 0, bits = 0;
     for (char c : in) {
-        if (c == '=' ) break;
+        if (c == '=') break;
         int v = val(c);
         if (v < 0) continue;
         buf = (buf << 6) | v;
@@ -73,18 +69,29 @@ std::vector<uint8_t> base64_decode(const std::string& in) {
     return out;
 }
 
-pb::Event::Code map_event_code(const std::string& type) {
-    if (type == "connection_failed")      return pb::Event::CONNECTION_FAILED;
-    if (type == "connection_restored")    return pb::Event::CONNECTION_RESTORED;
-    if (type == "prime_capture_failed")   return pb::Event::PRIME_CAPTURE_FAILED;
-    if (type == "prime_capture_restored") return pb::Event::PRIME_CAPTURE_RESTORED;
-    if (type == "capture_failed")         return pb::Event::CAPTURE_FAILED;
-    if (type == "capture_resumed")        return pb::Event::CAPTURE_RESUMED;
-    if (type == "state_changed")          return pb::Event::STATE_CHANGED;
+// Map a plugin EventBus event onto a canonical/extension EVENT code. Lifecycle
+// "type"s map to their canonical codes; motion/zone/detection → DETECTION;
+// description → DESCRIPTION; the EventClip "event" → RECORDING_SAVED. Anything
+// else stays 0 (unspecified) and is still forwarded with its raw JSON.
+uint16_t map_event_code(const std::string& type, const std::string& event) {
+    if (type == "connection_failed")      return ss::kEventConnectionFailed;
+    if (type == "connection_restored")    return ss::kEventConnectionRestored;
+    if (type == "prime_capture_failed")   return ss::kEventPrimeCaptureFailed;
+    if (type == "prime_capture_restored") return ss::kEventPrimeCaptureRestored;
+    if (type == "capture_failed")         return ss::kEventCaptureFailed;
+    if (type == "capture_resumed")        return ss::kEventCaptureResumed;
+    if (type == "state_changed")          return ss::kEventStateChanged;
     if (type == "motion" || type == "zone_motion" || type == "detection")
-        return pb::Event::DETECTION;
-    if (type == "description")            return pb::Event::DESCRIPTION;
-    return pb::Event::CODE_UNSPECIFIED;
+        return ss::kEventDetection;
+    if (type == "description")            return ss::kEventDescription;
+    if (event == "EventClip")             return ss::kEventRecordingSaved;
+    if (event == "RecordingOpening")      return ss::kEventRecordingOpening;
+    return 0;
+}
+
+bool is_ai_code(uint16_t code) {
+    return code == ss::kEventDetection || code == ss::kEventDescription ||
+           code == ss::kEventRecordingSaved || code == ss::kEventRecordingOpening;
 }
 
 } // namespace
@@ -162,10 +169,10 @@ void WorkerLink::stop() {
     // Best-effort BYE to every connected consumer before tearing down. We're
     // closing everything next, so write directly and ignore errors (no reaping).
     {
-        pb::Frame frame;
-        frame.set_monitor_id(monitor_id_);
-        frame.mutable_bye()->set_reason("worker shutting down");
-        MessagePtr bye = buildFrameMessage(frame, nullptr, /*control=*/true);
+        MessagePtr bye = makeControl(static_cast<uint8_t>(ss::MessageType::Bye),
+                                     static_cast<uint8_t>(ss::StreamId::Video),
+                                     /*flags=*/0, /*sequence=*/0, /*pts_us=*/0,
+                                     /*body=*/{});
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto& [fd, c] : clients_) {
             (void)c;
@@ -189,17 +196,46 @@ void WorkerLink::stop() {
     ::unlink(socket_path_.c_str());
 }
 
-WorkerLink::MessagePtr WorkerLink::buildFrameMessage(
-    const pb::Frame& frame, std::shared_ptr<const std::vector<uint8_t>> payload, bool control) {
+WorkerLink::MessagePtr WorkerLink::makeControl(uint8_t type, uint8_t stream, uint8_t flags,
+                                              uint32_t sequence, int64_t pts_us,
+                                              std::vector<uint8_t> body, bool control) {
     auto msg = std::make_shared<Message>();
-    const uint32_t pb_len = static_cast<uint32_t>(frame.ByteSizeLong());
-    const uint32_t payload_len = payload ? static_cast<uint32_t>(payload->size()) : 0;
-    msg->prefix.resize(8 + pb_len);
-    put_u32_le(msg->prefix.data(), pb_len);
-    put_u32_le(msg->prefix.data() + 4, payload_len);
-    frame.SerializeToArray(msg->prefix.data() + 8, static_cast<int>(pb_len));
-    msg->payload = std::move(payload);
+    ss::Header h{};
+    h.length = ss::kHeaderLengthBytes + static_cast<uint32_t>(body.size());
+    h.version = ss::kProtocolVersion;
+    h.type = type;
+    h.stream = stream;
+    h.flags = flags;
+    h.sequence = sequence;
+    h.generation = generation_;
+    h.pts_us = static_cast<uint64_t>(pts_us);
+    msg->prefix.resize(ss::kHeaderSize + body.size());
+    ss::SerializeHeader(h, msg->prefix.data());
+    if (!body.empty())
+        std::memcpy(msg->prefix.data() + ss::kHeaderSize, body.data(), body.size());
+    msg->payload = nullptr;
     msg->control = control;
+    return msg;
+}
+
+WorkerLink::MessagePtr WorkerLink::makeMedia(uint8_t type, uint8_t stream, uint8_t flags,
+                                            uint32_t sequence, int64_t pts_us,
+                                            std::shared_ptr<const std::vector<uint8_t>> payload) {
+    auto msg = std::make_shared<Message>();
+    const uint32_t payload_len = payload ? static_cast<uint32_t>(payload->size()) : 0;
+    ss::Header h{};
+    h.length = ss::kHeaderLengthBytes + payload_len;
+    h.version = ss::kProtocolVersion;
+    h.type = type;
+    h.stream = stream;
+    h.flags = flags;
+    h.sequence = sequence;
+    h.generation = generation_;
+    h.pts_us = static_cast<uint64_t>(pts_us);
+    msg->prefix.resize(ss::kHeaderSize);
+    ss::SerializeHeader(h, msg->prefix.data());
+    msg->payload = std::move(payload);
+    msg->control = false;
     return msg;
 }
 
@@ -273,12 +309,13 @@ void WorkerLink::runLoop() {
             last_stats_ = now;
             for (auto& [fd, c] : clients_) {
                 if (c.dead) continue;
-                pb::Frame f;
-                f.set_monitor_id(monitor_id_);
-                auto* st = f.mutable_stats();
-                st->set_messages_sent(c.sent);
-                st->set_messages_dropped(c.dropped);
-                c.queue.push_back(buildFrameMessage(f, nullptr, /*control=*/true));
+                MessagePtr st = makeControl(static_cast<uint8_t>(ss::MessageType::Stats),
+                                            static_cast<uint8_t>(ss::StreamId::Video),
+                                            /*flags=*/0, /*sequence=*/0, /*pts_us=*/0,
+                                            ss::BuildStats(c.sent, c.dropped),
+                                            /*control=*/false);
+                c.queue.push_back(st);
+                c.queued_bytes += st->wire_size();
                 onClientWritable(c);
             }
         }
@@ -297,12 +334,22 @@ void WorkerLink::acceptClient() {
     }
     Client c;
     c.fd = cfd;
-    // Replay the cached snapshot so a late subscriber learns current status
-    // without waiting for the next transition (events analogue of a keyframe).
-    if (snapshot_) {
-        c.queue.push_back(snapshot_);
-        c.queued_bytes += snapshot_->wire_size();
-    }
+    // Canonical consumers (zm-api, zmc-style) send no client->server messages, so
+    // fan out everything by default; the optional Subscribe extension can narrow
+    // it later. New consumers get HELLO(s), then the current-status snapshot, then
+    // the cached keyframe so they can initialize and render immediately.
+    c.want_video = true;
+    c.want_audio = true;
+    c.want_events = true;
+    auto push = [&c](const MessagePtr& m) {
+        if (!m) return;
+        c.queue.push_back(m);
+        c.queued_bytes += m->wire_size();
+    };
+    push(hello_video_);
+    push(hello_audio_);
+    push(snapshot_);
+    push(keyframe_);
     auto [it, _] = clients_.emplace(cfd, std::move(c));
     onClientWritable(it->second);
 }
@@ -313,60 +360,74 @@ void WorkerLink::onClientReadable(Client& c) {
     if (n <= 0) { c.dead = true; return; }
     c.inbuf.append(buf, static_cast<size_t>(n));
 
-    // Parse as many complete wire units as are buffered.
-    while (c.inbuf.size() >= 8) {
+    // Parse as many complete wire units as are buffered. Inbound frames use the
+    // canonical 24-byte header with zm-next control extension message types.
+    while (c.inbuf.size() >= ss::kHeaderSize) {
         const uint8_t* p = reinterpret_cast<const uint8_t*>(c.inbuf.data());
-        uint32_t pb_len = get_u32_le(p);
-        uint32_t payload_len = get_u32_le(p + 4);
-        size_t need = 8 + pb_len + payload_len;
+        ss::Header h{};
+        if (!ss::ParseHeader(p, h)) { c.dead = true; return; }  // corrupt stream
+        const size_t payload_len = h.payload_size();
+        const size_t need = ss::kHeaderSize + payload_len;
         if (c.inbuf.size() < need) break;
 
-        pb::Frame frame;
-        if (frame.ParseFromArray(c.inbuf.data() + 8, static_cast<int>(pb_len))) {
-            switch (frame.payload_case()) {
-                case pb::Frame::kSubscribe: {
-                    const auto& s = frame.subscribe();
-                    c.want_video = s.video();
-                    c.want_audio = s.audio();
-                    c.want_events = s.events();
-                    // Replay the cached Hello(s) for the just-subscribed streams so
-                    // a late consumer can initialize its decoder immediately.
-                    for (const auto& [stream, hello] : helloByStream_) {
-                        const bool isAudio = (stream == pb::STREAM_KIND_AUDIO);
-                        if ((isAudio && c.want_audio) || (!isAudio && c.want_video)) {
-                            c.queue.push_back(hello);
-                            c.queued_bytes += hello->wire_size();
-                        }
-                    }
+        const char* body = c.inbuf.data() + ss::kHeaderSize;
+        switch (static_cast<ss::MessageType>(h.type)) {
+            case ss::MessageType::Subscribe: {
+                json j = json::parse(body, body + payload_len, nullptr, false);
+                if (j.is_object()) {
+                    c.want_video = j.value("video", true);
+                    c.want_audio = j.value("audio", true);
+                    c.want_events = j.value("events", true);
+                    // Replay the cached Hello(s) for the just-subscribed streams.
+                    auto push = [&c](const MessagePtr& m) {
+                        if (!m) return;
+                        c.queue.push_back(m);
+                        c.queued_bytes += m->wire_size();
+                    };
+                    if (c.want_video) push(hello_video_);
+                    if (c.want_audio) push(hello_audio_);
                     onClientWritable(c);
-                    break;
                 }
-                case pb::Frame::kCommand: {
-                    const auto& cmd = frame.command();
-                    CommandResult r{false, "no command handler", ""};
-                    if (handler_) r = handler_(cmd.name(), cmd.args_json());
-                    pb::Frame out;
-                    out.set_monitor_id(monitor_id_);
-                    auto* resp = out.mutable_response();
-                    resp->set_request_id(cmd.request_id());
-                    resp->set_ok(r.ok);
-                    resp->set_message(r.message);
-                    resp->set_data_json(r.data_json);
-                    c.queue.push_back(buildFrameMessage(out, nullptr, /*control=*/true));
-                    onClientWritable(c);
-                    break;
-                }
-                case pb::Frame::kTalkback: {
-                    // Two-way audio: relay to the camera backchannel handler.
-                    if (talkbackHandler_) {
-                        const auto& tb = frame.talkback();
-                        talkbackHandler_(tb.codec(), tb.pts_us(), tb.data());
-                    }
-                    break;
-                }
-                default:
-                    break; // ignore other inbound types
+                break;
             }
+            case ss::MessageType::Command: {
+                json j = json::parse(body, body + payload_len, nullptr, false);
+                CommandResult r{false, "bad command", ""};
+                std::string name;
+                uint64_t request_id = 0;
+                if (j.is_object()) {
+                    // Accept either {"cmd":...} (zm-api plugin-targeted commands) or
+                    // {"name":...,"args":...} (core control). Pass the FULL payload
+                    // JSON to the handler so plugin commands keep every field.
+                    name = j.value("cmd", j.value("name", std::string{}));
+                    request_id = j.value("request_id", 0ull);
+                    std::string raw(body, payload_len);
+                    if (handler_) r = handler_(name, raw);
+                    else r = {false, "no command handler", ""};
+                }
+                json resp = {{"request_id", request_id}, {"ok", r.ok},
+                             {"message", r.message}, {"data", r.data_json}};
+                std::string rs = resp.dump();
+                MessagePtr out = makeControl(static_cast<uint8_t>(ss::MessageType::Response),
+                                             static_cast<uint8_t>(ss::StreamId::Monitor),
+                                             /*flags=*/0, /*sequence=*/0, /*pts_us=*/0,
+                                             std::vector<uint8_t>(rs.begin(), rs.end()));
+                c.queue.push_back(out);
+                c.queued_bytes += out->wire_size();
+                onClientWritable(c);
+                break;
+            }
+            case ss::MessageType::Talkback: {
+                // Payload = [u32 codec_le][raw audio]; pts in the header.
+                if (talkbackHandler_ && payload_len >= 4) {
+                    uint32_t codec = get_u32_le(reinterpret_cast<const uint8_t*>(body));
+                    talkbackHandler_(codec, static_cast<int64_t>(h.pts_us),
+                                     std::string(body + 4, payload_len - 4));
+                }
+                break;
+            }
+            default:
+                break;  // ignore other / unknown inbound types
         }
         c.inbuf.erase(0, need);
     }
@@ -434,17 +495,16 @@ void WorkerLink::publishEventJson(const std::string& raw_event_json) {
     if (!running_.load()) return;
 
     json j = json::parse(raw_event_json, nullptr, /*allow_exceptions=*/false);
+    const bool obj = !j.is_discarded() && j.is_object();
 
     // The capture plugin's StreamMetadata event carries codec parameters; turn it
     // into a Hello (the media handshake) rather than a generic Event.
-    if (!j.is_discarded() && j.is_object() &&
-        j.value("event", std::string{}) == "StreamMetadata") {
+    if (obj && j.value("event", std::string{}) == "StreamMetadata") {
         std::vector<uint8_t> extradata;
         if (j.contains("extradata") && j["extradata"].is_string())
             extradata = base64_decode(j["extradata"].get<std::string>());
         const bool isAudio = (j.value("media", std::string("video")) == "audio");
-        setStreamParams(static_cast<uint32_t>(isAudio ? pb::STREAM_KIND_AUDIO
-                                                      : pb::STREAM_KIND_VIDEO),
+        setStreamParams(/*stream=*/isAudio ? 2u : 1u,
                         static_cast<uint32_t>(j.value("codec_id", 0)),
                         extradata.data(), extradata.size(),
                         static_cast<uint32_t>(j.value("width", 0)),
@@ -455,58 +515,50 @@ void WorkerLink::publishEventJson(const std::string& raw_event_json) {
         return;
     }
 
-    pb::Frame frame;
-    frame.set_monitor_id(monitor_id_);
-    auto* ev = frame.mutable_event();
+    const std::string type = (obj && j.contains("type") && j["type"].is_string())
+                                 ? j["type"].get<std::string>() : "";
+    const std::string event = (obj && j.contains("event") && j["event"].is_string())
+                                  ? j["event"].get<std::string>() : "";
 
-    std::string type = (!j.is_discarded() && j.is_object() && j.contains("type") &&
-                        j["type"].is_string())
-                           ? j["type"].get<std::string>()
-                           : "";
-    ev->set_code(map_event_code(type));
-    ev->set_wall_clock_us(now_usec());
-    ev->set_message(raw_event_json);
+    ss::MonitorEvent ev;
+    ev.code = map_event_code(type, event);
+    ev.wall_clock_us = static_cast<uint64_t>(now_usec());
+    ev.has_wall_clock = true;
+    // Lifecycle events surface human-readable detail in `message`; analysis/AI
+    // events carry their structured payload in the JSON detail TLV.
+    if (is_ai_code(ev.code))
+        ev.json_detail = raw_event_json;
+    else
+        ev.message = raw_event_json;
 
-    // Populate the structured Description for VLM scene-understanding events.
-    if (type == "description" && j.is_object()) {
-        auto* d = ev->mutable_description();
-        d->set_text(j.value("text", std::string{}));
-        d->set_prompt(j.value("prompt", std::string{}));
-        d->set_model(j.value("model", std::string{}));
-    }
-
-    const pb::Event::Code code = ev->code();
     // Lifecycle/health events represent current monitor status, so cache the
-    // latest as the connect-time snapshot — a consumer that connects later learns
-    // the current state immediately. Detection/description are per-event streams
-    // (too frequent, not "status") and must not clobber the snapshot.
-    const bool is_health = code != pb::Event::CODE_UNSPECIFIED &&
-                           code != pb::Event::SNAPSHOT &&
-                           code != pb::Event::DETECTION &&
-                           code != pb::Event::DESCRIPTION;
+    // latest as the connect-time snapshot. Detection/description/recording are
+    // per-event streams (not "status") and must not clobber the snapshot.
+    const bool is_health = ev.code != 0 && ev.code != ss::kEventSnapshot &&
+                           !is_ai_code(ev.code);
 
-    MessagePtr msg;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        frame.set_sequence(event_sequence_++);
-        frame.set_generation(generation_);
-        msg = buildFrameMessage(frame, nullptr, /*control=*/true);
-        enqueue(msg, /*video=*/false, /*audio=*/false, /*events=*/true);
-        if (is_health) snapshot_ = msg;
-    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    MessagePtr msg = makeControl(static_cast<uint8_t>(ss::MessageType::Event),
+                                 static_cast<uint8_t>(ss::StreamId::Monitor),
+                                 /*flags=*/0, event_sequence_++, /*pts_us=*/0,
+                                 ss::BuildEvent(ev));
+    enqueue(msg, /*video=*/false, /*audio=*/false, /*events=*/true);
+    if (is_health) snapshot_ = msg;
 }
 
 void WorkerLink::setSnapshotJson(const std::string& raw_event_json) {
-    pb::Frame frame;
-    frame.set_monitor_id(monitor_id_);
-    auto* ev = frame.mutable_event();
-    ev->set_code(pb::Event::SNAPSHOT);
-    ev->set_wall_clock_us(now_usec());
-    ev->set_message(raw_event_json);
+    ss::MonitorEvent ev;
+    ev.code = ss::kEventSnapshot;
+    ev.wall_clock_us = static_cast<uint64_t>(now_usec());
+    ev.has_wall_clock = true;
+    ev.message = raw_event_json;
 
     std::lock_guard<std::mutex> lock(mutex_);
-    frame.set_generation(generation_);
-    snapshot_ = buildFrameMessage(frame, nullptr, /*control=*/true);
+    // Tagged with the current event sequence as a baseline; cached, not broadcast.
+    snapshot_ = makeControl(static_cast<uint8_t>(ss::MessageType::Event),
+                            static_cast<uint8_t>(ss::StreamId::Monitor),
+                            /*flags=*/0, event_sequence_, /*pts_us=*/0,
+                            ss::BuildEvent(ev));
 }
 
 void WorkerLink::setStreamParams(uint32_t stream, uint32_t codec_id,
@@ -514,45 +566,65 @@ void WorkerLink::setStreamParams(uint32_t stream, uint32_t codec_id,
                                  uint32_t width, uint32_t height,
                                  uint32_t fps_num, uint32_t fps_den,
                                  uint32_t sample_rate, uint32_t channels) {
-    pb::Frame frame;
-    frame.set_monitor_id(monitor_id_);
-    auto* h = frame.mutable_hello();
-    h->set_stream(static_cast<pb::StreamKind>(stream));
-    h->set_codec_id(codec_id);
-    if (extradata && extradata_len)
-        h->set_extradata(extradata, extradata_len);
-    h->set_width(width);
-    h->set_height(height);
-    h->set_fps_num(fps_num);
-    h->set_fps_den(fps_den);
-    h->set_sample_rate(sample_rate);
-    h->set_channels(channels);
+    std::vector<uint8_t> body = ss::BuildHello(codec_id, extradata, extradata_len,
+                                               width, height, fps_num, fps_den,
+                                               sample_rate, channels);
+    const uint8_t wstream = wire_stream(stream);
+    const bool isAudio = (wstream == static_cast<uint8_t>(ss::StreamId::Audio));
 
     std::lock_guard<std::mutex> lock(mutex_);
-    ++generation_;
-    frame.set_generation(generation_);
-    MessagePtr msg = buildFrameMessage(frame, nullptr, /*control=*/true);
-    // Cache the latest Hello per stream kind so a client that subscribes after
-    // startup still receives it (see the Subscribe handler).
-    helloByStream_[stream] = msg;
-    enqueue(msg, /*video=*/true, /*audio=*/true, /*events=*/false);
+    std::vector<uint8_t>& cached = isAudio ? hello_audio_body_ : hello_video_body_;
+    if (body == cached) return;  // no change: don't bump generation / re-broadcast
+
+    const bool reconfigure = !cached.empty();
+    if (reconfigure) {
+        ++generation_;
+        sequence_[0] = sequence_[1] = 0;
+        keyframe_.reset();
+    }
+    cached = body;
+    MessagePtr hello = makeControl(static_cast<uint8_t>(ss::MessageType::Hello),
+                                   wstream, /*flags=*/0, /*sequence=*/0, /*pts_us=*/0,
+                                   std::vector<uint8_t>(body));
+    (isAudio ? hello_audio_ : hello_video_) = hello;
+    enqueue(hello, /*video=*/!isAudio, /*audio=*/isAudio, /*events=*/false);
+
+    // Re-issue the other stream's HELLO so both carry the new generation.
+    if (reconfigure) {
+        if (isAudio && !hello_video_body_.empty()) {
+            hello_video_ = makeControl(static_cast<uint8_t>(ss::MessageType::Hello),
+                                       static_cast<uint8_t>(ss::StreamId::Video),
+                                       0, 0, 0, std::vector<uint8_t>(hello_video_body_));
+            enqueue(hello_video_, /*video=*/true, /*audio=*/false, /*events=*/false);
+        } else if (!isAudio && !hello_audio_body_.empty()) {
+            hello_audio_ = makeControl(static_cast<uint8_t>(ss::MessageType::Hello),
+                                       static_cast<uint8_t>(ss::StreamId::Audio),
+                                       0, 0, 0, std::vector<uint8_t>(hello_audio_body_));
+            enqueue(hello_audio_, /*video=*/false, /*audio=*/true, /*events=*/false);
+        }
+    }
 }
 
 void WorkerLink::sendMedia(uint32_t stream, bool keyframe, int64_t pts_us,
                            std::shared_ptr<const std::vector<uint8_t>> payload) {
-    if (!running_.load()) return;
-    pb::Frame frame;
-    frame.set_monitor_id(monitor_id_);
-    auto* m = frame.mutable_media();
-    m->set_stream(static_cast<pb::StreamKind>(stream));
-    m->set_keyframe(keyframe);
-    m->set_pts_us(pts_us);
+    if (!running_.load() || !payload || payload->empty()) return;
+    const uint8_t wstream = wire_stream(stream);
+    const bool is_video = (wstream == static_cast<uint8_t>(ss::StreamId::Video));
+    const bool video_keyframe = keyframe && is_video;
+    const uint8_t flags = video_keyframe ? ss::kFlagKeyframe : 0;
 
-    const bool is_video = (static_cast<pb::StreamKind>(stream) == pb::STREAM_KIND_VIDEO);
     std::lock_guard<std::mutex> lock(mutex_);
-    frame.set_sequence(media_sequence_++);  // per-stream counter; gaps => drops
-    frame.set_generation(generation_);
-    MessagePtr msg = buildFrameMessage(frame, std::move(payload), /*control=*/false);
+    const uint32_t seq = sequence_[wstream]++;  // per-stream counter; gaps => drops
+
+    // Cache the keyframe for fast-start of late joiners (same refcounted buffer).
+    if (video_keyframe) {
+        keyframe_ = makeMedia(static_cast<uint8_t>(ss::MessageType::Keyframe),
+                              wstream, flags, seq, pts_us, payload);
+    }
+    if (clients_.empty()) return;  // sequence still advanced + keyframe cached
+
+    MessagePtr msg = makeMedia(static_cast<uint8_t>(ss::MessageType::Media),
+                               wstream, flags, seq, pts_us, std::move(payload));
     enqueue(msg, /*video=*/is_video, /*audio=*/!is_video, /*events=*/false);
 }
 

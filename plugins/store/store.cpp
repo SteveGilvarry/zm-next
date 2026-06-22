@@ -1,28 +1,34 @@
-// store_event: EVENT-BASED recorder with pre-roll and post-roll.
+// store: unified ZoneMinder-Next recorder. One muxer + one zm-api event-id
+// handshake, three recording policies selected by "mode":
 //
-// Unlike store_filesystem (a continuous recorder), store_event is a
-// ZM_PLUGIN_PROCESS pass-through that keeps a rolling in-memory buffer of recent
-// compressed video (and audio) packets. When an alarm event fires (motion /
-// detection / audio_event / tracked_detection — driven by the AI cascade rather
-// than dumb motion), it writes a single clip file containing:
+//   "continuous" — record everything, rotating a segment every max_secs at a
+//                  keyframe boundary. Each segment is a ZM event (cause
+//                  "continuous"). (Replaces the old store_filesystem.)
+//   "event"      — keep a rolling pre-roll buffer; on a trigger event write one
+//                  clip with pre_roll_sec before and post_roll_sec after the last
+//                  trigger. Each clip is a ZM event (cause = the trigger). The
+//                  classic NVR event clip. (Replaces the old store_event.)
+//   "both"       — continuous segments, but a trigger during a segment sets that
+//                  segment's cause and its VLM descriptions are captured. No
+//                  second file (ZM "Mocord").
 //
-//   pre_roll_sec seconds BEFORE the trigger  ...through...  post_roll_sec
-//   seconds AFTER the last trigger.
-//
-// This is the classic NVR "event clip".
+// Every recorded clip/segment participates in the event-id handshake with zm-api
+// over the worker socket: on open it emits recording_opening{clip_token,trigger};
+// zm-api replies assign_recording{clip_token,event_id,dir,video_name}, which we
+// apply by renaming the in-progress file (same filesystem; the open fd keeps
+// writing the same inode). On close it emits EventClip{event_id,path,...}. If no
+// reply arrives the clip keeps store's own naming (fallback). See the handshake
+// docs in docs/.
 //
 // Data flow:
-//   on_frame (capture thread):
-//     (a) append the packet to the rolling buffer (keyframe-aligned trimming),
-//     (b) if recording, write it to the open clip,
-//     (c) ALWAYS forward downstream via host->on_frame (pass-through).
-//   event callback (publisher thread, via host->subscribe_evt):
-//     - StreamMetadata events configure the video/audio codec params.
-//     - trigger events start a clip (writing pre-roll) and refresh last-trigger.
-//   A trailing finalize happens lazily in on_frame once post_roll elapses.
+//   on_frame (capture thread): (a) maintain rolling buffer (event mode) / drive
+//   segment open+rotate (continuous), (b) write to the open clip, (c) ALWAYS
+//   forward downstream via host->on_frame.
+//   event callback (publisher thread): StreamMetadata -> codec params; trigger
+//   events -> start/extend a clip (event/both); assign_recording -> stash for the
+//   capture thread; description -> sidecar.
 //
-// Lifetime: state is a raw, leaked struct handed to the host callback as `user`
-// plus an atomic `running`; we unsubscribe in stop() and finalize any open clip.
+// Lifetime: state is leaked on stop() so an in-flight host callback never dangles.
 
 #include "event_trigger.hpp"
 
@@ -43,7 +49,6 @@ extern "C" {
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -60,6 +65,8 @@ using json = nlohmann::json;
 namespace fs = std::filesystem;
 
 namespace {
+
+enum class Mode { Continuous, Event, Both };
 
 // ---------------------------------------------------------------------------
 // Codec parameters learned from StreamMetadata host events.
@@ -95,20 +102,22 @@ struct BufferedPacket {
 // ---------------------------------------------------------------------------
 // Plugin state. Leaked on stop() so an in-flight host callback never dangles.
 // ---------------------------------------------------------------------------
-struct StoreEventState {
+struct StoreState {
     // Config.
+    Mode mode = Mode::Continuous;
     std::string root;
     int monitor_id = 0;
-    int pre_roll_sec = 5;
-    int post_roll_sec = 10;
-    int max_buffer_sec = 15;
+    int max_secs = 300;                   // continuous: segment rotation length
+    int pre_roll_sec = 5;                 // event: seconds before the trigger
+    int post_roll_sec = 10;               // event: seconds after the last trigger
+    int max_buffer_sec = 15;              // event: rolling-buffer cap
     std::vector<std::string> trigger_types;
     std::vector<uint32_t> stream_filter;  // empty == accept all
 
     // Host.
     zm_host_api_t* host = nullptr;
     void* host_ctx = nullptr;
-    zm_plugin_t* plugin = nullptr;        // for pass-through forwarding
+    zm_plugin_t* plugin = nullptr;
     void* sub_handle = nullptr;
 
     // Lifetime gate for the host callback.
@@ -118,24 +127,22 @@ struct StoreEventState {
     // thread; the event callback is on the publisher thread).
     std::mutex mtx;
 
-    // Codec params learned from StreamMetadata.
     VideoParams video;
     AudioParams audio;
 
-    // Rolling pre-roll buffer (oldest at front). Keyframe-aligned trimming keeps
-    // a clip decodable.
+    // Rolling pre-roll buffer (event mode only).
     std::deque<BufferedPacket> buffer;
 
     // Recording state.
     bool recording = false;
-    int64_t last_trigger_usec = 0;        // wall-ish clock from frame pts
-    bool warned_no_codec = false;         // log-once when a trigger arrives early
+    int64_t last_trigger_usec = 0;
+    bool warned_no_codec = false;
 
     // Open muxer.
     std::unique_ptr<AVFormatContext, decltype(&avformat_free_context)> fmt_ctx{
         nullptr, avformat_free_context};
     bool header_written = false;
-    int64_t start_ts = 0;                 // pts_usec of first written packet
+    int64_t start_ts = 0;
     int64_t last_pts = 0;
     std::string cur_path;
     AVStream* video_stream = nullptr;
@@ -144,19 +151,39 @@ struct StoreEventState {
     // VLM "description" events captured during the current clip; written to a
     // sidecar JSON on close so recordings are searchable by description.
     std::vector<std::string> descriptions;
+
+    // --- event-id assignment handshake with zm-api (via the worker socket) -----
+    uint64_t clip_seq = 0;
+    std::string current_clip_token;
+    long current_event_id = 0;
+    bool clip_assigned = false;
+    int64_t frames_written = 0;
+    std::string current_cause;            // "continuous" | trigger type
+
+    // Pending assignment handed from the worker thread (event_cb) to the capture
+    // thread (handle_frame). Guarded by its OWN leaf mutex so event_cb never takes
+    // st->mtx while WorkerLink holds its lock (avoids a lock-order inversion).
+    std::mutex assign_mtx;
+    struct Assignment {
+        bool valid = false;
+        std::string clip_token;
+        long event_id = 0;
+        std::string dir;
+        std::string video_name;
+    };
+    Assignment pending_assign;
 };
 
-// Couples plugin->instance to the (leaked) state.
-struct StoreEventCtx {
+struct StoreCtx {
     zm_host_api_t* host = nullptr;
     void* host_ctx = nullptr;
-    StoreEventState* state = nullptr;
+    StoreState* state = nullptr;
 };
 
 // ---------------------------------------------------------------------------
 // Logging.
 // ---------------------------------------------------------------------------
-void slog(StoreEventState* st, zm_log_level_t level, const char* fmt, ...) {
+void slog(StoreState* st, zm_log_level_t level, const char* fmt, ...) {
     if (!st || !st->host || !st->host->log) return;
     va_list ap;
     va_start(ap, fmt);
@@ -176,7 +203,22 @@ std::string get_default_root() {
 #endif
 }
 
-// "{root}/{YYYY-MM-DD}/event-Monitor-{stream}-{HH-MM-SS}.mkv"
+Mode parse_mode(const std::string& s) {
+    if (s == "event") return Mode::Event;
+    if (s == "both") return Mode::Both;
+    return Mode::Continuous;  // default
+}
+
+const char* mode_name(Mode m) {
+    switch (m) {
+        case Mode::Event: return "event";
+        case Mode::Both: return "both";
+        default: return "continuous";
+    }
+}
+
+// "{root}/{YYYY-MM-DD}/event-Monitor-{stream}-{HH-MM-SS}.mkv" — store's own
+// naming, used as the recording target until zm-api assigns the ZM-tree path.
 std::string make_clip_path(const std::string& root, int monitor_id,
                            uint32_t stream_id, std::time_t t) {
     std::tm tm = *std::localtime(&t);
@@ -202,16 +244,16 @@ std::vector<uint8_t> b64_decode(const std::string& b64) {
     return out;
 }
 
-bool stream_allowed(const StoreEventState* st, uint32_t sid) {
+bool stream_allowed(const StoreState* st, uint32_t sid) {
     if (st->stream_filter.empty()) return true;
     return std::find(st->stream_filter.begin(), st->stream_filter.end(), sid) !=
            st->stream_filter.end();
 }
 
 // ---------------------------------------------------------------------------
-// Rolling buffer: append + keyframe-aligned trim. Caller holds st->mtx.
+// Rolling buffer (event mode): append + keyframe-aligned trim. Caller holds mtx.
 // ---------------------------------------------------------------------------
-void buffer_append(StoreEventState* st, const zm_frame_hdr_t* hdr,
+void buffer_append(StoreState* st, const zm_frame_hdr_t* hdr,
                    const uint8_t* payload) {
     BufferedPacket bp;
     bp.stream_id = hdr->stream_id;
@@ -221,9 +263,6 @@ void buffer_append(StoreEventState* st, const zm_frame_hdr_t* hdr,
     bp.data.assign(payload, payload + hdr->bytes);
     st->buffer.push_back(std::move(bp));
 
-    // Trim by duration. Window = pre_roll + a margin; never trim beyond
-    // max_buffer_sec. We must not drop past the last keyframe that precedes the
-    // retained window, so a future clip starts decodable.
     int window_sec = st->pre_roll_sec + 2;
     if (window_sec > st->max_buffer_sec) window_sec = st->max_buffer_sec;
     if (window_sec < 1) window_sec = 1;
@@ -232,8 +271,6 @@ void buffer_append(StoreEventState* st, const zm_frame_hdr_t* hdr,
     const int64_t newest = st->buffer.back().pts_usec;
     const int64_t cutoff = newest - window_usec;
 
-    // Find the index of the last keyframe at or before `cutoff`; everything
-    // strictly before it can be dropped. If no such keyframe exists, keep all.
     size_t drop_before = 0;
     bool found = false;
     for (size_t i = 0; i < st->buffer.size(); ++i) {
@@ -249,11 +286,8 @@ void buffer_append(StoreEventState* st, const zm_frame_hdr_t* hdr,
             st->buffer.pop_front();
     }
 
-    // Hard cap against runaway memory: if still older than max_buffer_sec, drop
-    // from the front to the next video keyframe.
     const int64_t hard_cutoff = newest - (int64_t)st->max_buffer_sec * 1000000;
     while (st->buffer.size() > 1 && st->buffer.front().pts_usec < hard_cutoff) {
-        // Only drop if doing so still leaves a keyframe to start from.
         bool keyframe_ahead = false;
         for (size_t i = 1; i < st->buffer.size(); ++i) {
             if (st->buffer[i].hw_type == (uint32_t)ZM_FRAME_COMPRESSED &&
@@ -268,14 +302,14 @@ void buffer_append(StoreEventState* st, const zm_frame_hdr_t* hdr,
 }
 
 // ---------------------------------------------------------------------------
-// Muxer open / write / close. Caller holds st->mtx.
+// Muxer open / write / close. Caller holds mtx.
 // ---------------------------------------------------------------------------
-bool open_clip(StoreEventState* st, uint32_t stream_id, std::time_t t) {
+bool open_clip(StoreState* st, uint32_t stream_id, std::time_t t) {
     if (!st->video.valid) {
         if (!st->warned_no_codec) {
             slog(st, ZM_LOG_WARN,
-                 "store_event: trigger before StreamMetadata known; cannot open "
-                 "clip yet (waiting for codec params)");
+                 "store: recording requested before StreamMetadata known; "
+                 "waiting for codec params");
             st->warned_no_codec = true;
         }
         return false;
@@ -284,27 +318,34 @@ bool open_clip(StoreEventState* st, uint32_t stream_id, std::time_t t) {
     st->cur_path = make_clip_path(st->root, st->monitor_id, stream_id, t);
     std::error_code ec;
     fs::create_directories(fs::path(st->cur_path).parent_path(), ec);
+    // 1-second filename resolution: disambiguate same-second segments.
+    if (fs::exists(st->cur_path)) {
+        const std::string stem = st->cur_path.substr(0, st->cur_path.size() - 4);
+        for (int n = 2;; ++n) {
+            std::string cand = stem + "-" + std::to_string(n) + ".mkv";
+            if (!fs::exists(cand)) { st->cur_path = cand; break; }
+        }
+    }
 
     AVFormatContext* ctx = nullptr;
     if (avformat_alloc_output_context2(&ctx, nullptr, "matroska",
                                        st->cur_path.c_str()) < 0 || !ctx) {
-        slog(st, ZM_LOG_ERROR, "store_event: alloc output ctx failed for %s",
+        slog(st, ZM_LOG_ERROR, "store: alloc output ctx failed for %s",
              st->cur_path.c_str());
         return false;
     }
     st->fmt_ctx.reset(ctx);
 
     if (avio_open(&ctx->pb, st->cur_path.c_str(), AVIO_FLAG_WRITE) < 0) {
-        slog(st, ZM_LOG_ERROR, "store_event: avio_open failed for %s",
+        slog(st, ZM_LOG_ERROR, "store: avio_open failed for %s",
              st->cur_path.c_str());
         st->fmt_ctx.reset();
         return false;
     }
 
-    // Video stream.
     AVStream* vst = avformat_new_stream(ctx, nullptr);
     if (!vst) {
-        slog(st, ZM_LOG_ERROR, "store_event: could not create video stream");
+        slog(st, ZM_LOG_ERROR, "store: could not create video stream");
         avio_closep(&ctx->pb);
         st->fmt_ctx.reset();
         return false;
@@ -330,7 +371,6 @@ bool open_clip(StoreEventState* st, uint32_t stream_id, std::time_t t) {
     vst->r_frame_rate = vst->avg_frame_rate;
     st->video_stream = vst;
 
-    // Audio stream (best-effort, must be added before write_header).
     st->audio_stream = nullptr;
     if (st->audio.valid) {
         AVStream* ast = avformat_new_stream(ctx, nullptr);
@@ -367,7 +407,7 @@ bool open_clip(StoreEventState* st, uint32_t stream_id, std::time_t t) {
     if (ret < 0) {
         char eb[AV_ERROR_MAX_STRING_SIZE];
         av_strerror(ret, eb, sizeof(eb));
-        slog(st, ZM_LOG_ERROR, "store_event: write_header failed: %s", eb);
+        slog(st, ZM_LOG_ERROR, "store: write_header failed: %s", eb);
         avio_closep(&ctx->pb);
         st->fmt_ctx.reset();
         st->video_stream = nullptr;
@@ -378,20 +418,17 @@ bool open_clip(StoreEventState* st, uint32_t stream_id, std::time_t t) {
     st->header_written = true;
     st->start_ts = 0;
     st->last_pts = 0;
-    slog(st, ZM_LOG_INFO, "store_event: opened clip %s", st->cur_path.c_str());
+    st->frames_written = 0;
+    slog(st, ZM_LOG_INFO, "store: opened clip %s", st->cur_path.c_str());
     return true;
 }
 
-void write_packet(StoreEventState* st, uint32_t hw_type, bool keyframe,
+void write_packet(StoreState* st, uint32_t hw_type, bool keyframe,
                   int64_t pts_usec, const uint8_t* data, size_t bytes) {
     if (!st->header_written || !st->fmt_ctx) return;
 
-    AVStream* target = nullptr;
-    if (hw_type == (uint32_t)ZM_FRAME_COMPRESSED_AUDIO) {
-        target = st->audio_stream;  // best-effort; null => drop audio
-    } else {
-        target = st->video_stream;
-    }
+    AVStream* target = (hw_type == (uint32_t)ZM_FRAME_COMPRESSED_AUDIO)
+                           ? st->audio_stream : st->video_stream;
     if (!target) return;
 
     if (st->start_ts == 0) st->start_ts = pts_usec;
@@ -415,14 +452,16 @@ void write_packet(StoreEventState* st, uint32_t hw_type, bool keyframe,
     if (ret < 0) {
         char eb[AV_ERROR_MAX_STRING_SIZE];
         av_strerror(ret, eb, sizeof(eb));
-        slog(st, ZM_LOG_ERROR, "store_event: write_frame failed: %s", eb);
+        slog(st, ZM_LOG_ERROR, "store: write_frame failed: %s", eb);
     }
-    if (hw_type != (uint32_t)ZM_FRAME_COMPRESSED_AUDIO)
+    if (hw_type != (uint32_t)ZM_FRAME_COMPRESSED_AUDIO) {
         st->last_pts = pts_usec;
+        ++st->frames_written;
+    }
     av_packet_free(&pkt);
 }
 
-void close_clip(StoreEventState* st) {
+void close_clip(StoreState* st) {
     if (!st->fmt_ctx) return;
     if (st->header_written) {
         av_write_trailer(st->fmt_ctx.get());
@@ -431,6 +470,9 @@ void close_clip(StoreEventState* st) {
 
     int64_t duration = st->last_pts - st->start_ts;
     std::string path = st->cur_path;
+    long ev_id = st->current_event_id;       // captured before the reset below
+    int64_t frames = st->frames_written;
+    std::string cause = st->current_cause;
     st->fmt_ctx.reset();
     st->header_written = false;
     st->video_stream = nullptr;
@@ -438,15 +480,20 @@ void close_clip(StoreEventState* st) {
     st->recording = false;
     st->start_ts = 0;
     st->last_pts = 0;
+    st->frames_written = 0;
+    st->current_clip_token.clear();
+    st->current_event_id = 0;
+    st->clip_assigned = false;
+    st->current_cause.clear();
 
     // Sidecar JSON next to the clip — the VLM descriptions captured during the
-    // event, so recordings are searchable/greppable by what was seen. Written as
-    // "<clip>.json" (e.g. event-Monitor-0-...-.mkv.json).
+    // event, so recordings are searchable/greppable by what was seen.
     {
         json side;
         side["clip"] = fs::path(path).filename().string();
         side["path"] = path;
         side["duration_usec"] = duration;
+        side["cause"] = cause;
         side["descriptions"] = json::array();
         std::string joined;
         for (const auto& d : st->descriptions) {
@@ -459,26 +506,32 @@ void close_clip(StoreEventState* st) {
                 }
             } catch (const std::exception&) { /* skip malformed */ }
         }
-        side["text"] = joined;   // flat, grep-friendly summary of all descriptions
+        side["text"] = joined;
         const std::string side_path = path + ".json";
         std::ofstream f(side_path);
         if (f) { f << side.dump(2); }
-        slog(st, ZM_LOG_INFO, "store_event: wrote sidecar %s (%zu descriptions)",
+        slog(st, ZM_LOG_INFO, "store: wrote sidecar %s (%zu descriptions)",
              side_path.c_str(), st->descriptions.size());
     }
     st->descriptions.clear();
 
     if (st->host && st->host->publish_evt) {
-        json ev = {{"event", "EventClip"}, {"path", path}, {"duration", duration}};
+        // recording_saved: echo zm-api's assigned event_id (0 if unassigned), the
+        // final path, cause, duration in seconds, and the video frame count.
+        json ev = {{"event", "EventClip"},
+                   {"event_id", ev_id},
+                   {"path", path},
+                   {"cause", cause},
+                   {"duration", duration / 1e6},
+                   {"frames", frames}};
         st->host->publish_evt(st->host_ctx, ev.dump().c_str());
     }
-    slog(st, ZM_LOG_INFO, "store_event: closed clip %s (duration=%lld)",
-         path.c_str(), (long long)duration);
+    slog(st, ZM_LOG_INFO,
+         "store: closed clip %s (event_id=%ld, cause=%s, duration=%.2fs, frames=%lld)",
+         path.c_str(), ev_id, cause.c_str(), duration / 1e6, (long long)frames);
 }
 
-// Flush the entire rolling buffer (pre-roll) into the freshly opened clip. The
-// buffer already starts at/before a video keyframe. Caller holds st->mtx.
-void write_preroll(StoreEventState* st) {
+void write_preroll(StoreState* st) {
     for (const auto& pk : st->buffer) {
         write_packet(st, pk.hw_type, pk.keyframe, pk.pts_usec, pk.data.data(),
                      pk.data.size());
@@ -486,21 +539,73 @@ void write_preroll(StoreEventState* st) {
 }
 
 // ---------------------------------------------------------------------------
-// Trigger handling — invoked from the host event callback.
+// Recording open + event-id handshake.
 // ---------------------------------------------------------------------------
-void start_recording(StoreEventState* st, uint32_t stream_id, int64_t now_usec) {
+// Open a recording (segment or event clip) and start the zm-api event-id
+// handshake. `cause` is the ZM event cause ("continuous" or the trigger type).
+// Caller holds mtx.
+bool open_recording(StoreState* st, uint32_t stream_id, const std::string& cause,
+                    bool with_preroll) {
     std::time_t wall = std::time(nullptr);
-    if (!open_clip(st, stream_id, wall)) {
-        return;  // codec params not ready, etc. (already logged)
-    }
+    if (!open_clip(st, stream_id, wall)) return false;
     st->recording = true;
-    st->descriptions.clear();   // fresh sidecar for this clip
-    write_preroll(st);
-    st->last_trigger_usec = now_usec;
+    st->descriptions.clear();
+    st->current_cause = cause;
+    st->current_clip_token = std::to_string(st->monitor_id) + "-" +
+                             std::to_string((long long)wall) + "-" +
+                             std::to_string(++st->clip_seq);
+    st->current_event_id = 0;
+    st->clip_assigned = false;
+
+    if (with_preroll) write_preroll(st);
+
+    // Ask zm-api to allocate the ZM event id + target path.
+    if (st->host && st->host->publish_evt) {
+        json req = {{"event", "RecordingOpening"},
+                    {"clip_token", st->current_clip_token},
+                    {"trigger", cause}};
+        st->host->publish_evt(st->host_ctx, req.dump().c_str());
+    }
+    slog(st, ZM_LOG_INFO, "store: recording_opening token=%s cause=%s",
+         st->current_clip_token.c_str(), cause.c_str());
+    return true;
 }
 
-// StreamMetadata event -> configure codec params. Caller holds st->mtx.
-void apply_stream_metadata(StoreEventState* st, const json& j) {
+// Apply a pending event-id assignment from zm-api: rename the in-progress clip
+// from store's own-naming path to zm-api's target. The open avio fd keeps writing
+// the same inode after rename (POSIX, same filesystem); a cross-filesystem move
+// fails and we keep the own-naming file as a fallback. Caller holds mtx.
+void apply_pending_assignment(StoreState* st) {
+    if (st->clip_assigned || !st->recording) return;
+    StoreState::Assignment a;
+    {
+        std::lock_guard<std::mutex> lk(st->assign_mtx);
+        if (!st->pending_assign.valid) return;
+        if (st->pending_assign.clip_token != st->current_clip_token) return;
+        a = st->pending_assign;
+        st->pending_assign.valid = false;
+    }
+    st->current_event_id = a.event_id;
+    st->clip_assigned = true;
+    if (a.dir.empty() || a.video_name.empty()) return;  // id only, keep own naming
+
+    std::error_code ec;
+    fs::create_directories(a.dir, ec);
+    const std::string target = a.dir + "/" + a.video_name;
+    fs::rename(st->cur_path, target, ec);
+    if (ec) {
+        slog(st, ZM_LOG_WARN,
+             "store: could not move clip to %s (%s); keeping %s",
+             target.c_str(), ec.message().c_str(), st->cur_path.c_str());
+    } else {
+        slog(st, ZM_LOG_INFO, "store: assigned event_id=%ld, clip -> %s",
+             a.event_id, target.c_str());
+        st->cur_path = target;
+    }
+}
+
+// StreamMetadata event -> configure codec params. Caller holds mtx.
+void apply_stream_metadata(StoreState* st, const json& j) {
     std::string media = j.value("media", std::string());
     uint32_t sid = j.value("stream_id", 0u);
     if (!stream_allowed(st, sid)) return;
@@ -513,11 +618,9 @@ void apply_stream_metadata(StoreEventState* st, const json& j) {
         ap.extradata = b64_decode(j.value("extradata", std::string()));
         ap.valid = true;
         st->audio = std::move(ap);
-        slog(st, ZM_LOG_INFO,
-             "store_event: audio metadata codec_id=%d rate=%d ch=%d",
+        slog(st, ZM_LOG_INFO, "store: audio metadata codec_id=%d rate=%d ch=%d",
              ap.codec_id, ap.sample_rate, ap.channels);
     } else {
-        // Treat anything non-audio (including unset media) as video.
         VideoParams vp;
         vp.codec_id = j.value("codec_id", 0);
         vp.width = j.value("width", 0);
@@ -528,14 +631,13 @@ void apply_stream_metadata(StoreEventState* st, const json& j) {
         vp.extradata = b64_decode(j.value("extradata", std::string()));
         vp.valid = true;
         st->video = std::move(vp);
-        slog(st, ZM_LOG_INFO,
-             "store_event: video metadata codec_id=%d %dx%d",
+        slog(st, ZM_LOG_INFO, "store: video metadata codec_id=%d %dx%d",
              vp.codec_id, vp.width, vp.height);
     }
 }
 
 void event_cb(void* user, const char* json_event) {
-    auto* st = static_cast<StoreEventState*>(user);
+    auto* st = static_cast<StoreState*>(user);
     if (!st || !st->running.load(std::memory_order_acquire) || !json_event)
         return;
 
@@ -546,7 +648,22 @@ void event_cb(void* user, const char* json_event) {
         return;
     }
 
-    // StreamMetadata configures the encoder/stream.
+    // Inbound control command from zm-api, re-published on the bus by zm-core.
+    // Stash under the leaf lock (NOT st->mtx) so it never blocks capture nor nests
+    // st->mtx under WorkerLink's lock; handle_frame applies it on the capture thread.
+    if (j.contains("cmd")) {
+        if (j["cmd"] == "assign_recording") {
+            std::lock_guard<std::mutex> lk(st->assign_mtx);
+            st->pending_assign = StoreState::Assignment{
+                /*valid=*/true,
+                j.value("clip_token", std::string()),
+                static_cast<long>(j.value("event_id", 0)),
+                j.value("dir", std::string()),
+                j.value("video_name", std::string())};
+        }
+        return;
+    }
+
     if (j.value("event", std::string()) == "StreamMetadata") {
         std::lock_guard<std::mutex> lk(st->mtx);
         apply_stream_metadata(st, j);
@@ -557,8 +674,7 @@ void event_cb(void* user, const char* json_event) {
     if (j.contains("type") && j["type"].is_string())
         type = j["type"].get<std::string>();
 
-    // Capture VLM scene descriptions that land during an active clip; they're
-    // written to the sidecar JSON on close (see close_clip).
+    // Capture VLM scene descriptions that land during an active clip.
     if (type == "description") {
         std::lock_guard<std::mutex> lk(st->mtx);
         if (st->recording && stream_allowed(st, j.value("stream_id", 0u)))
@@ -566,53 +682,76 @@ void event_cb(void* user, const char* json_event) {
         return;
     }
 
-    // Trigger detection: an event "type" in the configured trigger set.
-    if (!zm::storeevent::is_trigger(st->trigger_types, type))
-        return;
+    // Continuous mode ignores triggers; segments are time-driven (handle_frame).
+    if (st->mode == Mode::Continuous) return;
+    if (!zm::storeevent::is_trigger(st->trigger_types, type)) return;
 
     uint32_t sid = j.value("stream_id", 0u);
     if (!stream_allowed(st, sid)) return;
 
     std::lock_guard<std::mutex> lk(st->mtx);
-    // Use the newest buffered frame's clock as "now" (frames carry the canonical
-    // microsecond clock); fall back to 0 if the buffer is empty.
-    int64_t now_usec = st->buffer.empty() ? 0 : st->buffer.back().pts_usec;
+    int64_t now_usec = st->buffer.empty() ? st->last_pts : st->buffer.back().pts_usec;
 
-    if (!st->recording) {
-        start_recording(st, sid, now_usec);
-    } else {
-        st->last_trigger_usec = now_usec;  // extend the post-roll window
+    if (st->mode == Mode::Both) {
+        // Continuous file is (or will be) recording; a trigger just sets the
+        // segment's cause (and its descriptions are captured above).
+        if (st->recording) st->current_cause = type;
+        st->last_trigger_usec = now_usec;
+        return;
     }
+
+    // Event mode: a trigger starts a clip (writing pre-roll) or extends post-roll.
+    if (!st->recording) {
+        open_recording(st, sid, type, /*with_preroll=*/true);
+    }
+    st->last_trigger_usec = now_usec;
 }
 
 // ---------------------------------------------------------------------------
 // Frame handling — capture thread.
 // ---------------------------------------------------------------------------
-void forward_downstream(StoreEventState* st, const void* buf, size_t size) {
+void forward_downstream(StoreState* st, const void* buf, size_t size) {
     if (st->host && st->host->on_frame)
         st->host->on_frame(st->host_ctx, buf, size);
 }
 
-void handle_frame(zm_plugin_t* plugin, const void* buf, size_t size) {
-    auto* ctx = static_cast<StoreEventCtx*>(plugin->instance);
-    if (!ctx || !ctx->state || !buf) return;
-    StoreEventState* st = ctx->state;
+// Continuous/both: drive segment open + keyframe-aligned rotation. Caller holds
+// mtx. Returns once the muxer is ready (or not yet) for this frame.
+void drive_continuous(StoreState* st, const zm_frame_hdr_t* hdr) {
+    const bool is_video = hdr->hw_type == (uint32_t)ZM_FRAME_COMPRESSED;
+    const bool keyframe = (hdr->flags & 1u) != 0;
+    if (!st->recording) {
+        // Lazily open on the first video keyframe once codec params are known, so
+        // the segment starts decodable and no orphan empty file is left.
+        if (is_video && keyframe && st->video.valid)
+            open_recording(st, hdr->stream_id, "continuous", /*with_preroll=*/false);
+        return;
+    }
+    // Rotate at a keyframe boundary once the segment reaches max_secs.
+    if (is_video && keyframe && st->start_ts != 0) {
+        int64_t elapsed = ((int64_t)hdr->pts_usec - st->start_ts) / 1000000;
+        if (elapsed >= st->max_secs) {
+            close_clip(st);
+            open_recording(st, hdr->stream_id, "continuous", /*with_preroll=*/false);
+        }
+    }
+}
 
-    // JSON metadata events may also arrive inline as frames (buffer starts '{').
-    // We rely on the host event subscription for codec params, so just forward.
+void handle_frame(zm_plugin_t* plugin, const void* buf, size_t size) {
+    auto* ctx = static_cast<StoreCtx*>(plugin->instance);
+    if (!ctx || !ctx->state || !buf) return;
+    StoreState* st = ctx->state;
+
     if (size > 0 && static_cast<const char*>(buf)[0] == '{') {
         forward_downstream(st, buf, size);
         return;
     }
-
     if (size < sizeof(zm_frame_hdr_t)) {
         forward_downstream(st, buf, size);
         return;
     }
 
     const zm_frame_hdr_t* hdr = static_cast<const zm_frame_hdr_t*>(buf);
-
-    // Only buffer/record compressed CPU media; everything still forwards.
     bool is_video = hdr->hw_type == (uint32_t)ZM_FRAME_COMPRESSED;
     bool is_audio = hdr->hw_type == (uint32_t)ZM_FRAME_COMPRESSED_AUDIO;
 
@@ -624,23 +763,29 @@ void handle_frame(zm_plugin_t* plugin, const void* buf, size_t size) {
 
         std::lock_guard<std::mutex> lk(st->mtx);
 
-        // (a) append to rolling buffer.
-        buffer_append(st, hdr, payload);
-
-        // (b) if recording, write this packet, and check post-roll expiry.
-        if (st->recording) {
-            write_packet(st, hdr->hw_type, (hdr->flags & 1u) != 0,
-                         (int64_t)hdr->pts_usec, payload, hdr->bytes);
-
-            int64_t now_usec = (int64_t)hdr->pts_usec;
-            int64_t since = now_usec - st->last_trigger_usec;
-            if (since > (int64_t)st->post_roll_sec * 1000000) {
-                close_clip(st);
+        if (st->mode == Mode::Event) {
+            // (a) keep the rolling pre-roll buffer.
+            buffer_append(st, hdr, payload);
+            // (b) if recording, apply any assignment, write, check post-roll.
+            if (st->recording) {
+                apply_pending_assignment(st);
+                write_packet(st, hdr->hw_type, (hdr->flags & 1u) != 0,
+                             (int64_t)hdr->pts_usec, payload, hdr->bytes);
+                int64_t since = (int64_t)hdr->pts_usec - st->last_trigger_usec;
+                if (since > (int64_t)st->post_roll_sec * 1000000)
+                    close_clip(st);
+            }
+        } else {
+            // continuous / both: open + rotate segments, write every frame.
+            drive_continuous(st, hdr);
+            if (st->recording) {
+                apply_pending_assignment(st);
+                write_packet(st, hdr->hw_type, (hdr->flags & 1u) != 0,
+                             (int64_t)hdr->pts_usec, payload, hdr->bytes);
             }
         }
     }
 
-    // (c) always forward downstream (pass-through).
     forward_downstream(st, buf, size);
 }
 
@@ -651,15 +796,17 @@ int handle_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx,
                  const char* json_cfg) {
     zm_plugin_set_log_context(host, host_ctx);
 
-    auto* st = new StoreEventState();  // leaked on stop (see StoreEventCtx)
+    auto* st = new StoreState();  // leaked on stop (see StoreCtx)
     st->host = host;
     st->host_ctx = host_ctx;
     st->plugin = plugin;
 
     try {
         auto j = json::parse(json_cfg ? json_cfg : "{}");
+        st->mode = parse_mode(j.value("mode", std::string("continuous")));
         st->root = j.value("root", get_default_root());
         st->monitor_id = j.value("monitor_id", 0);
+        st->max_secs = j.value("max_secs", 300);
         st->pre_roll_sec = j.value("pre_roll_sec", 5);
         st->post_roll_sec = j.value("post_roll_sec", 10);
         st->max_buffer_sec = j.value("max_buffer_sec", 15);
@@ -673,7 +820,7 @@ int handle_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx,
                     st->stream_filter.push_back(s.get<uint32_t>());
         }
     } catch (...) {
-        slog(st, ZM_LOG_ERROR, "store_event: invalid config JSON");
+        slog(st, ZM_LOG_ERROR, "store: invalid config JSON");
         delete st;
         return -1;
     }
@@ -685,23 +832,22 @@ int handle_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx,
     if (host && host->subscribe_evt)
         st->sub_handle = host->subscribe_evt(host_ctx, &event_cb, st);
 
-    auto* ctx = new StoreEventCtx{host, host_ctx, st};
+    auto* ctx = new StoreCtx{host, host_ctx, st};
     plugin->instance = ctx;
 
     slog(st, ZM_LOG_INFO,
-         "store_event: started root=%s pre_roll=%d post_roll=%d max_buffer=%d",
-         st->root.c_str(), st->pre_roll_sec, st->post_roll_sec,
-         st->max_buffer_sec);
+         "store: started mode=%s root=%s max_secs=%d pre_roll=%d post_roll=%d",
+         mode_name(st->mode), st->root.c_str(), st->max_secs,
+         st->pre_roll_sec, st->post_roll_sec);
     return 0;
 }
 
 void handle_stop(zm_plugin_t* plugin) {
     if (!plugin || !plugin->instance) return;
-    auto* ctx = static_cast<StoreEventCtx*>(plugin->instance);
-    StoreEventState* st = ctx->state;
+    auto* ctx = static_cast<StoreCtx*>(plugin->instance);
+    StoreState* st = ctx->state;
 
     if (st) {
-        // Stop callbacks first, then disarm any in-flight.
         if (ctx->host && ctx->host->unsubscribe_evt)
             ctx->host->unsubscribe_evt(ctx->host_ctx, st->sub_handle);
         st->running.store(false, std::memory_order_release);
@@ -710,8 +856,7 @@ void handle_stop(zm_plugin_t* plugin) {
         if (st->recording || st->fmt_ctx) close_clip(st);
     }
 
-    // `st` is intentionally leaked so a late callback can't dangle.
-    delete ctx;
+    delete ctx;  // `st` is intentionally leaked so a late callback can't dangle.
     plugin->instance = nullptr;
 }
 
@@ -721,7 +866,7 @@ extern "C" __attribute__((visibility("default"))) void zm_plugin_init(
     zm_plugin_t* plugin) {
     if (!plugin) return;
     plugin->version = ZM_PLUGIN_ABI_VERSION;
-    plugin->type = ZM_PLUGIN_PROCESS;
+    plugin->type = ZM_PLUGIN_STORE;
     plugin->instance = nullptr;
     plugin->start = handle_start;
     plugin->stop = handle_stop;

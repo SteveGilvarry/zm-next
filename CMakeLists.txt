@@ -90,10 +90,7 @@ endif()
 include(CTest)
 enable_testing()
 
-# Worker interface contract (protobuf codegen from proto/worker_link.proto)
-add_subdirectory(proto)
-
-# Core library
+# Core library (includes the canonical stream socket protocol + WorkerLink)
 add_subdirectory(core)
 
 # Plugins
@@ -110,10 +107,10 @@ target_include_directories(zm-core PRIVATE ${Boost_INCLUDE_DIRS} /opt/homebrew/i
 # ========================================
 # TOOLS
 # ========================================
-# wl_dump: live worker-socket probe (connects, subscribes, prints framed protobuf).
-# Links zm_proto only (vcpkg protobuf, no Boost/Homebrew protobuf collision).
+# wl_dump: live worker-socket probe — connects as a canonical consumer and prints
+# every framed message (Hello / Media / Keyframe / Stats / Event / Bye).
 add_executable(wl_dump tools/wl_dump.cpp)
-target_link_libraries(wl_dump PRIVATE zm_proto)
+target_link_libraries(wl_dump PRIVATE zm_stream_protocol)
 target_compile_features(wl_dump PRIVATE cxx_std_20)
 
 # Integration smoke test: drives the built zm-core + plugins through capture_file

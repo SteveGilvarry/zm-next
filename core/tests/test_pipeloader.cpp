@@ -49,7 +49,7 @@ TEST(PipelineLoaderTest, JsonTreePreservesChildren) {
     {
         std::ofstream o(f);
         o << R"({"plugins":[{"kind":"capture_rtsp_multi","children":[)"
-             R"({"kind":"decode_ffmpeg","children":[{"kind":"detect_onnx"},{"kind":"store_filesystem"}]})"
+             R"({"kind":"decode_ffmpeg","children":[{"kind":"detect_onnx"},{"kind":"store"}]})"
              R"(]}]})";
     }
     PipelineLoader loader(f, true);

@@ -40,8 +40,8 @@
         },
         {
           "id": "store",
-          "kind": "store_filesystem",
-          "cfg": { "root": "/tmp/zm_e2e_rec", "monitor_id": 1 },
+          "kind": "store",
+          "cfg": { "mode": "continuous", "root": "/tmp/zm_e2e_rec", "monitor_id": 1 },
           "queue_depth": 120
         }
       ]

@@ -1,7 +1,7 @@
 {
   "name": "person_alert",
   "root": true,
-  "comment": "Person-gated record + RICH notify. Cascade: camera -> motion-gated YOLO (decode_detect, class_filter=[0]=person only). A person detection event fans out to: store_event (pre/post-roll clip), describe_vlm (VLM describes the frame, triggered by the detection), and output_mqtt. output_mqtt publishes the bare detection to zm-next/detection AND the VLM description+detection (a single rich alert: text + label/bbox/confidence) to zm-next/description. Needs an MQTT broker (`mosquitto -p 1883`) and a local VLM server (bench/metal/run_mlx_vlm_server.sh). Fill in camera URL, model_path, and the VLM model id; on Apple decode_detect auto-selects Metal/ANE. Watch: mosquitto_sub -t 'zm-next/#' -v",
+  "comment": "Person-gated record + RICH notify. Cascade: camera -> motion-gated YOLO (decode_detect, class_filter=[0]=person only). A person detection event fans out to: store (mode=event, pre/post-roll clip), describe_vlm (VLM describes the frame, triggered by the detection), and output_mqtt. output_mqtt publishes the bare detection to zm-next/detection AND the VLM description+detection (a single rich alert: text + label/bbox/confidence) to zm-next/description. Needs an MQTT broker (`mosquitto -p 1883`) and a local VLM server (bench/metal/run_mlx_vlm_server.sh). Fill in camera URL, model_path, and the VLM model id; on Apple decode_detect auto-selects Metal/ANE. Watch: mosquitto_sub -t 'zm-next/#' -v",
   "plugins": [
     { "id": "capture", "kind": "capture_rtsp_multi",
       "cfg": { "streams": [ { "stream_id": 0, "url": "rtsp://USER:PASS@CAMERA:554/Streaming/Channels/102", "transport": "tcp" } ] },
@@ -11,8 +11,8 @@
                    "input_size": 640, "conf_threshold": 0.40,
                    "class_filter": [0], "roi_motion": true },
           "queue_depth": 2 },
-        { "id": "record", "kind": "store_event",
-          "cfg": { "root": "/data/events", "trigger_types": ["detection"],
+        { "id": "record", "kind": "store",
+          "cfg": { "mode": "event", "root": "/data/events", "trigger_types": ["detection"],
                    "pre_roll_sec": 5, "post_roll_sec": 10 },
           "queue_depth": 120 },
         { "id": "decode", "kind": "decode_ffmpeg",

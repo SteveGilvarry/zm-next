@@ -21,8 +21,8 @@
       "children": [
         {
           "id": "record_main",
-          "kind": "store_filesystem",
-          "cfg": { "root": "/var/lib/zm/recordings", "monitor_id": 1, "max_secs": 300, "stream_filter": [0] },
+          "kind": "store",
+          "cfg": { "mode": "continuous", "root": "/var/lib/zm/recordings", "monitor_id": 1, "max_secs": 300, "stream_filter": [0] },
           "queue_depth": 120
         },
         {

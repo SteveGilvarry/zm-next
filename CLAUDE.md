@@ -95,7 +95,10 @@ settings via the cached `ZM_FFMPEG_INCLUDES` / `ZM_FFMPEG_LIBDIRS` / `ZM_FFMPEG_
 - `motion_hybrid` — older combined motion plugin (see its `MIGRATION_GUIDE.md`).
 - `output_webrtc` — H.264 WebRTC streaming via `LibDataChannel` (vcpkg).
 - `output_mse` — Media Source Extensions streaming output.
-- `store_filesystem` — writes media to disk.
+- `store` — unified recorder; `mode` = `continuous` (time-rotated segments) | `event`
+  (triggered pre/post-roll clips) | `both`. Writes media to disk and runs the zm-api
+  event-id assignment handshake (recording_opening → assign_recording → EventClip).
+  Replaces the former `store_filesystem` + `store_event`.
 - `hello` — minimal reference plugin / `PluginManager` test fixture.
 
 The modular motion design (`zones` → `motion_pixel_diff` → output, replacing monolithic motion plugins)

@@ -86,10 +86,12 @@ optional with the defaults shown. Common keys:
   `event_types` (filter; empty = all).
 - **output_webrtc** / **output_mse** — `port`, `stream_filter`, client limits
   (video output is being superseded by the zm-api front door).
-- **store_filesystem** — `root`, `stream_filter` (records video + audio).
-- **store_event** — `root`, `pre_roll_sec` (5), `post_roll_sec` (10),
+- **store** — unified recorder. `mode` (`continuous` | `event` | `both`, default
+  `continuous`), `root`, `monitor_id`, `stream_filter`. Continuous: `max_secs` (300,
+  segment rotation). Event/both: `pre_roll_sec` (5), `post_roll_sec` (10),
   `trigger_types` (["motion","detection","audio_event","tracked_detection"]),
-  `max_buffer_sec` (15), `stream_filter`.
+  `max_buffer_sec` (15). Each clip/segment is a ZM event assigned an id by zm-api
+  via the recording_opening → assign_recording → EventClip handshake.
 - **store_snapshot** — `root`, `trigger_types`, `min_interval_ms` (2000),
   `jpeg_quality` (2–31, lower=better), `frame_width`/`frame_height`,
   `stream_filter`.
@@ -99,6 +101,6 @@ optional with the defaults shown. Common keys:
 Detectors publish events (`detection`, `pose`, `segmentation`, `face`, `lpr`,
 `audio_event`); **tracker** consumes `detection` → emits `tracked_detection`
 (adds `track_id`); **analytics_rules** consumes `tracked_detection` → emits
-`analytics`; **store_event** / **store_snapshot** / **output_mqtt** /
+`analytics`; **store** (mode=event/both) / **store_snapshot** / **output_mqtt** /
 **output_webhook** consume any of these as triggers. All cross-plugin events flow
 through the host event API (`subscribe_evt`/`publish_evt`).
