@@ -12,7 +12,7 @@ shared libraries communicating through a stable C ABI.
 ## Build & Test
 
 The project uses CMake + vcpkg (for `LibDataChannel`) and depends on Homebrew packages (FFmpeg ≥ 7.0,
-xsimd, nlohmann-json, Boost, SQLite3). `VCPKG_ROOT` must be set or vcpkg present at `~/vcpkg`.
+xsimd, nlohmann-json, Boost). `VCPKG_ROOT` must be set or vcpkg present at `~/vcpkg`.
 
 ```bash
 ./build.sh            # configure (Debug) + build into build/
@@ -69,7 +69,8 @@ Plugin logging/event helpers (`zm_plugin_log_info`, `ZM_LOG_*` C++ macros, `zm_p
 
 ### Core library (`core/`, builds `libzmcore.a`)
 
-- **PipelineLoader** — parses a pipeline from JSON (`isJson=true`) or a SQLite DB. JSON uses a recursive
+- **PipelineLoader** — parses a pipeline from a JSON file (pushed by the orchestrating daemon; zm-next
+  has no DB connection). JSON uses a recursive
   tree of plugin nodes, each with `id`, `kind` (or explicit `path`), `cfg` (or `config`), and `children`;
   the loader **flattens** this tree into an ordered `vector<PluginConfig>`. When `kind` is given (not an
   explicit `path`), the `.so`/`.dylib` is resolved as `plugins/<kind>/<kind><ext>` **relative to the
@@ -81,7 +82,8 @@ Plugin logging/event helpers (`zm_plugin_log_info`, `ZM_LOG_*` C++ macros, `zm_p
 - **ShmRing** — lock-free shared-memory ring buffer (Boost.Interprocess, named `zm_shmring`) for
   cross-process/thread frame transport.
 - **EventBus** — thread-safe in-process singleton pub/sub (`EventBus::instance()`) for metadata events.
-- **monitor.cpp** — `startMonitor(monitorId)` entry point for DB-backed pipelines.
+- **WorkerLink** (`core/src/WorkerLink.cpp`) — the per-monitor Unix-socket server speaking the canonical
+  stream-socket protocol (`core/src/stream_socket_protocol.cpp`): media + EVENT push, optional control.
 
 ### Plugins (`plugins/`, each builds a `SHARED`/`MODULE` lib with `PREFIX ""`)
 

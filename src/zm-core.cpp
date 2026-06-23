@@ -32,7 +32,7 @@ void print_usage(const char* prog) {
     std::cout << "       or: " << prog << " --pipelines-dir <dir>\n";
     std::cout << "Options:\n";
     std::cout << "  --socket <path>      Unix socket for the worker link (media+events+control)\n";
-    std::cout << "  --monitor-id <id>    Monitor id stamped into the protobuf frames\n";
+    std::cout << "  --monitor-id <id>    Monitor id for this worker (per-monitor socket)\n";
 }
 
 int main(int argc, char** argv) {
@@ -73,14 +73,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Determine if file is JSON or DB by extension.
-    // NOTE: the SQLite (DB-pull) path is deprecated — pipeline config is now
-    // pushed by the orchestrating daemon as a JSON file. Kept for tests only.
-    bool isJson = false;
-    if (pipelineFile.size() > 5 && pipelineFile.substr(pipelineFile.size()-5) == ".json")
-        isJson = true;
-
-    PipelineLoader loader(pipelineFile, isJson);
+    // Pipeline config is a JSON file pushed by the orchestrating daemon (zm-api);
+    // zm-next has no DB connection.
+    PipelineLoader loader(pipelineFile);
     if (!loader.load()) {
         std::cerr << "Failed to load pipeline: " << pipelineFile << std::endl;
         return 3;
@@ -137,7 +132,7 @@ int main(int argc, char** argv) {
 
         // Bridge in-process telemetry to the link. Plugins publish JSON events on
         // the "plugin_event" channel (see PluginManager/CaptureThread host API);
-        // WorkerLink maps them onto protobuf Event frames.
+        // WorkerLink maps them onto canonical stream-socket EVENT frames.
         WorkerLink* wl = link.get();
         EventBus::instance().subscribe("plugin_event", [wl](const std::string& evt) {
             // Inbound plugin-targeted commands are re-published on this same bus to

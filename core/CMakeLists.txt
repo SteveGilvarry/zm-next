@@ -11,7 +11,6 @@ FetchContent_MakeAvailable(googletest)
 
 find_package(Boost REQUIRED)
 find_package(Threads REQUIRED)
-find_package(SQLite3 REQUIRED)
 find_package(nlohmann_json 3.2.0 REQUIRED)
 
 # Canonical per-monitor stream socket wire protocol (byte-compatible with the
@@ -48,7 +47,6 @@ target_link_libraries(zmcore PUBLIC zm_stream_protocol)
 # PUBLIC: ShmRing.hpp exposes Boost.Interprocess, so consumers (tests, plugins)
 # need the Boost include too.
 target_include_directories(zmcore PUBLIC ${Boost_INCLUDE_DIRS})
-target_link_libraries(zmcore PRIVATE SQLite::SQLite3)
 
 # Unit tests for ShmRing
 enable_testing()
@@ -71,8 +69,7 @@ add_test(NAME PluginManagerTest COMMAND $<TARGET_FILE:test_plugin_manager>)
 
 # Unit tests for PipelineLoader
 add_executable(test_pipeloader tests/test_pipeloader.cpp)
-target_include_directories(test_pipeloader PRIVATE ${SQLite3_INCLUDE_DIRS})
-target_link_libraries(test_pipeloader PRIVATE zmcore GTest::gtest_main Threads::Threads ${SQLite3_LIBRARIES})
+target_link_libraries(test_pipeloader PRIVATE zmcore GTest::gtest_main Threads::Threads)
 add_test(NAME PipelineLoaderTest COMMAND $<TARGET_FILE:test_pipeloader>)
 
 # Unit tests for StageRunner (per-stage threading + drop-queue)

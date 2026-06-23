@@ -36,9 +36,9 @@ on a signal. All persistence, policy, auth, and viewer fan-out live upstream.
                           ▼
                   zm-api (control plane)        owns DB · config · auth · orchestration
                           │
-                          │   ══ one Unix-domain socket per monitor, length-prefixed protobuf ══
+                          │   ══ one Unix-domain socket per monitor, canonical binary stream protocol ══
                           │   ◄── push:  Hello · Media · Keyframe · Stats · Event(detection) · Bye
-                          │   ──► pull:  Subscribe · Command · Talkback   ◄── Response
+                          │   ──► pull:  Subscribe · Command · Talkback   ◄── Response  (extension)
                           ▼
    ┌──────────────────────────── zm-core (one process per monitor) ────────────────────────────┐
    │                                                                                            │
@@ -58,9 +58,10 @@ on a signal. All persistence, policy, auth, and viewer fan-out live upstream.
 - **🧵 Per-stage threading** — a slow AI detector can't stall recording or streaming. Each non-input
   plugin runs on its own thread with a **bounded, drop-oldest** queue (`queue_depth` per node), so
   load is shed at the stage that's overloaded, never propagated backwards.
-- **🔌 Schema-first worker contract** — a single `worker_link.proto` is the source of truth; the C++
-  worker and the Rust control plane both codegen from it. The bulk media payload rides *alongside*
-  the protobuf (`writev`, refcounted buffers) — **zero payload copies**.
+- **🔌 One canonical worker protocol** — a 24-byte binary stream-socket wire (byte-compatible with the
+  ZoneMinder `zmc` producer and the Rust control plane's consumer); media (Annex-B) + TLV `Hello`/`Event`
+  on one socket. The bulk media payload rides *alongside* the header (`writev`, refcounted buffers) —
+  **zero payload copies**.
 - **🎥 Codec & hardware aware** — `decode_ffmpeg` auto-detects the input codec (H.264/HEVC/MJPEG/…)
   from the stream handshake and supports configurable hwaccel (CUDA / VideoToolbox / VAAPI / QSV).
   Audio is carried end-to-end; two-way audio (talkback) is in the contract.
@@ -82,7 +83,7 @@ on a signal. All persistence, policy, auth, and viewer fan-out live upstream.
 | **Audio** | `audio_detect` (windowed audio event classification) |
 | **Track / Analyze / Understand** | `tracker` (IOU/SORT-style), `analytics_rules` (intrusion / line-cross / loiter), `describe_vlm` (scene description via a VLM server) |
 | **Output** | `output_webrtc`, `output_mse`, `output_mqtt`, `output_webhook` |
-| **Store** | `store_filesystem` (continuous, keyframe-aligned rotation), `store_event` (pre/post-roll), `store_snapshot` |
+| **Store** | `store` (`mode` = continuous keyframe-aligned rotation / event pre-roll+post-roll / both), `store_snapshot` |
 | **Utility** | `overlay`, `privacy_mask`, `hello` (reference plugin) |
 
 Every plugin's config keys are documented in **[docs/Plugin_Config_Reference.md](docs/Plugin_Config_Reference.md)**.
@@ -91,7 +92,7 @@ Every plugin's config keys are documented in **[docs/Plugin_Config_Reference.md]
 
 **Prerequisites** — CMake, a C++20 toolchain, [vcpkg](https://github.com/microsoft/vcpkg)
 (`VCPKG_ROOT` set, or present at `~/vcpkg`), and Homebrew packages: FFmpeg ≥ 7.0, `onnxruntime`,
-`xsimd`, `nlohmann-json`, `boost`, `sqlite3`, `mosquitto`, `protobuf`.
+`xsimd`, `nlohmann-json`, `boost`, `mosquitto`.
 
 ```bash
 ./build.sh            # configure (Debug) + build into build/
@@ -131,7 +132,7 @@ a `cfg` object, an optional `queue_depth`, and `children`:
                 { "id": "detect", "kind": "detect_onnx", "cfg": { "model_path": "yolo.onnx" }, "queue_depth": 2 }
               ] }
           ] },
-        { "id": "store", "kind": "store_filesystem", "cfg": { "root": "/data/rec" }, "queue_depth": 120 }
+        { "id": "store", "kind": "store", "cfg": { "mode": "continuous", "root": "/data/rec" }, "queue_depth": 120 }
       ] }
   ]
 }
@@ -142,9 +143,12 @@ work the freshest frame, large (~120) for recorders that must not drop.
 
 ## 🔭 The worker socket
 
-One Unix-domain socket per monitor, length-prefixed protobuf, bidirectional (see
-[`proto/worker_link.proto`](proto/worker_link.proto)). Each wire unit is
-`u32 pb_len · u32 payload_len · [Frame] · [raw payload]` — metadata in protobuf, media alongside it.
+One Unix-domain socket per monitor, speaking the canonical binary stream-socket protocol
+(`core/include/zm/stream_socket_protocol.hpp`) — byte-compatible with the ZoneMinder `zmc` producer
+and the Rust control plane's consumer. Each message is a 24-byte little-endian header
+(`length · version · type · stream · flags · sequence · generation · pts_us`) followed by its
+payload: raw Annex-B for `Media`, a TLV list for `Hello`/`Event`. The media payload rides alongside
+the header (`writev`, refcounted) — never copied per consumer.
 
 - **server → client:** `Hello` (per-stream codec params, replayed on connect) · `Media` · `Keyframe`
   · `Stats` (per-consumer, drop accounting) · `Event` (lifecycle / health / **detection** / VLM
@@ -183,8 +187,8 @@ gracefully when FFmpeg isn't on the host. See **[docs/End_To_End_Proof.md](docs/
 
 ```text
 core/        the engine library (libzmcore) + WorkerLink + tests
-  include/zm_plugin.h    the plugin ABI — the contract between core and every plugin
-proto/       worker_link.proto + codegen (the worker contract)
+  include/zm_plugin.h                  the plugin ABI — core <-> every plugin
+  include/zm/stream_socket_protocol.hpp  the worker-socket wire protocol (the worker contract)
 plugins/     one directory per plugin (builds name.dylib, PREFIX "")
 pipelines/   declarative pipeline graphs (*.template.json are tracked)
 tools/       wl_dump — a ~100-line reference worker-socket consumer
@@ -196,7 +200,7 @@ src/         zm-core.cpp — the per-monitor worker entry point
 ## 🗺️ Status & roadmap
 
 ZM-Next is under active development. The capture → decode → motion → detect → record pipeline, the
-per-stage threading, and the protobuf worker contract are implemented and validated end-to-end. On
+per-stage threading, and the canonical worker-socket contract are implemented and validated end-to-end. On
 the horizon: hardening for daemon supervision (watchdog/liveness, `SO_PEERCRED` access control,
 per-stage health metrics), GPU validation on Linux/NVIDIA, and per-camera cutover alongside legacy
 `zmc`/`zma`.
@@ -216,5 +220,5 @@ copyleft lineage. (`LICENSE` / `LICENSE-COMMERCIAL` files formalize the above.)
 ---
 
 <div align="center">
-<sub>Built on FFmpeg · ONNX Runtime · Boost.Interprocess · LibDataChannel · Protobuf · GoogleTest</sub>
+<sub>Built on FFmpeg · ONNX Runtime · Boost.Interprocess · LibDataChannel · GoogleTest</sub>
 </div>

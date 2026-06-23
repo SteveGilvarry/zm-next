@@ -6,9 +6,9 @@ actually differentiates a next-gen ZoneMinder core from every existing NVR:
 moving from "pixels changed" (motion) to **"a person is at the door"** (detection)
 to **"someone left a package and walked away"** (scene understanding).
 
-The detection metadata contract already exists in `proto/worker_link.proto`
-(`Event.code = DETECTION`, `Detection { repeated Object { label, confidence,
-bbox, track_id, zone_id } }`), so AI results ride the same per-monitor worker
+The detection metadata contract rides the canonical worker stream-socket EVENT
+channel (event code `0x0301` detection, JSON detail
+`{objects:[{label,confidence,x,y,w,h,track_id,zone_id}], frame_pts_us}`), so AI results ride the same per-monitor worker
 socket as media and lifecycle events — no new transport.
 
 ## Runtime decision: ONNX Runtime
@@ -109,9 +109,9 @@ analyzer; use `motion_gate` purely to throttle inference.
 
 zm-next stays a worker; these are tasks for the Rust `zm-api` repo (recorded here
 so they aren't lost — **not** to be implemented from this project):
-- Generate the `prost` consumer from `proto/worker_link.proto`, replacing
-  `src/streaming/source/fifo.rs`, and ingest `Event.DETECTION` / future
-  description events into the event model.
+- Extend the binary stream-socket consumer (`src/streaming/source/protocol.rs`)
+  to handle EVENT (0x06) — detection (0x0301) / description (0x0302) — and ingest
+  them into the event model.
 - Persist detection metadata (labels, bboxes, track ids, zone ids) and VLM
   descriptions as queryable event fields; expose natural-language event search in
   the API → dashboard / mobile / zmNinjaNg.

@@ -19,7 +19,7 @@
 | Phase | Workstream | Deliverable | Why this order |
 |---|---|---|---|
 | **0** | Motion | A/B harness + tuning recipe for the existing `cuda_motion_regions` gate (downsample, min-blob, N-of-M persistence, masks, global-luma suppression). Capture baseline recall/FP-wake/GPU-cost numbers with `bench_gpu_roi` + `bench_resources`. | Cheapest, highest-leverage. Settles "is a heavier method worth it?" with data before we touch any model code. Establishes the benchmark baseline everything else is measured against. |
-| **1** | LLM | `llm_event_review` plugin (MVP): subscribe to `alert`+`tracked_detection`, **snap latest frame** (Approach A), call **local Qwen3-VL via `IVisionProvider`/OpenAI-compat local provider only**, publish `"reasoning"` event. Add `Event.REASONING` to `worker_link.proto`. | Replaces the broken timer trigger with a track-gated one immediately, using infra that already exists (`describe_vlm`'s HTTP client + frame-snap pattern). Local-only first = no key/privacy surface to get wrong. |
+| **1** | LLM | `llm_event_review` plugin (MVP): subscribe to `alert`+`tracked_detection`, **snap latest frame** (Approach A), call **local Qwen3-VL via `IVisionProvider`/OpenAI-compat local provider only**, publish `"reasoning"` event. Add a `reasoning` EVENT code (0x0305) to the stream-socket protocol. | Replaces the broken timer trigger with a track-gated one immediately, using infra that already exists (`describe_vlm`'s HTTP client + frame-snap pattern). Local-only first = no key/privacy surface to get wrong. |
 | **2** | LLM | **Provider abstraction hardening**: `OpenAICompatProvider` / `AnthropicProvider` / `GeminiProvider` adapters + `Retry`/`RateLimit`/`Fallback` decorators + secret-ref key handling + per-camera local-only routing. Cloud→local fallback wired. | Adds cloud quality + resilience once the local path is proven. Decorator composition keeps adapters dumb. |
 | **3** | LLM | **NL query subsystem**: SQLite + `sqlite-vec` store, embed-at-ingest (`bge-small`/`nomic`/`Qwen3-Embedding-0.6B`), Qwen function-calling router with `count_events()` (SQL) + `search_events()` (hybrid), strict-citation grounded answers. Surface via zm-api endpoint. | Needs a corpus of stored descriptions (Phases 1-2) before query is meaningful. Highest complexity, lowest urgency. |
 | **4** | Motion (optional) | Optical-flow / motion-coherence confirmation stage behind diff hits (NVIDIA HW flow on Blackwell), enabled per-zone for treed/weather scenes. Clip-based (Approach B) frame retrieval from `store_event` pre-roll for richer LLM temporal context. | Pure refinement. Only justified after Phase 0 data shows residual weather/tree false-wakes, and after Phase 1 shows single-frame context is insufficient. |
@@ -336,12 +336,16 @@ Store `event_id`, `ts` (epoch int, indexed), `monitor_id`, `labels[]`, `track_id
 
 **Pitfalls baked into the design:** counting → SQL (never LLM tally); temporal → resolve relative dates to epoch bounds in code + indexed `ts` + SQL pre-filter + `ORDER BY ts`; Text2SQL errors → parameterized tool functions with whitelisted columns, app-side date math; hallucination → strict-citation + existence-verify; post-filter recall loss → `sqlite-vec` pre-filtering.
 
-## Protobuf / transport changes
+## Transport changes
 
-`proto/worker_link.proto` currently has `Event.Code` with `DETECTION = 9` and `DESCRIPTION = 10` plus a `Description` message (`worker_link.proto:127-160`). **Add:**
-- `REASONING = 11` to `Event.Code`.
-- A `Reasoning` message (`description`, `threat_level` enum {LOW,MEDIUM,HIGH}, `confidence`, `track_id`, `trigger_reason`, `model`, `provider_id`) + a field `Reasoning reasoning = 11;` on `Event`.
-- zm-api ingests `Event.REASONING`, persists + embeds it, and exposes `POST /api/events/search` for the NL query subsystem.
+The canonical worker stream-socket EVENT channel (`core/include/zm/stream_socket_protocol.hpp`)
+already has detection (`0x0301`) and description (`0x0302`) event codes carrying a JSON detail
+TLV (`0x10`). **Add:**
+- A `reasoning` event code (`0x0305`, additive — version stays 1, skip-on-unknown) whose JSON
+  detail is `{description, threat_level: LOW|MEDIUM|HIGH, confidence, track_id, trigger_reason,
+  model, provider_id}`.
+- zm-api ingests the reasoning event, persists + embeds it, and exposes `POST /api/events/search`
+  for the NL query subsystem.
 
 ---
 

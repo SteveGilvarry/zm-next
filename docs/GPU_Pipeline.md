@@ -52,7 +52,7 @@ with `nvidia-smi` showing decode+compute on the GPU and no per-frame host copies
 
 Decode on the GPU and keep frames there; run detection/motion on the surface;
 **download to CPU only when a CPU consumer needs it** (CPU motion, VLM JPEG, or no
-GPU present). The worker_link media path sends compressed packets, so it never
+GPU present). The worker-socket media path sends compressed packets, so it never
 needs decoded frames — it's already free of decoded-frame copies.
 
 ## Design

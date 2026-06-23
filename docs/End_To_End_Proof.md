@@ -1,7 +1,7 @@
 # End-to-End Proof (file → cascade → worker socket + recording)
 
 This is a runnable, camera-free proof that the whole worker actually works: capture,
-per-stage threading, decode, motion detection, recording, and the protobuf worker
+per-stage threading, decode, motion detection, recording, and the canonical worker
 socket — all in one process, verifiable on a laptop with no RTSP camera.
 
 ## What it exercises
@@ -11,7 +11,7 @@ capture_file (MP4, AVCC H.264)
  ├─ decode_ffmpeg (auto codec + extradata → RGB24)
  │   └─ motion_gate ──> motion DETECTION events
  │       └─ detect_onnx (pass-through; no model needed)
- └─ store_filesystem ──> /tmp/zm_e2e_rec/.../<HH-MM-SS>.mkv
+ └─ store (mode=continuous) ──> /tmp/zm_e2e_rec/.../<HH-MM-SS>.mkv
 WorkerLink (--socket) ──> Hello + Media + Event + Stats to any connecting client
 ```
 
@@ -40,8 +40,9 @@ ffprobe -count_packets -show_entries stream=codec_name,width,height,nb_read_pack
 ```
 
 `wl_dump` (built from `tools/wl_dump.cpp`) is a ~100-line reference consumer: it
-connects, sends a `Subscribe{video,audio,events}`, and prints the framed protobuf.
-It is the smallest possible stand-in for the zm-api consumer.
+connects and prints each framed message (a canonical consumer receives Hello +
+Media + Event + Stats by default). It is the smallest possible stand-in for the
+zm-api consumer.
 
 ## Expected result (clean run)
 
@@ -61,10 +62,10 @@ It is the smallest possible stand-in for the zm-api consumer.
    is unaffected. Packets are now forwarded in their **native** container form — no
    in-pipeline bitstream conversion — so the decoder and the muxer both see one
    consistent stream.
-2. **store_filesystem skipped all frames** — it treated the compressed bitstream
+2. **the recorder skipped all frames** — it treated the compressed bitstream
    (`hw_type=ZM_FRAME_COMPRESSED`) as a GPU surface and dropped it. Fix: accept
    `ZM_FRAME_COMPRESSED`, reject GPU surfaces and raw pixel buffers.
-3. **store_filesystem never got video codecpar** — the core delivers input-plugin
+3. **the recorder never got video codecpar** — the core delivers input-plugin
    metadata on the EventBus, but store consumed only *audio* StreamMetadata, so the
    muxer header was never written (0-byte files). Fix: consume video StreamMetadata
    from the bus and build the muxer codecpar from it.

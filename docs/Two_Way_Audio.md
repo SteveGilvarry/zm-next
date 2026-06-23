@@ -37,9 +37,10 @@ browser mic ──► zm-api (WebRTC/REST) ──► worker socket (Talkback fra
 
 ## What's implemented now
 
-- **Contract:** `worker_link.proto` has an inbound `Talkback { codec, pts_us, data }`
-  message in the `Frame` oneof (client→server). The bidirectional worker socket
-  already supports inbound messages (Subscribe/Command), so no new transport.
+- **Contract:** the canonical protocol's client→server extension includes a
+  `Talkback` message (type `0x13`: 24-byte header carrying `pts_us`, payload
+  `[u32 codec][raw audio]`). The worker socket already accepts inbound control
+  messages (Subscribe/Command), so no new transport.
 - **Routing hook:** `WorkerLink` parses inbound `Talkback` frames and invokes a
   `TalkbackHandler` (`setTalkbackHandler`). `zm-core` registers one today that
   logs receipt, so the path from API → worker is exercisable end-to-end.
