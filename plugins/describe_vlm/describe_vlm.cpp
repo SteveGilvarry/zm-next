@@ -27,6 +27,7 @@
 
 #include "zm_plugin.h"
 #include "vlm_client.hpp"
+#include "image_encode.hpp"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -91,76 +92,8 @@ struct DescribeVlmCtx {
     std::condition_variable cv;
 };
 
-// ---------------------------------------------------------------------------
-// JPEG encoding helper (FFmpeg mjpeg encoder)
-// ---------------------------------------------------------------------------
-//
-// Encode an RGB24 buffer to an in-memory JPEG. Returns true and fills `out` on
-// success.
-//
-static bool encode_rgb24_to_jpeg(const uint8_t* rgb, int width, int height,
-                                 std::vector<uint8_t>& out) {
-    out.clear();
-    if (!rgb || width <= 0 || height <= 0) return false;
-
-    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
-    if (!codec) return false;
-
-    AVCodecContext* cctx = avcodec_alloc_context3(codec);
-    if (!cctx) return false;
-
-    cctx->pix_fmt = AV_PIX_FMT_YUVJ420P;
-    cctx->width = width;
-    cctx->height = height;
-    cctx->time_base = AVRational{1, 25};
-    cctx->color_range = AVCOL_RANGE_JPEG;
-
-    SwsContext* sws = nullptr;
-    AVFrame* frame = nullptr;
-    AVPacket* pkt = nullptr;
-    bool ok = false;
-
-    do {
-        if (avcodec_open2(cctx, codec, nullptr) < 0) break;
-
-        frame = av_frame_alloc();
-        if (!frame) break;
-        frame->format = cctx->pix_fmt;
-        frame->width = width;
-        frame->height = height;
-        if (av_frame_get_buffer(frame, 32) < 0) break;
-
-        sws = sws_getContext(width, height, AV_PIX_FMT_RGB24,
-                             width, height, AV_PIX_FMT_YUVJ420P,
-                             SWS_BILINEAR, nullptr, nullptr, nullptr);
-        if (!sws) break;
-
-        const uint8_t* srcSlice[1] = {rgb};
-        int srcStride[1] = {3 * width};
-        sws_scale(sws, srcSlice, srcStride, 0, height,
-                  frame->data, frame->linesize);
-
-        frame->pts = 0;
-
-        if (avcodec_send_frame(cctx, frame) < 0) break;
-
-        pkt = av_packet_alloc();
-        if (!pkt) break;
-
-        int ret = avcodec_receive_packet(cctx, pkt);
-        if (ret < 0) break;
-
-        out.assign(pkt->data, pkt->data + pkt->size);
-        ok = true;
-    } while (false);
-
-    if (pkt) av_packet_free(&pkt);
-    if (frame) av_frame_free(&frame);
-    if (sws) sws_freeContext(sws);
-    if (cctx) avcodec_free_context(&cctx);
-
-    return ok;
-}
+// JPEG encoding helper now lives in the shared header (plugins/common); see
+// zm::img::encode_rgb24_to_jpeg.
 
 // ---------------------------------------------------------------------------
 // HTTP helper (libcurl)
@@ -239,7 +172,7 @@ static void run_inference_cycle(DescribeVlmCtx* ctx) {
     }
 
     std::vector<uint8_t> jpeg;
-    if (!encode_rgb24_to_jpeg(frame.data(), width, height, jpeg)) {
+    if (!zm::img::encode_rgb24_to_jpeg(frame.data(), width, height, jpeg)) {
         ZM_LOG_ERROR("describe_vlm: JPEG encode failed");
         return;
     }

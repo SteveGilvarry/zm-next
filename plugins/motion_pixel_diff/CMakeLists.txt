@@ -5,6 +5,11 @@ project(motion_pixel_diff LANGUAGES CXX)
 find_package(Boost 1.70 REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
+# libswscale (for the background-plate JPEG encoder in plugins/common); not part
+# of the parent's ZM_FFMPEG_LIBS.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SWSCALE REQUIRED libswscale)
+
 # Build a single plugin with the correct extension for the OS
 if(APPLE)
     add_library(motion_pixel_diff SHARED motion_pixel_diff.cpp)
@@ -14,13 +19,16 @@ endif()
 
 target_include_directories(motion_pixel_diff PRIVATE
     ${CMAKE_SOURCE_DIR}/core/include
+    ${CMAKE_SOURCE_DIR}/plugins/common
     ${ZM_XSIMD_INCLUDES}
     ${Boost_INCLUDE_DIRS}
+    ${SWSCALE_INCLUDE_DIRS}
 )
 
-target_link_directories(motion_pixel_diff PRIVATE ${ZM_FFMPEG_LIBDIRS})
-target_link_libraries(motion_pixel_diff PRIVATE 
-    ${ZM_FFMPEG_LIBS} 
+target_link_directories(motion_pixel_diff PRIVATE ${ZM_FFMPEG_LIBDIRS} ${SWSCALE_LIBRARY_DIRS})
+target_link_libraries(motion_pixel_diff PRIVATE
+    ${ZM_FFMPEG_LIBS}
+    ${SWSCALE_LIBRARIES}
     zmcore
     ${Boost_LIBRARIES}
     nlohmann_json::nlohmann_json

@@ -75,6 +75,10 @@ struct DetectSegCtx {
     int frameHeight = 0;
     std::string ep = "cpu";
     std::string maskFormat = "polygon";  // "polygon" | "none"
+    // Event shape: "segmentation" (default; key "objects") or "detection" (key
+    // "detections", type "detection") so the tracker consumes it and the polygon
+    // rides through to tracked_detection for the motion-synopsis review_export.
+    std::string eventType = "segmentation";
     std::vector<int> classFilter;        // empty = all
     std::vector<int> streamFilter;       // empty = all
     std::vector<std::string> classNames; // empty = use COCO-80
@@ -124,6 +128,7 @@ static int detect_seg_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host
             ctx->frameHeight = j.value("frame_height", 0);
             ctx->ep = j.value("ep", std::string("cpu"));
             ctx->maskFormat = j.value("mask_format", std::string("polygon"));
+            ctx->eventType = j.value("event_type", std::string("segmentation"));
             if (j.contains("class_filter") && j["class_filter"].is_array())
                 ctx->classFilter = j["class_filter"].get<std::vector<int>>();
             if (j.contains("stream_filter") && j["stream_filter"].is_array())
@@ -346,10 +351,19 @@ static void detect_seg_on_frame(zm_plugin_t* plugin, const void* buf, size_t siz
         }
 
         json evt;
-        evt["type"] = "segmentation";
         evt["stream_id"] = hdr->stream_id;
         evt["pts_usec"] = hdr->pts_usec;
-        evt["objects"] = std::move(objsJson);
+        // In "detection" mode emit a tracker-compatible event (type "detection",
+        // key "detections") so the tracker attaches track_ids and passes the
+        // polygon through to "tracked_detection" (consumed by review_export for
+        // motion synopsis). Otherwise keep the native segmentation shape.
+        if (ctx->eventType == "detection") {
+            evt["type"] = "detection";
+            evt["detections"] = std::move(objsJson);
+        } else {
+            evt["type"] = "segmentation";
+            evt["objects"] = std::move(objsJson);
+        }
         if (ctx->host && ctx->host->publish_evt)
             ctx->host->publish_evt(ctx->hostCtx, evt.dump().c_str());
     } catch (const std::exception& e) {

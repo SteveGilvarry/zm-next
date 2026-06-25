@@ -23,6 +23,7 @@ endif()
 
 target_include_directories(describe_vlm PRIVATE
     ${CMAKE_SOURCE_DIR}/core/include
+    ${CMAKE_SOURCE_DIR}/plugins/common
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 

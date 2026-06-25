@@ -462,6 +462,37 @@ TEST(WorkerLinkTest, CmdStyleCommandDispatchedToBus) {
     link.stop();
 }
 
+// A review_assets event (motion synopsis tube manifest) maps to the 0x0306
+// extension code and its JSON rides in the json_detail TLV (proving the
+// map_event_code + is_ai_code edits, without which it would land in the message
+// tag and zm-api's ingest would break).
+TEST(WorkerLinkTest, ReviewAssetsEvent) {
+    const std::string path = temp_socket_path(975);
+    zm::WorkerLink link(/*monitor_id=*/16, path);
+    ASSERT_TRUE(link.start());
+
+    int client = connect_client(path);
+    ASSERT_GE(client, 0);
+
+    link.publishEventJson(
+        R"({"type":"review_assets","event_id":512,"clip_token":"16-7-1",)"
+        R"("tubes":[{"track_id":3}]})");
+
+    ss::Header h;
+    std::vector<uint8_t> body;
+    ASSERT_TRUE(read_msg(client, h, &body));
+    EXPECT_EQ(h.type, static_cast<uint8_t>(ss::MessageType::Event));
+    ss::MonitorEvent ev;
+    ASSERT_TRUE(ss::ParseEvent(body.data(), body.size(), ev));
+    EXPECT_EQ(ev.code, ss::kEventReviewAssets);
+    EXPECT_FALSE(ev.json_detail.empty());          // rode in TLV 0x10, not the message tag
+    EXPECT_TRUE(ev.message.empty());
+    EXPECT_NE(ev.json_detail.find("16-7-1"), std::string::npos);
+
+    ::close(client);
+    link.stop();
+}
+
 TEST(WorkerLinkTest, PeriodicStats) {
     const std::string path = temp_socket_path();
     zm::WorkerLink::Config cfg;

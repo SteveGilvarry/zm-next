@@ -84,6 +84,7 @@ uint16_t map_event_code(const std::string& type, const std::string& event) {
     if (type == "motion" || type == "zone_motion" || type == "detection")
         return ss::kEventDetection;
     if (type == "description")            return ss::kEventDescription;
+    if (type == "review_assets")          return ss::kEventReviewAssets;
     if (event == "EventClip")             return ss::kEventRecordingSaved;
     if (event == "RecordingOpening")      return ss::kEventRecordingOpening;
     return 0;
@@ -91,7 +92,8 @@ uint16_t map_event_code(const std::string& type, const std::string& event) {
 
 bool is_ai_code(uint16_t code) {
     return code == ss::kEventDetection || code == ss::kEventDescription ||
-           code == ss::kEventRecordingSaved || code == ss::kEventRecordingOpening;
+           code == ss::kEventRecordingSaved || code == ss::kEventRecordingOpening ||
+           code == ss::kEventReviewAssets;
 }
 
 } // namespace

@@ -151,6 +151,8 @@ constexpr uint16_t kEventDetection            = 0x0301;  // motion / object dete
 constexpr uint16_t kEventDescription          = 0x0302;  // VLM scene description
 constexpr uint16_t kEventRecordingSaved       = 0x0303;  // a clip was written to storage
 constexpr uint16_t kEventRecordingOpening     = 0x0304;  // a clip segment opened; requests an event-id assignment
+// 0x0305 reserved for a future "reasoning" event (see docs/Research_Motion_and_LLM_Review.md).
+constexpr uint16_t kEventReviewAssets         = 0x0306;  // motion-synopsis tube/plate manifest (see docs/Motion_Synopsis.md)
 
 // EVENT TLV tags
 constexpr uint8_t kTlvWallClockUs = 0x01;  // u64, unix-epoch microseconds

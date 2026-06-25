@@ -193,6 +193,28 @@ JSON
 else echo "  SKIP: aac encoder unavailable"; fi
 
 # ---------------------------------------------------------------------------
+echo "[8] background plate export (motion synopsis ingredient)"
+# decode -> grayscale -> motion_pixel_diff(plate_export) writes the rolling
+# background_ as a JPEG side file + emits a "background_plate" event. No model
+# needed; proves the zm-next P0 plate half end-to-end.
+ffmpeg -y -f lavfi -i testsrc=duration=3:size=320x240:rate=15 \
+       -c:v libx264 -g 15 -pix_fmt yuv420p "$WORK/plate.mp4" >/dev/null 2>&1
+cat > "$WORK/plate.json" <<JSON
+{"name":"plate","root":true,"plugins":[
+ {"id":"cap","kind":"capture_file","cfg":{"path":"$WORK/plate.mp4","stream_id":0,"loop":false,"realtime":false},
+  "children":[
+   {"id":"dec","kind":"decode_ffmpeg","cfg":{"output_format":"gray","frame_width":320,"frame_height":240},"queue_depth":8,
+    "children":[
+     {"id":"mo","kind":"motion_pixel_diff","cfg":{"frame_width":320,"frame_height":240,"monitor_id":708,"downscale":1,"plate_export":true,"plate_refresh_secs":1,"plate_dir":"$WORK/plates708"}}]}]}]}
+JSON
+"$ZMCORE" --pipeline "$WORK/plate.json" --socket "$WORK/s708.sock" --monitor-id 708 >"$WORK/c708.log" 2>&1 &
+WPID=$!; PIDS+=("$WPID"); wait_sock "$WORK/s708.sock"; sleep 3; kill $WPID 2>/dev/null; wait $WPID 2>/dev/null
+PF=$(find "$WORK/plates708" -name 'plate-*.jpg' -type f 2>/dev/null | head -1)
+[ -n "$PF" ] && pass "background plate written" || fail "no background plate written"
+[ -n "$PF" ] && ffprobe -v error "$PF" >/dev/null 2>&1 && pass "plate is a valid jpeg" \
+                                                       || fail "plate not a valid image"
+
+# ---------------------------------------------------------------------------
 echo "----------------------------------------"
 if [ "$fails" -eq 0 ]; then echo "INTEGRATION SMOKE: ALL PASS"; exit 0
 else echo "INTEGRATION SMOKE: $fails FAILURE(S)"; exit 1; fi

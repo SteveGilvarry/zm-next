@@ -57,6 +57,13 @@ struct MotionConfig {
     float backgroundLearningRate = 0.03125f; // 1/32
     bool enableMotionMap = false;      // Generate motion visualization
     bool enableFiltering = true;       // Apply spatial filtering
+    // Background-plate export (for motion synopsis). The plate is the rolling
+    // background_ model written periodically as a grayscale JPEG side file, with
+    // an internal "background_plate" event so review_export can reference it.
+    bool plateExport = false;
+    int  plateRefreshSecs = 120;       // min seconds between plate writes
+    std::string plateDir;              // directory to write plate-*.jpg into
+    bool plateOnIllumChange = true;    // also write when illumination shifts
 };
 
 // Motion detection result for a zone
@@ -80,6 +87,7 @@ struct MotionResult {
 class PixelDifferenceDetector {
 private:
     int width_, height_;
+    int effectiveWidth_ = 0, effectiveHeight_ = 0;  // background_ dims (post-downscale)
     MotionConfig config_;
     alignas(64) std::vector<uint8_t> background_;
     bool backgroundReady_;
@@ -102,6 +110,16 @@ public:
     // Statistics
     size_t getFrameCount() const { return frameCount_; }
     bool isBackgroundReady() const { return backgroundReady_; }
+
+    // Background-plate access (for plate export). Dims are the post-downscale
+    // resolution of background_. copyBackground returns false if not yet ready.
+    int bgWidth() const { return effectiveWidth_; }
+    int bgHeight() const { return effectiveHeight_; }
+    bool copyBackground(std::vector<uint8_t>& out) const {
+        if (!backgroundReady_) return false;
+        out = background_;
+        return true;
+    }
     
 private:
     // Core motion detection

@@ -1,11 +1,18 @@
 #include "motion_pixel_diff.hpp"
+#include "image_encode.hpp"
 #include <sstream>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <chrono>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <numeric>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
+namespace fs = std::filesystem;
 
 // Simple zone metadata deserialization (matching zones plugin)
 ZoneMetadata ZoneMetadata::deserialize(const std::string& data) {
@@ -99,10 +106,12 @@ bool PixelDifferenceDetector::initialize(int width, int height, const MotionConf
         effectiveHeight = config_.outHeight;
     }
     
+    effectiveWidth_ = effectiveWidth;
+    effectiveHeight_ = effectiveHeight;
     size_t frameSize = effectiveWidth * effectiveHeight;
     background_.assign(frameSize, 0);
     backgroundReady_ = false;
-    
+
     return true;
 }
 
@@ -367,7 +376,79 @@ struct MotionPixelDiffCtx {
     int monitorId = 0;
     zm_host_api_t* host = nullptr;
     void* hostCtx = nullptr;
+    // Per-instance plate-export state.
+    std::chrono::steady_clock::time_point lastPlate{};
+    bool havePlate = false;
+    int lastPlateLuma = -1000;
 };
+
+namespace {
+// Coarse illumination bucket from mean grayscale luma (for day/night plate
+// selection at render time).
+const char* illum_bucket(int luma) {
+    if (luma < 60) return "night";
+    if (luma > 170) return "day";
+    return "dusk";
+}
+
+// Write the current background_ as a grayscale JPEG plate and publish an internal
+// "background_plate" event referencing it. Returns true if a plate was written.
+bool maybe_write_plate(MotionPixelDiffCtx* ctx) {
+    if (!ctx->config.plateExport || !ctx->detector.isBackgroundReady()) return false;
+    if (ctx->config.plateDir.empty()) return false;
+
+    std::vector<uint8_t> bg;
+    if (!ctx->detector.copyBackground(bg) || bg.empty()) return false;
+    const long sum = std::accumulate(bg.begin(), bg.end(), 0L);
+    const int luma = static_cast<int>(sum / static_cast<long>(bg.size()));
+
+    const auto now = std::chrono::steady_clock::now();
+    const bool first = !ctx->havePlate;
+    const bool due = first ||
+        (now - ctx->lastPlate) >= std::chrono::seconds(ctx->config.plateRefreshSecs);
+    const bool illum = ctx->config.plateOnIllumChange && !first &&
+        std::abs(luma - ctx->lastPlateLuma) > 25;
+    if (!due && !illum) return false;
+
+    const int w = ctx->detector.bgWidth();
+    const int h = ctx->detector.bgHeight();
+    if (w <= 0 || h <= 0 || static_cast<size_t>(w) * h != bg.size()) return false;
+
+    std::vector<uint8_t> jpeg;
+    if (!zm::img::encode_gray8_to_jpeg(bg.data(), w, h, jpeg)) return false;
+
+    const uint64_t wallclock_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+
+    std::error_code ec;
+    fs::create_directories(ctx->config.plateDir, ec);
+    const std::string path =
+        ctx->config.plateDir + "/plate-" + std::to_string(wallclock_ms) + ".jpg";
+    {
+        std::ofstream f(path, std::ios::binary);
+        if (!f) return false;
+        f.write(reinterpret_cast<const char*>(jpeg.data()),
+                static_cast<std::streamsize>(jpeg.size()));
+        if (!f) return false;
+    }
+
+    ctx->lastPlate = now;
+    ctx->havePlate = true;
+    ctx->lastPlateLuma = luma;
+
+    if (ctx->host && ctx->host->publish_evt) {
+        json ev = {{"type", "background_plate"},
+                   {"monitor", ctx->monitorId},
+                   {"path", path},
+                   {"wallclock_ms", wallclock_ms},
+                   {"w", w}, {"h", h},
+                   {"illum", illum_bucket(luma)}};
+        ctx->host->publish_evt(ctx->hostCtx, ev.dump().c_str());
+    }
+    return true;
+}
+} // namespace
 
 extern "C" {
 
@@ -392,6 +473,10 @@ static int motion_pixel_diff_start(zm_plugin_t* plugin, zm_host_api_t* host, voi
             ctx->config.backgroundLearningRate = j.value("background_learning_rate", 0.03125f);
             ctx->config.enableMotionMap = j.value("enable_motion_map", false);
             ctx->config.enableFiltering = j.value("enable_filtering", true);
+            ctx->config.plateExport = j.value("plate_export", false);
+            ctx->config.plateRefreshSecs = j.value("plate_refresh_secs", 120);
+            ctx->config.plateDir = j.value("plate_dir", std::string());
+            ctx->config.plateOnIllumChange = j.value("plate_on_illum_change", true);
             ctx->monitorId = j.value("monitor_id", 0);
         } catch (const std::exception& e) {
             if (host && host->log) {
@@ -476,7 +561,10 @@ static void motion_pixel_diff_on_frame(zm_plugin_t* plugin, const void* buf, siz
     
     // Detect motion
     MotionResult result = ctx->detector.detectMotion(frameData, zones);
-    
+
+    // Background-plate export for motion synopsis (rate-limited internally).
+    maybe_write_plate(ctx);
+
     // Publish motion events
     if (result.hasGlobalMotion || !result.zoneResults.empty()) {
         if (ctx->host && ctx->host->publish_evt) {

@@ -1,0 +1,61 @@
+{
+  "_comment": [
+    "Motion-synopsis INGREDIENT pipeline (zm-next P0). Produces the tubes + plates",
+    "a zm-api synopsis renderer consumes; see docs/Motion_Synopsis.md.",
+    "  capture -> decode(rgb24) -> detect_seg(event_type=detection, polygon)",
+    "                            -> tracker (adds track_id, passes polygon through)",
+    "                            -> review_export (samples tubes; emits 0x0306 on EventClip)",
+    "                            -> store(mode=event) (records the clip + lifecycle events)",
+    "            decode(grayscale) -> motion_pixel_diff(plate_export) (background plates)",
+    "REQUIRES a YOLO-seg ONNX model (2 outputs: detection + proto) at model_path.",
+    "Copy to pipelines/<name>.json with a real camera URL + model path (git-ignored)."
+  ],
+  "name": "synopsis_smoke",
+  "root": true,
+  "plugins": [
+    { "id": "capture", "kind": "capture_rtsp_multi",
+      "cfg": { "streams": [
+        { "stream_id": 0, "url": "rtsp://USER:PASS@CAMERA:554/Streaming/Channels/102", "transport": "tcp" }
+      ] },
+      "queue_depth": 16,
+      "children": [
+        { "id": "decode", "kind": "decode_ffmpeg",
+          "cfg": { "output_format": "rgb24", "frame_width": 1280, "frame_height": 720 },
+          "queue_depth": 4,
+          "children": [
+            { "id": "seg", "kind": "detect_seg",
+              "cfg": { "model_path": "/path/to/yolo11n-seg.onnx", "ep": "coreml",
+                       "input_size": 640, "conf_threshold": 0.35,
+                       "frame_width": 1280, "frame_height": 720,
+                       "mask_format": "polygon", "event_type": "detection",
+                       "class_filter": [0] },
+              "queue_depth": 2,
+              "children": [
+                { "id": "track", "kind": "tracker",
+                  "cfg": { "iou_threshold": 0.3, "max_age": 30, "min_hits": 3 },
+                  "queue_depth": 2 }
+              ] },
+            { "id": "review", "kind": "review_export",
+              "cfg": { "monitor_id": 1, "frame_width": 1280, "frame_height": 720,
+                       "sample_fps": 4, "cutout_max_edge": 256, "feather": 1,
+                       "ring_size": 8 },
+              "queue_depth": 4 },
+            { "id": "record", "kind": "store",
+              "cfg": { "mode": "event", "root": "/data/events", "monitor_id": 1,
+                       "trigger_types": ["tracked_detection"],
+                       "pre_roll_sec": 3, "post_roll_sec": 5 },
+              "queue_depth": 120 }
+          ] },
+        { "id": "decode_gray", "kind": "decode_ffmpeg",
+          "cfg": { "output_format": "grayscale", "frame_width": 1280, "frame_height": 720 },
+          "queue_depth": 4,
+          "children": [
+            { "id": "motion", "kind": "motion_pixel_diff",
+              "cfg": { "frame_width": 1280, "frame_height": 720, "monitor_id": 1,
+                       "plate_export": true, "plate_refresh_secs": 120,
+                       "plate_dir": "/data/events/plates/1" },
+              "queue_depth": 4 }
+          ] }
+      ] }
+  ]
+}
