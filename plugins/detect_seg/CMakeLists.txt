@@ -31,6 +31,7 @@ endif()
 target_include_directories(detect_seg PRIVATE
     ${CMAKE_SOURCE_DIR}/core/include
     ${CMAKE_SOURCE_DIR}/plugins/detect_onnx
+    ${CMAKE_SOURCE_DIR}/plugins/common
     ${ORT_INCLUDE}
 )
 

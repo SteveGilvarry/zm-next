@@ -14,6 +14,7 @@
 // box from (cx,cy,w,h); mask = sigmoid(sum_k coeff_k * proto_k), thresholded.
 
 #include "seg_postprocess.hpp"
+#include "base64.hpp"
 
 #include <onnxruntime_cxx_api.h>
 #ifdef __APPLE__
@@ -79,6 +80,10 @@ struct DetectSegCtx {
     // "detections", type "detection") so the tracker consumes it and the polygon
     // rides through to tracked_detection for the motion-synopsis review_export.
     std::string eventType = "segmentation";
+    // Emit the soft per-pixel sigmoid mask (downscaled, base64) as the object
+    // matte instead of the coarse polygon (motion synopsis P4). Supersedes polygon.
+    bool emitSoftMask = false;
+    int softMaskMaxEdge = 64;
     std::vector<int> classFilter;        // empty = all
     std::vector<int> streamFilter;       // empty = all
     std::vector<std::string> classNames; // empty = use COCO-80
@@ -129,6 +134,8 @@ static int detect_seg_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host
             ctx->ep = j.value("ep", std::string("cpu"));
             ctx->maskFormat = j.value("mask_format", std::string("polygon"));
             ctx->eventType = j.value("event_type", std::string("segmentation"));
+            ctx->emitSoftMask = j.value("emit_soft_mask", false);
+            ctx->softMaskMaxEdge = j.value("soft_mask_max_edge", 64);
             if (j.contains("class_filter") && j["class_filter"].is_array())
                 ctx->classFilter = j["class_filter"].get<std::vector<int>>();
             if (j.contains("stream_filter") && j["stream_filter"].is_array())
@@ -327,22 +334,32 @@ static void detect_seg_on_frame(zm_plugin_t* plugin, const void* buf, size_t siz
             return;
         }
 
-        const bool wantPolygon = (ctx->maskFormat != "none");
+        const bool wantAlpha = ctx->emitSoftMask;
+        const bool wantPolygon = (ctx->maskFormat != "none") && !wantAlpha;
 
         json objsJson = json::array();
         for (auto& o : objs) {
-            if (wantPolygon) {
-                std::vector<float> mask =
-                    zm::seg::build_mask(proto, maskDim, mh, mw, o.coeffs);
-                o.polygon = zm::seg::mask_to_polygon(mask, mh, mw, 0.5f, lb, o);
-            }
+            // The soft sigmoid mask feeds either the alpha matte (P4) or the
+            // coarse polygon; compute it once if either is wanted.
+            std::vector<float> softmask;
+            if (wantAlpha || wantPolygon)
+                softmask = zm::seg::build_mask(proto, maskDim, mh, mw, o.coeffs);
+
             std::string scratch;
             json od;
             od["label"] = className(ctx, o.class_id, scratch);
             od["confidence"] = o.confidence;
             od["bbox"] = {o.x, o.y, o.w, o.h};
             od["class_id"] = o.class_id;
-            if (wantPolygon) {
+            if (wantAlpha) {
+                zm::seg::AlphaMask am =
+                    zm::seg::mask_to_alpha(softmask, mh, mw, lb, o, ctx->softMaskMaxEdge);
+                if (am.w > 0 && am.h > 0) {
+                    od["mask"] = {{"format", "alpha"}, {"w", am.w}, {"h", am.h},
+                                  {"data", zm::b64::encode(am.data)}};
+                }
+            } else if (wantPolygon) {
+                o.polygon = zm::seg::mask_to_polygon(softmask, mh, mw, 0.5f, lb, o);
                 json poly = json::array();
                 for (const auto& p : o.polygon) poly.push_back({p[0], p[1]});
                 od["polygon"] = std::move(poly);

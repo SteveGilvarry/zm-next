@@ -22,6 +22,7 @@
 #include <nlohmann/json.hpp>
 #include "image_encode.hpp"
 #include "review_matte.hpp"
+#include "base64.hpp"
 
 #include <algorithm>
 #include <array>
@@ -54,7 +55,9 @@ struct Sample {
     int64_t pts_us = 0;
     uint64_t wallclock_ms = 0;
     std::array<float, 4> bbox{0, 0, 0, 0};            // source coords
-    std::vector<std::array<float, 2>> polygon;        // source coords (may be empty)
+    std::vector<std::array<float, 2>> polygon;        // source coords (empty if alpha used)
+    std::vector<uint8_t> alpha;                       // soft matte (bbox-local, alpha_w*alpha_h)
+    int alpha_w = 0, alpha_h = 0;                      // 0 => no soft mask (use polygon)
     std::vector<uint8_t> jpeg;                         // premultiplied RGB cutout
     int cutout_w = 0, cutout_h = 0;
 };
@@ -123,7 +126,9 @@ uint64_t wallclock_for(State* st, int64_t pts_us) {
 // Build a premultiplied, downscaled, MJPEG-encoded cutout for one detection.
 // Returns false if the crop is degenerate or encoding fails.
 bool build_cutout(const RingFrame& f, int fw, int fh, const std::array<float, 4>& bbox,
-                  const std::vector<std::array<float, 2>>& poly, int maxEdge, int feather,
+                  const std::vector<std::array<float, 2>>& poly,
+                  const std::vector<uint8_t>& alpha, int alphaW, int alphaH,
+                  int maxEdge, int feather,
                   std::vector<uint8_t>& jpegOut, int& outW, int& outH) {
     const int ix = std::clamp(static_cast<int>(std::floor(bbox[0])), 0, fw - 1);
     const int iy = std::clamp(static_cast<int>(std::floor(bbox[1])), 0, fh - 1);
@@ -139,10 +144,15 @@ bool build_cutout(const RingFrame& f, int fw, int fh, const std::array<float, 4>
                     static_cast<size_t>(iw) * 3);
     }
 
-    // Matte from polygon (crop-local), feathered, then premultiply.
+    // Matte: prefer the soft alpha (upsampled to the crop) when present, else
+    // rasterise the coarse polygon. Feather, then premultiply.
     std::vector<uint8_t> mask;
-    zm::review::fill_polygon(mask, iw, ih, poly, static_cast<float>(ix),
-                             static_cast<float>(iy));
+    if (!alpha.empty() && alphaW > 0 && alphaH > 0) {
+        zm::review::upsample_alpha(alpha, alphaW, alphaH, mask, iw, ih);
+    } else {
+        zm::review::fill_polygon(mask, iw, ih, poly, static_cast<float>(ix),
+                                 static_cast<float>(iy));
+    }
     for (int i = 0; i < feather; ++i) zm::review::box_blur3(mask, iw, ih);
     zm::review::premultiply_rgb(crop, mask);
 
@@ -253,14 +263,23 @@ std::string finalize_locked(State* st, long event_id, const std::string& clip_pa
             f.write(reinterpret_cast<const char*>(s.jpeg.data()),
                     static_cast<std::streamsize>(s.jpeg.size()));
             if (!f) continue;
-            json poly = json::array();
-            for (const auto& p : s.polygon) poly.push_back({p[0], p[1]});
+            // Carry the matte zm-api needs for true alpha compositing: the soft
+            // alpha (downscaled, base64) when present, else the coarse polygon.
+            json mask;
+            if (!s.alpha.empty() && s.alpha_w > 0 && s.alpha_h > 0) {
+                mask = {{"format", "alpha"}, {"w", s.alpha_w}, {"h", s.alpha_h},
+                        {"data", zm::b64::encode(s.alpha)}};
+            } else {
+                json poly = json::array();
+                for (const auto& p : s.polygon) poly.push_back({p[0], p[1]});
+                mask = {{"format", "polygon"}, {"points", std::move(poly)}};
+            }
             samplesJson.push_back({
                 {"pts_us", s.pts_us}, {"wallclock_ms", s.wallclock_ms},
                 {"bbox", {s.bbox[0], s.bbox[1], s.bbox[2], s.bbox[3]}},
                 {"cutout", tdir + "/" + name},
                 {"cutout_w", s.cutout_w}, {"cutout_h", s.cutout_h},
-                {"mask", {{"format", "polygon"}, {"points", std::move(poly)}}}});
+                {"mask", std::move(mask)}});
         }
         if (samplesJson.empty()) continue;
         tubesJson.push_back({{"track_id", tid}, {"label", tube.label},
@@ -322,21 +341,37 @@ void on_tracked_detection(State* st, const json& j) {
 
         std::array<float, 4> bbox{d["bbox"][0].get<float>(), d["bbox"][1].get<float>(),
                                   d["bbox"][2].get<float>(), d["bbox"][3].get<float>()};
+        // Matte: a soft alpha mask (detect_seg P4) supersedes the coarse polygon.
         std::vector<std::array<float, 2>> poly;
-        if (d.contains("polygon") && d["polygon"].is_array()) {
+        std::vector<uint8_t> alpha;
+        int alphaW = 0, alphaH = 0;
+        if (d.contains("mask") && d["mask"].is_object() &&
+            d["mask"].value("format", std::string()) == "alpha") {
+            const auto& m = d["mask"];
+            alphaW = m.value("w", 0);
+            alphaH = m.value("h", 0);
+            alpha = zm::b64::decode(m.value("data", std::string()));
+            if (alpha.size() != static_cast<size_t>(alphaW) * alphaH) {
+                alpha.clear(); alphaW = alphaH = 0;   // corrupt — fall back to polygon
+            }
+        }
+        if (alpha.empty() && d.contains("polygon") && d["polygon"].is_array()) {
             for (const auto& p : d["polygon"])
                 if (p.is_array() && p.size() >= 2)
                     poly.push_back({p[0].get<float>(), p[1].get<float>()});
         }
 
         Sample s;
-        if (!build_cutout(*frame, st->frameW, st->frameH, bbox, poly,
+        if (!build_cutout(*frame, st->frameW, st->frameH, bbox, poly, alpha, alphaW, alphaH,
                           st->cutoutMaxEdge, st->feather, s.jpeg, s.cutout_w, s.cutout_h))
             continue;
         s.pts_us = pts;
         s.wallclock_ms = wallclock_for(st, pts);
         s.bbox = bbox;
         s.polygon = std::move(poly);
+        s.alpha = std::move(alpha);
+        s.alpha_w = alphaW;
+        s.alpha_h = alphaH;
 
         if (tube.samples.empty()) {
             tube.label = d.value("label", std::string());

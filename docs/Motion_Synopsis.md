@@ -120,8 +120,10 @@ Identical schema on both sides:
           "bbox": [840, 120, 96, 220],            // source coords
           "cutout": "t17/000001.jpg",             // premultiplied RGB, relative to path_base
           "cutout_w": 96, "cutout_h": 220,
-          "mask": { "format": "polygon", "points": [[x,y], …] }
-          //  or  { "format": "rle", "w": 96, "h": 220, "counts": [..] } (bbox-local)
+          "mask": { "format": "alpha", "w": 28, "h": 64, "data": "<base64 8-bit, bbox-local>" }
+          //  soft per-pixel alpha (default when detect_seg emit_soft_mask=true); stretch w×h
+          //  across the bbox/cutout. Fallback when only the coarse outline is available:
+          //  { "format": "polygon", "points": [[x,y], …] }  (source coords)
         }
       ]
     }
@@ -143,25 +145,32 @@ soft `build_mask()` (`seg_postprocess.hpp:132`) needs the raw `proto` tensor + p
 `coeffs`, which never leave `detect_seg`.
 
 **Locked topology — single inference:** on synopsis cameras, configure `detect_seg` to emit a
-`type:"detection"` event whose per-object entries **carry the coarse `polygon`** (in addition to
-`label`/`confidence`/`bbox`/`class_id`). Then:
+`type:"detection"` event whose per-object entries carry the matte (`mask`/`polygon`) in addition to
+`label`/`confidence`/`bbox`/`class_id`. Then:
 
 ```
-decode_ffmpeg(RGB24) → detect_seg (type:"detection", incl. polygon)
-                          → tracker (attaches track_id, passes polygon through → "tracked_detection")
-                          → review_export (consumes tracked_detection: track_id + bbox + polygon, in one event)
+decode_ffmpeg(RGB24) → detect_seg (type:"detection", incl. matte)
+                          → tracker (attaches track_id, passes matte through → "tracked_detection")
+                          → review_export (consumes tracked_detection: track_id + bbox + matte, in one event)
                        ⤷ also a normal frame-chain child for RGB24 pixels
 ```
 
 `tracker` already copies original fields through and attaches `track_id`
-(`tracker.cpp:140-159`), so the `polygon` rides along untouched — **no tracker change**, **one
+(`tracker.cpp:140-159`), so the matte rides along untouched — **no tracker change**, **one
 inference**, **no join** in `review_export`. (Alternatives considered: running `detect_onnx` +
 `detect_seg` = 2× detector cost, rejected; teaching `tracker` to consume `segmentation` = more
 coupling. If a deployment *does* run two separate detectors, `review_export` can fall back to a
 `(pts_us, bbox-IoU)` join between `tracked_detection` and `segmentation`.)
 
-The matte source is therefore the **coarse polygon** (rasterised + feathered), not the soft
-sigmoid mask. That is honest MVP quality; a soft-matte upgrade is P4 (below).
+**Matte source (soft alpha, implemented).** `detect_seg`'s soft sigmoid mask
+(`build_mask` = proto×coeffs) can't be reconstructed in `review_export` (proto/coeffs never leave
+the detector), so `detect_seg` itself emits it: with `emit_soft_mask=true` it crops the soft mask to
+each object's bbox, downscales to ≤`soft_mask_max_edge` (default 64px), and ships it base64 in the
+detection's `mask:{format:"alpha",w,h,data}` (a few KB/object — metadata-scale, not bulk pixels,
+and it supersedes the polygon). `review_export` bilinearly upsamples it to the cutout for a true
+soft-alpha premultiply and forwards the same compact alpha into the manifest so zm-api composites
+with real per-pixel alpha. The **coarse polygon** remains the fallback when `emit_soft_mask` is off
+or the alpha is absent — so review still works without the soft mask, just with harder edges.
 
 ## zm-next work
 
@@ -247,7 +256,7 @@ target. Lifecycle is the standard `start/stop/on_frame` (`zm_plugin_init`,
 | **P1** Composite still | zm-api | Ingest `0x0306`; blit all tube cutouts onto the plate → one image; serve | `GET /events/{id}/review` returns a glanceable still; validates the whole ingredient path |
 | **P2** Temporal optimiser | zm-api | Tube time-shift packing (greedy first), collision + interaction handling | layout preview (still frames at synopsis times) |
 | **P3** Render + serve | zm-api | Composite time-shifted tubes → mp4 (shell ffmpeg), cache, REST + queue | `GET /events/{id}/synopsis` returns the clip |
-| **P4** Polish | both | soft-matte (detect_seg soft-mask side file → true alpha PNG); time-varying plate selection; retention/budget; per-camera tuning; Poisson blend | quality + storage benchmarks |
+| **P4** Polish | both | **soft-matte — DONE** (detect_seg emits the soft sigmoid mask as compact base64 alpha; review_export upsamples it for a true soft-alpha premultiply + forwards it to the manifest); remaining: time-varying plate selection; retention/budget; per-camera tuning; Poisson blend | quality + storage benchmarks |
 
 Each phase is independently demoable; P1 is the first shippable feature.
 
@@ -279,7 +288,7 @@ Each phase is independently demoable; P1 is the first shippable feature.
 | **Flicker** | temporally smooth per-object mask/scale (penalise 2nd-order diffs); EMA the cutout edge |
 | **Label clutter** | show per-tube timestamp labels on hover/selection or a few at a time, not all |
 | **Missed samples under load** | StageRunner drop-oldest → nearest-frame fallback or skip sample; tolerate gaps |
-| **Polygon-grade mattes look rough** | P4: `detect_seg` writes a downscaled soft-alpha side file (it has proto+coeffs+frame) → true alpha |
+| **Polygon-grade mattes look rough** | DONE: `detect_seg emit_soft_mask=true` emits the soft sigmoid alpha (proto×coeffs, downscaled+base64); review_export soft-premultiplies + forwards it. Polygon is the fallback. |
 | **Split interactions** (hand-off, person+bag) | zm-api groups co-occurring tubes and shifts each group as a rigid unit |
 
 ## Smoke test / verification (P0)
@@ -296,7 +305,8 @@ cat /tmp/.../synopsis/manifest.json | jq '.tubes | length'   # >0 tubes
 ls /tmp/.../synopsis/t*/                                # cutout JPEGs exist
 ```
 
-**Tests (gtest):** the matte unit must target the **polygon-rasterisation** path (not the
-unreachable `build_mask`): polygon→binary mask→feather; premultiply correctness; sampling cadence
-(≤ `sample_fps`/track); manifest shape + `event_id==0`/own-naming `path_base` handling. Keep
+**Tests (gtest):** matte helpers are covered by `ReviewMatteTest` (polygon raster, feather,
+premultiply, **bilinear `upsample_alpha`**, **base64 round-trip**) and `MaskToAlpha.*` in the
+detect_seg suite (soft-mask crop/downscale/gradient preservation). Plus sampling cadence
+(≤ `sample_fps`/track) and manifest shape / `event_id==0` / own-naming `path_base`. Keep
 `./build.sh test` green.

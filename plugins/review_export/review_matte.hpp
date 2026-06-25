@@ -60,6 +60,36 @@ inline void box_blur3(std::vector<uint8_t>& m, int w, int h) {
     }
 }
 
+// Bilinearly upsample (or resample) an 8-bit alpha mask from src (sw*sh) to dst
+// (dw*dh). Used to stretch detect_seg's downscaled soft mask onto the cutout. dst
+// is resized to dw*dh. Degenerate inputs yield an all-255 dst (plain crop).
+inline void upsample_alpha(const std::vector<uint8_t>& src, int sw, int sh,
+                           std::vector<uint8_t>& dst, int dw, int dh) {
+    dst.assign(static_cast<size_t>(dw) * dh, 255);
+    if (sw < 1 || sh < 1 || src.size() < static_cast<size_t>(sw) * sh || dw < 1 || dh < 1)
+        return;
+    for (int y = 0; y < dh; ++y) {
+        const float fy = (dh > 1) ? (static_cast<float>(y) * (sh - 1) / (dh - 1)) : 0.0f;
+        const int y0 = static_cast<int>(fy);
+        const int y1 = std::min(sh - 1, y0 + 1);
+        const float wy = fy - y0;
+        for (int x = 0; x < dw; ++x) {
+            const float fx = (dw > 1) ? (static_cast<float>(x) * (sw - 1) / (dw - 1)) : 0.0f;
+            const int x0 = static_cast<int>(fx);
+            const int x1 = std::min(sw - 1, x0 + 1);
+            const float wx = fx - x0;
+            const float a = src[static_cast<size_t>(y0) * sw + x0];
+            const float b = src[static_cast<size_t>(y0) * sw + x1];
+            const float c = src[static_cast<size_t>(y1) * sw + x0];
+            const float d = src[static_cast<size_t>(y1) * sw + x1];
+            const float top = a + (b - a) * wx;
+            const float bot = c + (d - c) * wx;
+            dst[static_cast<size_t>(y) * dw + x] =
+                static_cast<uint8_t>(top + (bot - top) * wy + 0.5f);
+        }
+    }
+}
+
 // Premultiply a packed RGB24 buffer by an 8-bit matte (per pixel: c = c*m/255), so
 // background pixels (matte 0) go black and survive lossy JPEG cleanly.
 inline void premultiply_rgb(std::vector<uint8_t>& rgb, const std::vector<uint8_t>& mask) {

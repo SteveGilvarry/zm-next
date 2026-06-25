@@ -161,6 +161,57 @@ inline std::vector<float> build_mask(const float* proto, int mask_dim,
 //
 // `box` (source pixels, xywh) clips the mask so only pixels inside the
 // detection box contribute (YOLO-seg crops the mask to the box).
+// A downscaled soft-alpha cutout of one object's mask, aligned to its bbox.
+// `w`*`h` row-major 8-bit alpha (0=background, 255=object); stretch it across the
+// object's bbox at render time. This preserves the per-pixel soft matte the
+// polygon throws away, while staying small (capped by max_edge).
+struct AlphaMask {
+    int w = 0, h = 0;
+    std::vector<uint8_t> data;  // row-major w*h, 8-bit
+};
+
+// Crop the soft mask (mh*mw, [0,1]) to the object's bbox footprint in mask-grid
+// coords, convert to 8-bit alpha, and downscale (nearest) so the longer edge is
+// <= max_edge. The result maps linearly onto the object's source-pixel bbox.
+inline AlphaMask mask_to_alpha(const std::vector<float>& mask, int mh, int mw,
+                               const zm::detect::Letterbox& lb, const SegObj& box,
+                               int max_edge = 64) {
+    AlphaMask out;
+    const float net = static_cast<float>(lb.net);
+    const float sx = net / static_cast<float>(mw);
+    const float sy = net / static_cast<float>(mh);
+    auto src_to_mask_x = [&](float xs) { return (xs * lb.scale + lb.pad_x) / sx; };
+    auto src_to_mask_y = [&](float ys) { return (ys * lb.scale + lb.pad_y) / sy; };
+    const int bx0 = std::max(0, static_cast<int>(std::floor(src_to_mask_x(box.x))));
+    const int bx1 = std::min(mw - 1, static_cast<int>(std::ceil(src_to_mask_x(box.x + box.w))));
+    const int by0 = std::max(0, static_cast<int>(std::floor(src_to_mask_y(box.y))));
+    const int by1 = std::min(mh - 1, static_cast<int>(std::ceil(src_to_mask_y(box.y + box.h))));
+    const int cw = bx1 - bx0 + 1;
+    const int ch = by1 - by0 + 1;
+    if (cw < 1 || ch < 1) return out;
+
+    // Target dims: downscale (nearest) so the long edge <= max_edge.
+    int dw = cw, dh = ch;
+    const int longEdge = std::max(cw, ch);
+    if (max_edge > 0 && longEdge > max_edge) {
+        const double s = static_cast<double>(max_edge) / longEdge;
+        dw = std::max(1, static_cast<int>(cw * s));
+        dh = std::max(1, static_cast<int>(ch * s));
+    }
+    out.w = dw; out.h = dh;
+    out.data.resize(static_cast<size_t>(dw) * dh);
+    for (int y = 0; y < dh; ++y) {
+        const int my = by0 + std::min(ch - 1, y * ch / dh);
+        for (int x = 0; x < dw; ++x) {
+            const int mx = bx0 + std::min(cw - 1, x * cw / dw);
+            float v = mask[static_cast<size_t>(my) * mw + mx];
+            if (v < 0.0f) v = 0.0f; else if (v > 1.0f) v = 1.0f;
+            out.data[static_cast<size_t>(y) * dw + x] = static_cast<uint8_t>(v * 255.0f + 0.5f);
+        }
+    }
+    return out;
+}
+
 inline std::vector<std::array<float, 2>> mask_to_polygon(
         const std::vector<float>& mask, int mh, int mw, float thr,
         const zm::detect::Letterbox& lb, const SegObj& box, int row_step = 2) {

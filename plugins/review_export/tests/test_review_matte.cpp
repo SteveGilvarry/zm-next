@@ -2,6 +2,7 @@
 // polygon rasterisation, feather, and premultiplication. No FFmpeg/model needed.
 
 #include "review_matte.hpp"
+#include "base64.hpp"
 
 #include <gtest/gtest.h>
 
@@ -11,6 +12,7 @@
 using zm::review::fill_polygon;
 using zm::review::box_blur3;
 using zm::review::premultiply_rgb;
+using zm::review::upsample_alpha;
 
 namespace {
 std::vector<std::array<float, 2>> square(float x0, float y0, float x1, float y1) {
@@ -85,4 +87,38 @@ TEST(ReviewMatte, PremultiplyHalfMatteScales) {
     std::vector<uint8_t> mask = {128};
     premultiply_rgb(rgb, mask);
     EXPECT_NEAR(rgb[0], 100, 2);
+}
+
+TEST(ReviewMatte, UpsampleAlphaPreservesCornersAndInterpolates) {
+    // 2x2 source: top row 0, bottom row 200 -> upsample to 1x5 column should ramp.
+    std::vector<uint8_t> src = {0, 0, 200, 200};  // 2x2
+    std::vector<uint8_t> dst;
+    upsample_alpha(src, 2, 2, dst, 1, 5);
+    ASSERT_EQ(dst.size(), 5u);
+    EXPECT_EQ(dst.front(), 0);      // top
+    EXPECT_EQ(dst.back(), 200);     // bottom
+    EXPECT_GT(dst[2], 80);          // middle interpolated
+    EXPECT_LT(dst[2], 120);
+}
+
+TEST(ReviewMatte, UpsampleAlphaDegenerateIsOpaque) {
+    std::vector<uint8_t> dst;
+    upsample_alpha({}, 0, 0, dst, 3, 3);
+    ASSERT_EQ(dst.size(), 9u);
+    for (uint8_t v : dst) EXPECT_EQ(v, 255);
+}
+
+TEST(Base64, RoundTripsArbitraryBytes) {
+    std::vector<uint8_t> in;
+    for (int i = 0; i < 256; ++i) in.push_back(static_cast<uint8_t>(i * 7 + 1));
+    const std::string enc = zm::b64::encode(in);
+    const std::vector<uint8_t> out = zm::b64::decode(enc);
+    EXPECT_EQ(in, out);
+}
+
+TEST(Base64, HandlesPaddingLengths) {
+    for (size_t n : {1u, 2u, 3u, 4u, 5u}) {
+        std::vector<uint8_t> in(n, 0xAB);
+        EXPECT_EQ(zm::b64::decode(zm::b64::encode(in)), in) << "n=" << n;
+    }
 }

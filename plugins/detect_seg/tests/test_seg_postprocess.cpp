@@ -157,6 +157,44 @@ TEST(Decode, ChannelMajorArgmaxAndBox) {
     EXPECT_NEAR(objs[0].coeffs[1], -0.5f, 1e-6f);
 }
 
+TEST(MaskToAlpha, CropsBoxFootprintToSoftAlpha) {
+    // 1:1 letterbox (scale 1, no pad), 8x8 mask grid. Object box (2,2,4,4).
+    zm::detect::Letterbox lb = zm::detect::compute_letterbox(8, 8, 8);
+    const int mh = 8, mw = 8;
+    std::vector<float> mask(static_cast<size_t>(mh) * mw, 0.0f);
+    for (int y = 2; y <= 6; ++y)
+        for (int x = 2; x <= 6; ++x)
+            mask[static_cast<size_t>(y) * mw + x] = 1.0f;
+    SegObj box = makeBox(2, 2, 4, 4, 0.9f, 0);
+    AlphaMask am = mask_to_alpha(mask, mh, mw, lb, box, /*max_edge=*/64);
+    EXPECT_EQ(am.w, 5);
+    EXPECT_EQ(am.h, 5);
+    ASSERT_EQ(am.data.size(), 25u);
+    for (uint8_t v : am.data) EXPECT_EQ(v, 255);  // all inside the box -> opaque
+}
+
+TEST(MaskToAlpha, DownscalesToMaxEdge) {
+    zm::detect::Letterbox lb = zm::detect::compute_letterbox(8, 8, 8);
+    const int mh = 8, mw = 8;
+    std::vector<float> mask(static_cast<size_t>(mh) * mw, 1.0f);
+    SegObj box = makeBox(0, 0, 8, 8, 0.9f, 0);   // whole grid -> 8x8 crop
+    AlphaMask am = mask_to_alpha(mask, mh, mw, lb, box, /*max_edge=*/4);
+    EXPECT_LE(am.w, 4);
+    EXPECT_LE(am.h, 4);
+    EXPECT_GT(am.w, 0);
+}
+
+TEST(MaskToAlpha, PreservesSoftGradient) {
+    zm::detect::Letterbox lb = zm::detect::compute_letterbox(8, 8, 8);
+    const int mh = 8, mw = 8;
+    std::vector<float> mask(static_cast<size_t>(mh) * mw, 0.0f);
+    // a soft 0.5 value should map to ~128, not snap to 0/255 (the polygon would)
+    mask[static_cast<size_t>(3) * mw + 3] = 0.5f;
+    SegObj box = makeBox(2, 2, 4, 4, 0.9f, 0);
+    AlphaMask am = mask_to_alpha(mask, mh, mw, lb, box, /*max_edge=*/64);
+    EXPECT_NEAR(am.data[static_cast<size_t>(1) * am.w + 1], 128, 2);  // (3,3) -> crop-local (1,1)
+}
+
 TEST(Decode, ConfidenceThresholdRejects) {
     zm::detect::Letterbox lb = zm::detect::compute_letterbox(8, 8, 8);
     const int num = 1, nc = 2, nm = 2;

@@ -27,8 +27,8 @@
               "cfg": { "model_path": "/path/to/yolo11n-seg.onnx", "ep": "coreml",
                        "input_size": 640, "conf_threshold": 0.35,
                        "frame_width": 1280, "frame_height": 720,
-                       "mask_format": "polygon", "event_type": "detection",
-                       "class_filter": [0] },
+                       "event_type": "detection", "emit_soft_mask": true,
+                       "soft_mask_max_edge": 64, "class_filter": [0] },
               "queue_depth": 2,
               "children": [
                 { "id": "track", "kind": "tracker",
