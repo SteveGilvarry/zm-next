@@ -10,7 +10,7 @@
 ![FFmpeg 7](https://img.shields.io/badge/FFmpeg-%E2%89%A57.0-007808?logo=ffmpeg&logoColor=white)
 ![ONNX Runtime](https://img.shields.io/badge/ONNX_Runtime-detect_tier-005CED?logo=onnx&logoColor=white)
 ![CMake + vcpkg](https://img.shields.io/badge/build-CMake_%2B_vcpkg-064F8C?logo=cmake&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-25_ctest_suites-success)
+![Tests](https://img.shields.io/badge/tests-27_ctest_suites-success)
 ![Platform](https://img.shields.io/badge/platform-macOS_%7C_Linux-lightgrey)
 ![License](https://img.shields.io/badge/license-AGPL--3.0_%2F_Commercial-blue)
 
@@ -66,8 +66,10 @@ on a signal. All persistence, policy, auth, and viewer fan-out live upstream.
   from the stream handshake and supports configurable hwaccel (CUDA / VideoToolbox / VAAPI / QSV).
   Audio is carried end-to-end; two-way audio (talkback) is in the contract.
 - **🧠 An AI tier, not a bolt-on** — embedded ONNX Runtime detection (YOLO, open-vocab, pose,
-  segmentation, face, LPR), audio event detection, tracking, zone/line analytics, and VLM scene
-  description — all JSON-configurable, with an optional **GPU zero-copy** decode→inference path.
+  segmentation, face, LPR), AudioSet-style audio-event classification, **OC-SORT** tracking with
+  appearance (**OSNet ReID**) gating, zone/line analytics, and VLM scene description — all
+  JSON-configurable, with an optional **GPU zero-copy** decode→inference path (NVDEC → on-GPU
+  detect → cross-camera dynamic batching), validated on Linux/NVIDIA.
 - **✅ Proven end-to-end** — a runnable, camera-free proof drives capture → decode → motion → detect
   + recording and observes the worker socket; an integration smoke suite guards it in CI.
 
@@ -75,15 +77,15 @@ on a signal. All persistence, policy, auth, and viewer fan-out live upstream.
 
 | Stage | Plugins |
 |---|---|
-| **Input** | `capture_rtsp_multi` (multi-stream RTSP), `capture_file` (file replay, loop, audio) |
-| **Decode / Encode** | `decode_ffmpeg` (auto codec + hwaccel), `encode_ffmpeg` (H.264/HEVC, nvenc/videotoolbox/…) |
+| **Input** | `capture_rtsp_multi` (multi-stream RTSP + audio), `capture_file` (file replay, loop, audio) |
+| **Decode / Encode** | `decode_ffmpeg` (auto codec + hwaccel), `decode_detect` (fused NVDEC decode + on-GPU detect in one synchronous stage), `encode_ffmpeg` (H.264/HEVC, nvenc/videotoolbox/…) |
 | **Motion / pre-filter** | `motion_gate` (SIMD pixel-diff gate), `zones` (R-tree spatial index), `motion_pixel_diff`, `motion_hybrid` |
-| **Detect** | `detect_onnx` (YOLO, +CUDA zero-copy), `detect_openvocab`, `detect_pose`, `detect_seg` |
+| **Detect** | `detect_onnx` (YOLO + optional OSNet **ReID** embeddings, +CUDA zero-copy & shared cross-camera batched engine), `detect_openvocab`, `detect_pose`, `detect_seg` |
 | **Recognize** | `recognize_face` (detector + embedder gallery), `lpr` (plate detect + OCR) |
-| **Audio** | `audio_detect` (windowed audio event classification) |
-| **Track / Analyze / Understand** | `tracker` (IOU/SORT-style), `analytics_rules` (intrusion / line-cross / loiter), `describe_vlm` (scene description via a VLM server) |
+| **Audio** | `audio_detect` (windowed audio-event classification; raw-waveform *or* log-mel front-end — YAMNet / PANNs / CED / EfficientAT) |
+| **Track / Analyze / Understand** | `tracker` (**OC-SORT**: Kalman + ByteTrack two-stage, appearance-gated ReID), `analytics_rules` (intrusion / line-cross / loiter), `alert_policy` (collapse per-frame detections into per-object alerts), `describe_vlm` (scene description via a VLM server), `llm_event_review` (LLM montage review + track-close narrator) |
 | **Output** | `output_webrtc`, `output_mse`, `output_mqtt`, `output_webhook` |
-| **Store** | `store` (`mode` = continuous keyframe-aligned rotation / event pre-roll+post-roll / both), `store_snapshot` |
+| **Store / Export** | `store` (`mode` = continuous keyframe-aligned rotation / event pre-roll+post-roll / both), `store_snapshot`, `review_export` (motion-synopsis tubes + plate refs for the renderer) |
 | **Utility** | `overlay`, `privacy_mask`, `hello` (reference plugin) |
 
 Every plugin's config keys are documented in **[docs/Plugin_Config_Reference.md](docs/Plugin_Config_Reference.md)**.
@@ -164,7 +166,7 @@ ctest --test-dir build -R WorkerLinkTest           # one suite by name
 ctest --test-dir build -R IntegrationSmoke         # end-to-end pipeline smoke
 ```
 
-**25 suites** cover the core (`ShmRing`, `EventBus`, `PluginManager`, `PipelineLoader`, `StageRunner`,
+**27 suites** cover the core (`ShmRing`, `EventBus`, `PluginManager`, `PipelineLoader`, `StageRunner`,
 `WorkerLink`), every plugin's pure logic, and a process-level **integration smoke test** that drives
 the built worker through baseline / HEVC / loop-replay / segment-rotation / dead-input / audio
 scenarios and asserts decode, recording, and socket behavior. The integration test skips itself
@@ -199,11 +201,13 @@ src/         zm-core.cpp — the per-monitor worker entry point
 
 ## 🗺️ Status & roadmap
 
-ZM-Next is under active development. The capture → decode → motion → detect → record pipeline, the
-per-stage threading, and the canonical worker-socket contract are implemented and validated end-to-end. On
-the horizon: hardening for daemon supervision (watchdog/liveness, `SO_PEERCRED` access control,
-per-stage health metrics), GPU validation on Linux/NVIDIA, and per-camera cutover alongside legacy
-`zmc`/`zma`.
+ZM-Next is under active development. The capture → decode → motion → detect → track → record pipeline,
+the per-stage threading, and the canonical worker-socket contract are implemented and validated
+end-to-end. The **GPU zero-copy path is validated on Linux/NVIDIA** (RTX 50-series): NVDEC decode →
+on-GPU YOLO → OC-SORT + OSNet ReID, cross-camera dynamic batching through a shared inference engine,
+and AudioSet audio classification on the live stream. On the horizon: hardening for daemon supervision
+(watchdog/liveness, `SO_PEERCRED` access control, per-stage health metrics), the ONNX Runtime TensorRT
+EP (fp16/INT8), and per-camera cutover alongside legacy `zmc`/`zma`.
 
 ## 📄 License
 
