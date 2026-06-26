@@ -96,6 +96,8 @@ struct DetectOnnxCtx {
     uint64_t lastSweepUsec = 0;
     bool sweptOnce = false;
     bool sharedEngine = false;     // route full-frame CUDA detect through the shared engine
+    int  sharedMaxBatch = 8;       // max tensors coalesced per batched Run
+    int  sharedMaxWaitUs = 2000;   // linger after first request to let a batch fill
     bool engineReady = false;
 
     bool warnedUnsupportedShape = false;
@@ -157,6 +159,8 @@ static int detect_onnx_start(zm_plugin_t* plugin, zm_host_api_t* host, void* hos
             ctx->maxRegions = j.value("max_regions", 8);
             ctx->fullSweepSec = j.value("full_sweep_sec", 2.0);
             ctx->sharedEngine = j.value("shared_engine", false);
+            ctx->sharedMaxBatch = j.value("shared_max_batch", 8);
+            ctx->sharedMaxWaitUs = j.value("shared_max_wait_us", 2000);
         } catch (const std::exception& e) {
             ZM_LOG_ERROR("detect_onnx: failed to parse config: %s", e.what());
         }
@@ -209,7 +213,8 @@ static int detect_onnx_start(zm_plugin_t* plugin, zm_host_api_t* host, void* hos
     // batched engine (one ORT session + CUDA context for all detect instances).
     if (ctx->sharedEngine && ctx->ep == "cuda" && !ctx->modelPath.empty()) {
         try {
-            zm::detect::InferenceEngine::get(ctx->modelPath, ctx->net);   // load shared session now
+            zm::detect::InferenceEngine::get(ctx->modelPath, ctx->net,
+                                             ctx->sharedMaxBatch, ctx->sharedMaxWaitUs);   // load shared session now
             ctx->engineReady = true;
             ctx->roiMotion = false;   // engine path is whole-frame only
             ZM_LOG_INFO("detect_onnx: using SHARED batched inference engine (model '%s')",
