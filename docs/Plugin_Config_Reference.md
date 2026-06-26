@@ -50,7 +50,10 @@ optional with the defaults shown. Common keys:
 ## Detect / recognize
 - **detect_onnx** — `model_path`, `input_size` (640), `conf_threshold` (0.25),
   `class_filter`, `class_names` (COCO-80), `frame_width`/`frame_height`, `ep`,
-  `stream_filter`.
+  `stream_filter`. ReID (appearance embedding for the tracker): `reid` (false);
+  `reid_model_path` (optional OSNet-style ONNX — when set, emits a learned
+  embedding per box, else falls back to an HSV colour histogram),
+  `reid_input_w` (128) / `reid_input_h` (256).
 - **detect_openvocab** — `model_path`, `prompts` (class names baked into export),
   `input_size`, `conf_threshold`, `frame_width`/`frame_height`, `ep`,
   `stream_filter`.
@@ -70,7 +73,11 @@ optional with the defaults shown. Common keys:
   `conf_threshold` (0.4), `top_k` (3), `labels`.
 
 ## Track / analytics / understand
-- **tracker** — `iou_threshold` (0.3), `max_age` (30), `min_hits` (3).
+- **tracker** — `iou_threshold` (0.3), `max_age` (30), `min_hits` (3),
+  `class_gated` (true), `appearance_threshold` (0=off) / `appearance_weight` (0.3) /
+  `embed_alpha` (0.1) for ReID; OC-SORT/ByteTrack: `det_high_thresh` (0.5,
+  high/low confidence split; 0 = single-stage), `low_iou_threshold` (0.2),
+  `ocm_weight` (0.2). Kalman motion + observation-centric recovery are always on.
 - **analytics_rules** — `rules`: array of
   `{name, type:"intrusion"|"linecross"|"loiter", polygon|line, direction, seconds, classes, stream_id}`.
 - **describe_vlm** — `server_url` (OpenAI-compatible VLM), `model`,

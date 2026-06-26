@@ -70,6 +70,14 @@ struct DetectOnnxCtx {
     int frameHeight = 0;
     std::string ep = "cpu";
     bool reid = false;                  // attach an appearance embedding per box
+    // Optional learned ReID head (OSNet-style ONNX). When set, replaces the HSV
+    // colour histogram with a discriminative embedding. Falls back to histogram
+    // if unset or the model fails to load.
+    std::string reidModelPath;
+    int reidW = 128, reidH = 256;       // ReID input W×H (OSNet default 128×256)
+    std::unique_ptr<Ort::Session> reidSession;
+    std::string reidInputName, reidOutputName;
+    bool reidReady = false;
     std::vector<int> classFilter;       // empty = all
     std::vector<int> streamFilter;      // empty = all
     std::vector<std::string> classNames; // empty = use COCO-80
@@ -132,6 +140,9 @@ static int detect_onnx_start(zm_plugin_t* plugin, zm_host_api_t* host, void* hos
             ctx->frameWidth = j.value("frame_width", 0);
             ctx->frameHeight = j.value("frame_height", 0);
             ctx->reid = j.value("reid", false);
+            ctx->reidModelPath = j.value("reid_model_path", std::string());
+            ctx->reidW = j.value("reid_input_w", 128);
+            ctx->reidH = j.value("reid_input_h", 256);
             ctx->ep = j.value("ep", std::string("cpu"));
             if (j.contains("class_filter") && j["class_filter"].is_array())
                 ctx->classFilter = j["class_filter"].get<std::vector<int>>();
@@ -233,6 +244,28 @@ static int detect_onnx_start(zm_plugin_t* plugin, zm_host_api_t* host, void* hos
         ZM_LOG_WARN("detect_onnx: no model_path configured; running as pass-through");
     }
 
+    // Optional learned ReID head. Loaded only when reid is on AND a model path is
+    // given; on failure we fall back to the colour-histogram embedding.
+    if (ctx->reid && !ctx->reidModelPath.empty() && ctx->env) {
+        try {
+            ctx->reidSession = std::make_unique<Ort::Session>(
+                *ctx->env, ctx->reidModelPath.c_str(), ctx->sessionOptions);
+            Ort::AllocatorWithDefaultOptions alloc;
+            ctx->reidInputName = ctx->reidSession->GetInputNameAllocated(0, alloc).get();
+            ctx->reidOutputName = ctx->reidSession->GetOutputNameAllocated(0, alloc).get();
+            ctx->reidReady = true;
+            ZM_LOG_INFO("detect_onnx: loaded ReID model '%s' (in='%s' out='%s' %dx%d)",
+                        ctx->reidModelPath.c_str(), ctx->reidInputName.c_str(),
+                        ctx->reidOutputName.c_str(), ctx->reidW, ctx->reidH);
+        } catch (const std::exception& e) {
+            ZM_LOG_WARN("detect_onnx: ReID model '%s' failed to load (%s); "
+                        "falling back to colour-histogram embedding",
+                        ctx->reidModelPath.c_str(), e.what());
+            ctx->reidSession.reset();
+            ctx->reidReady = false;
+        }
+    }
+
     plugin->instance = ctx;
     return 0;
 }
@@ -245,6 +278,68 @@ static void detect_onnx_stop(zm_plugin_t* plugin) {
 #endif
         delete ctx;
         plugin->instance = nullptr;
+    }
+}
+
+// Learned ReID embedding: crop the box, bilinear-resize to the model's W×H,
+// ImageNet-normalize (RGB, CHW), run the ONNX ReID head, L2-normalize the output.
+// Returns {} on a degenerate box or any failure (caller falls back to histogram).
+static std::vector<float> reidEmbed(DetectOnnxCtx* ctx, const uint8_t* rgb,
+                                    int fw, int fh, const zm::detect::Box& b) {
+    if (!ctx->reidReady || !rgb || fw <= 0 || fh <= 0) return {};
+    const int W = ctx->reidW, H = ctx->reidH;
+    if (W <= 0 || H <= 0) return {};
+    const float bx0 = std::max(0.f, b.x), by0 = std::max(0.f, b.y);
+    const float bx1 = std::min(static_cast<float>(fw), b.x + b.w);
+    const float by1 = std::min(static_cast<float>(fh), b.y + b.h);
+    const float cropW = bx1 - bx0, cropH = by1 - by0;
+    if (cropW < 2.f || cropH < 2.f) return {};
+
+    static const float mean[3] = {0.485f, 0.456f, 0.406f};
+    static const float stdv[3] = {0.229f, 0.224f, 0.225f};
+    std::vector<float> chw(static_cast<size_t>(3) * W * H);
+    const size_t plane = static_cast<size_t>(W) * H;
+    for (int y = 0; y < H; ++y) {
+        const float fy = by0 + (y + 0.5f) * cropH / H - 0.5f;
+        const int y0 = std::clamp(static_cast<int>(std::floor(fy)), 0, fh - 1);
+        const int y1 = std::min(fh - 1, y0 + 1);
+        const float wy = std::clamp(fy - y0, 0.f, 1.f);
+        for (int x = 0; x < W; ++x) {
+            const float fx = bx0 + (x + 0.5f) * cropW / W - 0.5f;
+            const int x0 = std::clamp(static_cast<int>(std::floor(fx)), 0, fw - 1);
+            const int x1 = std::min(fw - 1, x0 + 1);
+            const float wx = std::clamp(fx - x0, 0.f, 1.f);
+            const uint8_t* p00 = rgb + (static_cast<size_t>(y0) * fw + x0) * 3;
+            const uint8_t* p01 = rgb + (static_cast<size_t>(y0) * fw + x1) * 3;
+            const uint8_t* p10 = rgb + (static_cast<size_t>(y1) * fw + x0) * 3;
+            const uint8_t* p11 = rgb + (static_cast<size_t>(y1) * fw + x1) * 3;
+            for (int c = 0; c < 3; ++c) {
+                const float top = p00[c] + (p01[c] - p00[c]) * wx;
+                const float bot = p10[c] + (p11[c] - p10[c]) * wx;
+                const float v = (top + (bot - top) * wy) / 255.f;
+                chw[c * plane + static_cast<size_t>(y) * W + x] = (v - mean[c]) / stdv[c];
+            }
+        }
+    }
+
+    try {
+        Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        std::array<int64_t, 4> shape{1, 3, H, W};
+        Ort::Value in = Ort::Value::CreateTensor<float>(
+            mem, chw.data(), chw.size(), shape.data(), shape.size());
+        const char* inNames[] = {ctx->reidInputName.c_str()};
+        const char* outNames[] = {ctx->reidOutputName.c_str()};
+        auto out = ctx->reidSession->Run(Ort::RunOptions{nullptr}, inNames, &in, 1, outNames, 1);
+        const float* data = out[0].GetTensorData<float>();
+        const auto cnt = out[0].GetTensorTypeAndShapeInfo().GetElementCount();
+        std::vector<float> emb(data, data + cnt);
+        float norm = 0.f;
+        for (float v : emb) norm += v * v;
+        if (norm > 0.f) { norm = std::sqrt(norm); for (float& v : emb) v /= norm; }
+        return emb;
+    } catch (const std::exception& e) {
+        ZM_LOG_WARN("detect_onnx: ReID inference failed: %s", e.what());
+        return {};
     }
 }
 
@@ -319,7 +414,11 @@ static void publishBoxes(DetectOnnxCtx* ctx, const zm_frame_hdr_t* hdr,
         d["bbox"] = {b.x, b.y, b.w, b.h};
         d["class_id"] = b.class_id;
         if (doReid) {
-            auto emb = appearanceEmbed(rgb, fw, fh, b);
+            // Learned ReID embedding when a model is loaded, else colour histogram.
+            auto emb = ctx->reidReady ? reidEmbed(ctx, rgb, fw, fh, b)
+                                      : appearanceEmbed(rgb, fw, fh, b);
+            if (emb.empty() && ctx->reidReady)      // model produced nothing → fall back
+                emb = appearanceEmbed(rgb, fw, fh, b);
             if (!emb.empty()) d["embedding"] = emb;
         }
         detections.push_back(std::move(d));
