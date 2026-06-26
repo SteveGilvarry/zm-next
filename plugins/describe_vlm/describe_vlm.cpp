@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -76,7 +77,16 @@ struct DescribeVlmCtx {
     void* trigSub = nullptr;             // host subscription handle
     std::string curTrigger;             // trigger JSON for the in-flight describe (worker thread only)
 
-    // Latest frame snapshot (protected by frameMutex)
+    // Multi-frame config: send up to `frames` keyframes spaced ~frameIntervalMs
+    // so a temporally-aware VLM can reason about motion (loiter / package-drop /
+    // approach-then-leave). frames<=1 keeps the original single-frame behaviour.
+    int frames = 1;
+    int frameIntervalMs = 700;
+    bool jsonOutput = false;            // request structured {description,threat_level,confidence}
+    int maxTokens = 128;
+
+    // Latest frame snapshot + a sparse ring (one frame per ~frameIntervalMs, last
+    // `frames` kept) — all protected by frameMutex.
     std::mutex frameMutex;
     std::vector<uint8_t> latestFrame;
     int latestWidth = 0;
@@ -84,6 +94,8 @@ struct DescribeVlmCtx {
     uint32_t latestStreamId = 0;
     uint64_t latestPtsUsec = 0;
     bool haveFrame = false;
+    struct RingFrame { uint64_t pts = 0; int w = 0, h = 0; std::vector<uint8_t> rgb; };
+    std::deque<RingFrame> ring;
 
     // Background worker
     std::thread worker;
@@ -145,40 +157,60 @@ static bool http_post_json(const std::string& url, const std::string& body,
 // ---------------------------------------------------------------------------
 // Inference cycle
 // ---------------------------------------------------------------------------
+// JSON schema for structured scene answers (json_output mode).
+static const char* kSceneSchema =
+    R"({"type":"object","properties":{"description":{"type":"string"},)"
+    R"("threat_level":{"type":"string","enum":["LOW","MEDIUM","HIGH"]},)"
+    R"("confidence":{"type":"number"}},"required":["description","threat_level"]})";
+
 static void run_inference_cycle(DescribeVlmCtx* ctx) {
-    // Snapshot the latest frame under the lock.
-    std::vector<uint8_t> frame;
-    int width = 0, height = 0;
+    // Gather frame(s): the sampled ring (multi-frame mode) or the latest snapshot.
+    DescribeVlmCtx::RingFrame single;
+    std::vector<DescribeVlmCtx::RingFrame> picked;
     uint32_t streamId = 0;
     uint64_t ptsUsec = 0;
     {
         std::lock_guard<std::mutex> lk(ctx->frameMutex);
         if (!ctx->haveFrame || ctx->latestFrame.empty()) return;
-        frame = ctx->latestFrame;
-        width = ctx->latestWidth;
-        height = ctx->latestHeight;
         streamId = ctx->latestStreamId;
         ptsUsec = ctx->latestPtsUsec;
+        if (ctx->frames > 1 && !ctx->ring.empty()) {
+            picked.assign(ctx->ring.begin(), ctx->ring.end());  // already spaced, oldest→newest
+        } else {
+            single.pts = ctx->latestPtsUsec;
+            single.w = ctx->latestWidth;
+            single.h = ctx->latestHeight;
+            single.rgb = ctx->latestFrame;
+            picked.push_back(std::move(single));
+        }
     }
 
-    if (width <= 0 || height <= 0) {
-        ZM_LOG_ERROR("describe_vlm: invalid frame dimensions %dx%d", width, height);
-        return;
+    const uint64_t newestPts = picked.back().pts;
+    std::vector<vlm::ReqFrame> reqs;
+    reqs.reserve(picked.size());
+    for (const auto& f : picked) {
+        if (f.w <= 0 || f.h <= 0 || f.rgb.size() < size_t(f.w) * size_t(f.h) * 3) continue;
+        std::vector<uint8_t> jpeg;
+        if (!zm::img::encode_rgb24_to_jpeg(f.rgb.data(), f.w, f.h, jpeg)) continue;
+        vlm::ReqFrame rf;
+        rf.jpeg_base64 = vlm::base64_encode(jpeg.data(), jpeg.size());
+        if (picked.size() > 1) {
+            // Relative timestamp caption (newest = 0.0s) for temporal grounding.
+            const double dt = (static_cast<double>(f.pts) - static_cast<double>(newestPts)) / 1e6;
+            char cap[48];
+            std::snprintf(cap, sizeof(cap), "Frame at t=%+.1fs:", dt);
+            rf.caption = cap;
+        }
+        reqs.push_back(std::move(rf));
     }
-    // Sanity: ensure the buffer is large enough for RGB24.
-    if (frame.size() < size_t(width) * size_t(height) * 3) {
-        ZM_LOG_ERROR("describe_vlm: frame buffer too small for %dx%d RGB24", width, height);
+    if (reqs.empty()) {
+        ZM_LOG_ERROR("describe_vlm: no encodable frame for inference");
         return;
     }
 
-    std::vector<uint8_t> jpeg;
-    if (!zm::img::encode_rgb24_to_jpeg(frame.data(), width, height, jpeg)) {
-        ZM_LOG_ERROR("describe_vlm: JPEG encode failed");
-        return;
-    }
-
-    std::string b64 = vlm::base64_encode(jpeg.data(), jpeg.size());
-    std::string body = vlm::build_chat_request_json(ctx->model, ctx->prompt, b64);
+    const std::string schema = ctx->jsonOutput ? std::string(kSceneSchema) : std::string();
+    std::string body = vlm::build_chat_request_json_multi(ctx->model, ctx->prompt, reqs,
+                                                          ctx->maxTokens, schema);
 
     std::string response;
     if (!http_post_json(ctx->serverUrl, body, response)) {
@@ -186,7 +218,21 @@ static void run_inference_cycle(DescribeVlmCtx* ctx) {
         return;
     }
 
-    std::string text = vlm::parse_chat_response_text(response);
+    // Structured (json_output) → pull description/threat_level/confidence; else plain text.
+    std::string text, threatLevel;
+    double sceneConfidence = -1.0;
+    if (ctx->jsonOutput) {
+        auto j = vlm::parse_structured_response(response);
+        if (j.is_object()) {
+            text = j.value("description", std::string());
+            threatLevel = j.value("threat_level", std::string());
+            if (j.contains("confidence") && j["confidence"].is_number())
+                sceneConfidence = j["confidence"].get<double>();
+        }
+        if (text.empty()) text = vlm::parse_chat_response_text(response);  // fallback
+    } else {
+        text = vlm::parse_chat_response_text(response);
+    }
     if (text.empty()) {
         ZM_LOG_ERROR("describe_vlm: failed to parse VLM response");
         return;
@@ -200,6 +246,11 @@ static void run_inference_cycle(DescribeVlmCtx* ctx) {
     evt["model"] = ctx->model;
     evt["stream_id"] = streamId;
     evt["pts_usec"] = ptsUsec;
+    evt["frames"] = static_cast<int>(reqs.size());
+    // Structured scene fields (json_output mode). `scene_confidence` is kept
+    // distinct from the detection `confidence` set from the trigger below.
+    if (!threatLevel.empty()) evt["threat_level"] = threatLevel;
+    if (sceneConfidence >= 0.0) evt["scene_confidence"] = sceneConfidence;
 
     // Embed the detection that triggered this describe, so the published event (and
     // thus the MQTT payload) is a single rich alert: VLM text + what was detected.
@@ -289,6 +340,12 @@ static int describe_vlm_start(zm_plugin_t* plugin, zm_host_api_t* host,
     if (json_cfg) {
         try {
             auto j = json::parse(json_cfg);
+            ctx->frames = j.value("frames", 1);
+            if (ctx->frames < 1) ctx->frames = 1;
+            if (ctx->frames > 8) ctx->frames = 8;
+            ctx->frameIntervalMs = j.value("frame_interval_ms", 700);
+            ctx->jsonOutput = j.value("json_output", false);
+            ctx->maxTokens = j.value("max_tokens", 128);
             ctx->frameWidth = j.value("frame_width", 0);
             ctx->frameHeight = j.value("frame_height", 0);
             ctx->serverUrl = j.value("server_url", ctx->serverUrl);
@@ -403,6 +460,23 @@ static void describe_vlm_on_frame(zm_plugin_t* plugin, const void* buf, size_t s
             ctx->latestStreamId = hdr->stream_id;
             ctx->latestPtsUsec = hdr->pts_usec;
             ctx->haveFrame = true;
+
+            // Multi-frame: keep a sparse ring sampled at ~frameIntervalMs, last
+            // `frames` kept (bounds memory to `frames` RGB frames, not every frame).
+            if (ctx->frames > 1 && width > 0 && height > 0) {
+                const uint64_t gap = static_cast<uint64_t>(ctx->frameIntervalMs) * 1000;
+                if (ctx->ring.empty() ||
+                    hdr->pts_usec - ctx->ring.back().pts >= gap) {
+                    DescribeVlmCtx::RingFrame rf;
+                    rf.pts = hdr->pts_usec;
+                    rf.w = width;
+                    rf.h = height;
+                    rf.rgb.assign(payload, payload + payloadSize);
+                    ctx->ring.push_back(std::move(rf));
+                    while (ctx->ring.size() > static_cast<size_t>(ctx->frames))
+                        ctx->ring.pop_front();
+                }
+            }
         }
     }
 
