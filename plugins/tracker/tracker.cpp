@@ -54,6 +54,9 @@ struct TrackerState {
     float appearanceThreshold = 0.f;  // min cosine sim to allow a match (0=off)
     float appearanceWeight = 0.f;     // blend of appearance into the match score
     float embedAlpha = 0.1f;          // EMA weight on each new embedding
+    float detHighThresh = 0.5f;       // ByteTrack high/low confidence split (0=single-stage)
+    float lowIou = 0.2f;              // relaxed IoU for the low-confidence recovery pass
+    float ocmWeight = 0.2f;           // observation-centric momentum weight
 
     // Per stream_id tracker. Guarded by `mutex`.
     std::mutex mutex;
@@ -66,7 +69,7 @@ struct TrackerState {
                        streamId, zm::tracker::Tracker(
                                      iouThreshold, maxAge, minHits, classGated,
                                      appearanceThreshold, appearanceWeight,
-                                     embedAlpha))
+                                     embedAlpha, detHighThresh, lowIou, ocmWeight))
                      .first;
         }
         return it->second;
@@ -184,6 +187,9 @@ int tracker_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx,
         state->appearanceThreshold = cfg.value("appearance_threshold", 0.f);
         state->appearanceWeight = cfg.value("appearance_weight", 0.3f);
         state->embedAlpha = cfg.value("embed_alpha", 0.1f);
+        state->detHighThresh = cfg.value("det_high_thresh", 0.5f);
+        state->lowIou = cfg.value("low_iou_threshold", 0.2f);
+        state->ocmWeight = cfg.value("ocm_weight", 0.2f);
     } catch (const std::exception& e) {
         ZM_LOG_ERROR("tracker: failed to parse config: %s", e.what());
     }

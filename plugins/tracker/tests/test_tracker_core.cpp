@@ -160,6 +160,38 @@ TEST(TrackerTest, AppearanceGateKeepsConsistentLook) {
     EXPECT_EQ(tr.track_count(), 1u);
 }
 
+// OC-SORT: a moving track survives a one-frame detection gap and re-acquires the
+// same id (KF coast + recovery), instead of fragmenting into a new track.
+TEST(TrackerTest, SurvivesGapKeepsId) {
+    Tracker tr(0.3f, /*max_age=*/5, /*min_hits=*/1, /*class_gated=*/true,
+               0.f, 0.f, 0.1f, /*det_high_thresh=*/0.5f, 0.2f, 0.2f);
+    const int id = tr.update({makeDet(0, 0, 10, 10, 0, 0.9f)})[0];
+    EXPECT_NE(id, 0);
+    tr.update({makeDet(5, 0, 10, 10, 0, 0.9f)});    // build rightward velocity
+    tr.update({makeDet(10, 0, 10, 10, 0, 0.9f)});
+    tr.update({});                                   // gap: object missed one frame
+    auto r = tr.update({makeDet(15, 0, 10, 10, 0, 0.9f)});  // reappears down-track
+    EXPECT_EQ(r[0], id);            // recovered the same identity
+    EXPECT_EQ(tr.track_count(), 1u);
+}
+
+// ByteTrack: a low-confidence detection recovers an existing track (second pass)
+// but a lone low-confidence detection does NOT spawn a new track.
+TEST(TrackerTest, ByteTrackLowConfRecoversButDoesNotSpawn) {
+    Tracker tr(0.3f, /*max_age=*/5, /*min_hits=*/1, /*class_gated=*/true,
+               0.f, 0.f, 0.1f, /*det_high_thresh=*/0.5f, 0.2f, 0.2f);
+    const int id = tr.update({makeDet(0, 0, 10, 10, 0, 0.9f)})[0];  // high-conf -> track
+    EXPECT_NE(id, 0);
+
+    auto r1 = tr.update({makeDet(1, 0, 10, 10, 0, /*conf=*/0.3f)});  // low-conf overlap
+    EXPECT_EQ(r1[0], id);                 // recovered (stage 2), same id
+    EXPECT_EQ(tr.track_count(), 1u);
+
+    auto r2 = tr.update({makeDet(500, 500, 10, 10, 0, /*conf=*/0.3f)});  // lone low-conf
+    EXPECT_EQ(r2[0], 0);                   // no track
+    EXPECT_EQ(tr.track_count(), 1u);      // and did not spawn
+}
+
 // Greedy association: each detection matches at most one track.
 TEST(TrackerTest, OneToOneAssociation) {
     Tracker tr(0.3f, 30, /*min_hits=*/1);
