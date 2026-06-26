@@ -21,7 +21,7 @@
 | **0** | Motion | A/B harness + tuning recipe for the existing `cuda_motion_regions` gate (downsample, min-blob, N-of-M persistence, masks, global-luma suppression). Capture baseline recall/FP-wake/GPU-cost numbers with `bench_gpu_roi` + `bench_resources`. | Cheapest, highest-leverage. Settles "is a heavier method worth it?" with data before we touch any model code. Establishes the benchmark baseline everything else is measured against. |
 | **1** | LLM | `llm_event_review` plugin (MVP): subscribe to `alert`+`tracked_detection`, **snap latest frame** (Approach A), call **local Qwen3-VL via `IVisionProvider`/OpenAI-compat local provider only**, publish `"reasoning"` event. Add a `reasoning` EVENT code (0x0305) to the stream-socket protocol. | Replaces the broken timer trigger with a track-gated one immediately, using infra that already exists (`describe_vlm`'s HTTP client + frame-snap pattern). Local-only first = no key/privacy surface to get wrong. |
 | **2** | LLM | **Provider abstraction hardening**: `OpenAICompatProvider` / `AnthropicProvider` / `GeminiProvider` adapters + `Retry`/`RateLimit`/`Fallback` decorators + secret-ref key handling + per-camera local-only routing. Cloud→local fallback wired. | Adds cloud quality + resilience once the local path is proven. Decorator composition keeps adapters dumb. |
-| **3** | LLM | **NL query subsystem**: SQLite + `sqlite-vec` store, embed-at-ingest (`bge-small`/`nomic`/`Qwen3-Embedding-0.6B`), Qwen function-calling router with `count_events()` (SQL) + `search_events()` (hybrid), strict-citation grounded answers. Surface via zm-api endpoint. | Needs a corpus of stored descriptions (Phases 1-2) before query is meaningful. Highest complexity, lowest urgency. |
+| **3** | LLM | **NL query subsystem**: capability-detected vector store (MariaDB-native `VECTOR` 11.8+ → `sqlite-vec` fallback, feature-flagged; see *Vector store*), embed-at-ingest (`bge-small`/`nomic`/`Qwen3-Embedding-0.6B`), Qwen function-calling router with `count_events()` (SQL) + `search_events()` (hybrid), strict-citation grounded answers. Surface via zm-api endpoint. | Needs a corpus of stored descriptions (Phases 1-2) before query is meaningful. Highest complexity, lowest urgency. |
 | **4** | Motion (optional) | Optical-flow / motion-coherence confirmation stage behind diff hits (NVIDIA HW flow on Blackwell), enabled per-zone for treed/weather scenes. Clip-based (Approach B) frame retrieval from `store_event` pre-roll for richer LLM temporal context. | Pure refinement. Only justified after Phase 0 data shows residual weather/tree false-wakes, and after Phase 1 shows single-frame context is insufficient. |
 
 ---
@@ -321,11 +321,54 @@ embed_text = "front_door_cam 2026-06-18 14:32 | person, package |
 A person in dark clothing approached the front door carrying a parcel and set it down."
 ```
 
-Store `event_id`, `ts` (epoch int, indexed), `monitor_id`, `labels[]`, `track_ids[]`, `description`, `threat_level`, plus the vector — all in **one SQLite file** with `sqlite-vec` (`vec0` virtual table). This keeps structured filters and vector search in the *same* SQL query, which is decisive for selective filters.
+Store `event_id`, `ts` (epoch int, indexed), `monitor_id`, `labels[]`, `track_ids[]`, `description`, `threat_level`, plus the vector — colocated with the metadata so structured filters and vector search run in the *same* SQL query (decisive for selective filters). The physical store is backend-dependent (see *Vector store* below): MariaDB-native `VECTOR` in the operational DB when available, else a single SQLite file with `sqlite-vec` (`vec0`).
 
 **Embedding model (local, compute-once-per-event):** `bge-small`/`bge-base` or `nomic-embed-text-v1.5` (CPU-friendly, MIT/Apache); step up to `Qwen3-Embedding-0.6B` to stay in one model family with the generator.
 
-**Vector store choice:** **`sqlite-vec`** — pure C, zero-dep, in the same DB as metadata, **pre-filtering** via in-DB joins (critical: pgvector/FAISS only post-filter, which starves selective queries like "camera=front_door AND last 1h"). Use pgvector only if Postgres is already mandated.
+**Vector store: a pluggable, capability-detected backend (feature-flagged).** The vector index is a
+**derived, rebuildable** artifact (truth lives in the operational DB + media/sidecars), so the store
+backend is chosen at runtime behind one abstraction rather than hard-committed. zm-next stays
+**DB-less** throughout — it only emits the description (and, optionally, the image/CLIP embedding as
+an event field, computed on the GPU it already runs); *which* store receives it is entirely zm-api's
+decision.
+
+- **Abstraction:** a `VectorStore` trait in zm-api — `ensure_schema` / `upsert(event_id,kind,vec,meta)`
+  / `search(q,filter,k)` / `rebuild()` — with impls `MariaDbVectorStore`, `SqliteVecStore`,
+  `PgVectorStore` (later), and `NullVectorStore` (feature off). The ingest path and the search API are
+  identical across backends; the engine-specific vector SQL (MariaDB `VEC_DISTANCE_COSINE`, pgvector
+  `<=>`) is hidden inside each impl (so it's raw SQL, not ORM-portable — fine behind the trait).
+- **Feature flag** (zm-api settings):
+  ```toml
+  [search]
+  enabled = "auto"   # auto | on | off
+  backend = "auto"   # auto | mariadb | sqlite | postgres | none
+  ```
+- **Capability detection ("only if the DB supports it"):** at startup, probe the *already-connected*
+  DB functionally, not by version string alone (forks/distro patches make version-sniffing fragile).
+  MariaDB: version ≥ 11.8 **and** a tiny `VECTOR(3)` temp-table probe succeeds → native available
+  (Community 11.8 LTS ships `VECTOR` + HNSW `VEC_DISTANCE_*`, GPLv2, no extension). Postgres:
+  `CREATE EXTENSION IF NOT EXISTS vector`. Cache + log the chosen backend loudly.
+- **Selection (`auto`):** prefer **MariaDB-native** (same engine ZoneMinder already runs → in-DB
+  hybrid: metadata pre-filter + FTS + vector ANN in one transactional query over the same rows) →
+  else **`sqlite-vec`** as the **universal floor** (embeddable single file, no server-version
+  dependency, so search still works on older 10.x MariaDB / MySQL) → `PgVectorStore` slots into the
+  same chain later. An operator who refuses a second store can set `backend = "mariadb"` (strict:
+  disabled when native is absent, no sqlite fallback) — the flag supports both graceful-degrade
+  (default) and native-or-nothing.
+- **Rebuild-on-upgrade = near-zero lock-in:** because the index is rebuildable from descriptions,
+  switching backends is a `rebuild()` (re-embed), not a data migration. A user on 10.x runs sqlite-vec
+  today; after a MariaDB 11.8 upgrade, `auto` detects native vectors, rebuilds into the in-DB store,
+  and drops the sqlite file. Adding `PgVectorStore` later is one impl + one probe branch, no API/ingest
+  change.
+
+Whichever backend is active, the requirement is the same and it's what `sqlite-vec` first motivated:
+**pre-filtering** (metadata/time/class applied *before* the ANN). sqlite-vec does this via in-DB joins;
+MariaDB-native and pgvector ≥ 0.8 (iterative index scans) do it in-engine — avoid any store that can
+only post-filter, which starves selective queries like "camera=front_door AND last 1h".
+
+**Embeddings table is zm-api-owned and additive** — a `zmnext_event_vectors`-style table (or the
+separate sqlite-vec file), never a change to ZoneMinder's shared schema; zm-api owns its own
+migrations for it.
 
 **Query — this is a *router* problem, not pure RAG.** A local **Qwen with function calling** classifies intent and extracts slots (`time_range`→epoch bounds resolved *in code*, `monitor_id`, `classes`), then routes:
 
@@ -433,6 +476,9 @@ TLV (`0x10`). **Add:**
 - https://arxiv.org/pdf/2402.01613
 - https://github.com/asg017/sqlite-vec
 - https://github.com/asg017/sqlite-vss
+- https://mariadb.org/projects/mariadb-vector/  (MariaDB native VECTOR + HNSW, Community 11.8 LTS, GPLv2)
+- https://mariadb.com/docs/server/reference/sql-structure/vectors/vector-overview
+- https://github.com/pgvector/pgvector  (pgvector ≥ 0.8 iterative index scans for filtered search)
 - https://dev.to/aairom/embedded-intelligence-how-sqlite-vec-delivers-fast-local-vector-search-for-ai-3dpb
 - https://www.instaclustr.com/education/vector-database/pgvector-performance-benchmark-results-and-5-ways-to-boost-performance/
 - https://arxiv.org/pdf/2403.04871
