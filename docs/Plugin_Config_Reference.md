@@ -85,6 +85,12 @@ optional with the defaults shown. Common keys:
   `trigger_types` (e.g. `["detection"]`): when set, the VLM describes a frame
   only after a matching upstream event fires (the YOLO→VLM cascade gate),
   throttled to once per `interval_sec`; empty = legacy fixed-interval.
+  Multi-frame + structured output: `frames` (1; >1 sends that many keyframes with
+  per-frame timestamps so the VLM reasons over a sequence), `frame_interval_ms`
+  (700, spacing of the sampled keyframe ring), `json_output` (false; when true,
+  requests a strict JSON schema and emits `threat_level` + `scene_confidence` on
+  the event), `max_tokens` (128). Best with a temporally-aware model
+  (Qwen3-VL-4B-Instruct).
 
 ## Outputs / store
 - **output_mqtt** — `host` ("localhost"), `port` (1883), `base_topic`

@@ -20,9 +20,11 @@
           "children": [
             { "id": "describe", "kind": "describe_vlm",
               "cfg": { "server_url": "http://localhost:8081/v1/chat/completions",
-                       "model": "mlx-community/Qwen3-VL-8B-Instruct-4bit",
-                       "prompt": "Describe this security-camera scene in one short sentence; focus on the person and what they are doing.",
+                       "model": "mlx-community/Qwen3-VL-4B-Instruct-4bit",
+                       "prompt": "These are sequential frames from a security camera. In one short sentence, describe the person and what they are doing over the sequence.",
                        "trigger_types": ["detection"], "interval_sec": 5,
+                       "frames": 4, "frame_interval_ms": 700,
+                       "json_output": true, "max_tokens": 128,
                        "frame_width": 1280, "frame_height": 720 },
               "queue_depth": 2 } ] },
         { "id": "notify", "kind": "output_mqtt",
