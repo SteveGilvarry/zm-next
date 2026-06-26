@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,8 @@ extern "C" {
 #include <libavutil/channel_layout.h>
 #include <libavutil/samplefmt.h>
 #include <libavutil/opt.h>
+#include <libavutil/base64.h>
+#include <libavutil/mem.h>
 #include <libswresample/swresample.h>
 }
 
@@ -133,6 +136,8 @@ const AVCodec* findAudioDecoder(const std::string& name) {
 struct AudioMeta {
     std::atomic<int> codec_id{(int)AV_CODEC_ID_NONE};
     std::atomic<bool> running{true};
+    std::mutex extradataMu;            // guards extradata (cb thread vs on_frame)
+    std::vector<uint8_t> extradata;    // decoder config, e.g. AAC AudioSpecificConfig
 };
 
 // Host event callback: learn the audio codec id from the capture plugin's audio
@@ -145,6 +150,18 @@ static void audio_meta_cb(void* user, const char* json_event) {
         if (j.value("event", std::string()) != "StreamMetadata") return;
         if (j.value("media", std::string()) != "audio") return;
         m->codec_id.store(j.value("codec_id", (int)AV_CODEC_ID_NONE));
+        // Capture base64-encodes the codec extradata (AAC AudioSpecificConfig,
+        // etc.) in the metadata event. Without it, AAC-over-RTSP packets carry no
+        // in-band config and the decoder yields no frames.
+        auto ed = j.value("extradata", std::string());
+        if (!ed.empty()) {
+            std::vector<uint8_t> raw(ed.size());  // base64 decodes to <= input length
+            int n = av_base64_decode(raw.data(), ed.c_str(), static_cast<int>(raw.size()));
+            if (n > 0) {
+                std::lock_guard<std::mutex> lk(m->extradataMu);
+                m->extradata.assign(raw.begin(), raw.begin() + n);
+            }
+        }
     } catch (...) {
         // ignore malformed events
     }
@@ -166,6 +183,20 @@ static bool ensureAudioDecoder(AudioDetectCtx* ctx) {
     ctx->codecCtx = avcodec_alloc_context3(dec);
     if (!ctx->codecCtx) return false;
     ctx->codecCtx->sample_rate = ctx->sampleRate;
+    // Apply the codec config (extradata) the capture plugin forwarded — required
+    // for AAC/RTSP where the AudioSpecificConfig is out-of-band (in the SDP).
+    if (ctx->meta) {
+        std::lock_guard<std::mutex> lk(ctx->meta->extradataMu);
+        if (!ctx->meta->extradata.empty()) {
+            const auto& ed = ctx->meta->extradata;
+            ctx->codecCtx->extradata = static_cast<uint8_t*>(
+                av_mallocz(ed.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+            if (ctx->codecCtx->extradata) {
+                std::memcpy(ctx->codecCtx->extradata, ed.data(), ed.size());
+                ctx->codecCtx->extradata_size = static_cast<int>(ed.size());
+            }
+        }
+    }
     if (avcodec_open2(ctx->codecCtx, dec, nullptr) < 0) {
         avcodec_free_context(&ctx->codecCtx);
         ctx->codecCtx = nullptr;
@@ -507,7 +538,6 @@ static void audio_detect_on_frame(zm_plugin_t* plugin, const void* buf, size_t s
         forwardFrame(ctx, buf, size);
         return;
     }
-
     // Wrap the compressed payload in an AVPacket (no ownership transfer; the
     // decoder copies what it needs during send_packet).
     av_packet_unref(ctx->pkt);
