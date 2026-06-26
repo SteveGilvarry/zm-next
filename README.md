@@ -9,8 +9,9 @@
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)
 ![FFmpeg 7](https://img.shields.io/badge/FFmpeg-%E2%89%A57.0-007808?logo=ffmpeg&logoColor=white)
 ![ONNX Runtime](https://img.shields.io/badge/ONNX_Runtime-detect_tier-005CED?logo=onnx&logoColor=white)
+![CUDA](https://img.shields.io/badge/CUDA-zero--copy-76B900?logo=nvidia&logoColor=white)
 ![CMake + vcpkg](https://img.shields.io/badge/build-CMake_%2B_vcpkg-064F8C?logo=cmake&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-27_ctest_suites-success)
+![Tests](https://img.shields.io/badge/tests-27_passing-success?logo=githubactions&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-macOS_%7C_Linux-lightgrey)
 ![License](https://img.shields.io/badge/license-AGPL--3.0_%2F_Commercial-blue)
 
@@ -30,25 +31,53 @@ one process per camera, and talks to over a single Unix-domain socket. The worke
 ingests a generated pipeline, serves one socket carrying media + events + control, and exits cleanly
 on a signal. All persistence, policy, auth, and viewer fan-out live upstream.
 
-```text
-        dashboard / mobile / zmNinjaNg / RTSP clients
-                          │  REST · HLS · WebRTC · RTSP   (the only public surface)
-                          ▼
-                  zm-api (control plane)        owns DB · config · auth · orchestration
-                          │
-                          │   ══ one Unix-domain socket per monitor, canonical binary stream protocol ══
-                          │   ◄── push:  Hello · Media · Keyframe · Stats · Event(detection) · Bye
-                          │   ──► pull:  Subscribe · Command · Talkback   ◄── Response  (extension)
-                          ▼
-   ┌──────────────────────────── zm-core (one process per monitor) ────────────────────────────┐
-   │                                                                                            │
-   │   capture ──►  decode ──►  motion ──►  detect ──►  track ──►  analytics ──►  describe(VLM)  │
-   │      │            (each stage = its own thread + bounded drop-oldest queue)                │
-   │      └──►  store (filesystem / event / snapshot)          └──►  output (mqtt / webhook)     │
-   │                                                                                            │
-   │   every stage speaks the same C ABI · frames are zero-copy where possible (incl. GPU)      │
-   └────────────────────────────────────────────────────────────────────────────────────────────┘
+**System context** — the worker is the dumb, supervisable media+AI engine; the control plane owns everything stateful and is the only public surface.
+
+```mermaid
+flowchart TB
+    CL["🖥️ dashboard · 📱 mobile · zmNinjaNg · RTSP clients"]
+    API["⚙️ zm-api — control plane<br/><i>DB · config · auth · orchestration · viewer fan-out</i>"]
+    WK["🎬 zm-core — one worker process per monitor<br/><i>ingest pipeline · serve one socket · exit on signal</i>"]
+    CL <-->|"REST · HLS · WebRTC · RTSP"| API
+    API <==>|"one Unix socket / monitor<br/>Hello · Media · Keyframe · Event · Stats · Talkback"| WK
+
+    classDef edge fill:#0f172a,stroke:#334155,color:#e2e8f0
+    classDef plane fill:#1e1b4b,stroke:#818cf8,color:#e0e7ff
+    classDef worker fill:#052e2b,stroke:#14b8a6,color:#ccfbf1
+    class CL edge
+    class API plane
+    class WK worker
 ```
+
+**Inside the worker** — a graph of hot-swappable plugins, each on its own thread behind a bounded drop-oldest queue, all speaking one C ABI with frames zero-copy where possible (incl. GPU):
+
+```mermaid
+flowchart LR
+    cap["📷 capture<br/>RTSP · file"]
+    dec["🎞️ decode<br/>FFmpeg · NVDEC / VAAPI / VT"]
+    mo["🚦 motion gate<br/>SIMD pixel-diff"]
+    det["🧠 detect<br/>YOLO · pose · seg · open-vocab"]
+    trk["🎯 track<br/>OC-SORT + OSNet ReID"]
+    an["📐 analytics<br/>intrusion · line · loiter"]
+    vlm["💬 describe<br/>VLM scene caption"]
+    aud["🔊 audio detect<br/>AudioSet events"]
+    st["💾 store<br/>continuous · event"]
+    out["📡 output<br/>WebRTC · MSE · MQTT · webhook"]
+
+    cap --> dec --> mo --> det --> trk --> an --> vlm --> out
+    cap -. audio .-> aud --> out
+    dec -. record .-> st
+    trk --> out
+
+    classDef io fill:#052e2b,stroke:#14b8a6,color:#ccfbf1
+    classDef ai fill:#1e1b4b,stroke:#818cf8,color:#e0e7ff
+    classDef sink fill:#3b2410,stroke:#f59e0b,color:#fde68a
+    class cap,dec,mo io
+    class det,trk,an,vlm,aud ai
+    class st,out sink
+```
+
+> ⚡ **On NVIDIA**, `decode_detect` fuses NVDEC decode + ROI-motion + YOLO into one zero-copy GPU stage, and a shared batched engine coalesces frames **across cameras** into single inference passes.
 
 ## ✨ Highlights
 
