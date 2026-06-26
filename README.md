@@ -52,7 +52,7 @@ flowchart TB
 **Inside the worker** — a graph of hot-swappable plugins, each on its own thread behind a bounded drop-oldest queue, all speaking one C ABI with frames zero-copy where possible (incl. GPU):
 
 ```mermaid
-flowchart LR
+flowchart TB
     cap["📷 capture<br/>RTSP · file"]
     dec["🎞️ decode<br/>FFmpeg · NVDEC / VAAPI / VT"]
     mo["🚦 motion gate<br/>SIMD pixel-diff"]
@@ -62,11 +62,12 @@ flowchart LR
     vlm["💬 describe<br/>VLM scene caption"]
     aud["🔊 audio detect<br/>AudioSet events"]
     st["💾 store<br/>continuous · event"]
-    out["📡 output<br/>WebRTC · MSE · MQTT · webhook"]
+    out["📡 output<br/>WebRTC · MSE<br/>MQTT · webhook"]
 
     cap --> dec --> mo --> det --> trk --> an --> vlm --> out
-    cap -. audio .-> aud --> out
+    cap -. audio .-> aud
     dec -. record .-> st
+    aud --> out
     trk --> out
 
     classDef io fill:#052e2b,stroke:#14b8a6,color:#ccfbf1
