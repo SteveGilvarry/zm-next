@@ -70,7 +70,10 @@ optional with the defaults shown. Common keys:
   `conf_threshold`, dims, `ep`, `stream_filter`.
 - **audio_detect** — `model_path`, `codec` ("aac"), `audio_stream_id` (-1=any),
   `sample_rate` (16000), `window_sec` (1.0), `hop_sec` (0.5),
-  `conf_threshold` (0.4), `top_k` (3), `labels`.
+  `conf_threshold` (0.4), `top_k` (3), `labels`. `input_type` ("waveform"
+  YAMNet-style | "logmel" for CED/EfficientAT) — with a log-mel front-end:
+  `n_fft` (512, power of 2), `hop_length` (160), `n_mels` (64), `fmin` (0),
+  `fmax` (0=sr/2), `mel_log_offset` (1e-6), `mel_log10` (false), `mel_slaney` (false).
 
 ## Track / analytics / understand
 - **tracker** — `iou_threshold` (0.3), `max_age` (30), `min_hits` (3),

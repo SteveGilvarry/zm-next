@@ -63,8 +63,8 @@ set_target_properties(audio_detect PROPERTIES
 
 target_compile_options(audio_detect PRIVATE "-fvisibility=hidden")
 
-# Unit tests for the pure top-k helper (no ONNX Runtime / FFmpeg needed).
-add_executable(test_audio_topk tests/test_audio_topk.cpp)
+# Unit tests for the pure helpers (top-k + log-mel; no ONNX Runtime / FFmpeg needed).
+add_executable(test_audio_topk tests/test_audio_topk.cpp tests/test_logmel.cpp)
 target_include_directories(test_audio_topk PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(test_audio_topk PRIVATE GTest::gtest_main)
 set_target_properties(test_audio_topk PROPERTIES

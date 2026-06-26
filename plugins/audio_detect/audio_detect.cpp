@@ -17,6 +17,7 @@
 // is expected and correct.
 
 #include "audio_topk.hpp"
+#include "logmel.hpp"
 
 #include <onnxruntime_cxx_api.h>
 
@@ -59,6 +60,13 @@ struct AudioDetectCtx {
     float confThreshold = 0.4f;
     int topK = 3;
     std::vector<std::string> labels; // class index -> label; empty -> class_<id>
+
+    // Input front-end: "waveform" (YAMNet-style, raw samples) or "logmel"
+    // (CED / EfficientAT — a log-mel spectrogram). For logmel, `mel` is built in
+    // start() from the mel_* config and runWindow() feeds [.., n_mels, n_frames].
+    bool useLogMel = false;
+    zm::audio::MelConfig melCfg;
+    std::unique_ptr<zm::audio::MelExtractor> mel;
 
     // Derived window sizes (samples).
     size_t windowSamples = 0;
@@ -251,16 +259,33 @@ void runWindow(AudioDetectCtx* ctx, const zm_frame_hdr_t* hdr) {
         Ort::MemoryInfo memInfo =
             Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
-        // Build input tensor with the model's actual rank: [1, N] or [N].
+        // Input tensor: either a raw waveform (YAMNet-style) or a log-mel
+        // spectrogram (CED/EfficientAT). The mel buffer must outlive the Run().
         std::vector<int64_t> inputShape;
-        if (ctx->inputRank == 2) {
-            inputShape = {1, static_cast<int64_t>(n)};
+        std::vector<float> melBuf;
+        const float* data = ctx->samples.data();
+        size_t dataLen = n;
+
+        if (ctx->useLogMel && ctx->mel) {
+            int frames = 0;
+            melBuf = ctx->mel->extract(ctx->samples.data(), n, frames);
+            if (frames <= 0 || melBuf.empty()) return;
+            const int64_t M = ctx->mel->n_mels();
+            const int64_t F = frames;
+            // Match the model's rank: [1,1,M,F] / [1,M,F] / [M,F].
+            if (ctx->inputRank >= 4)      inputShape = {1, 1, M, F};
+            else if (ctx->inputRank == 3) inputShape = {1, M, F};
+            else                          inputShape = {M, F};
+            data = melBuf.data();
+            dataLen = melBuf.size();
         } else {
-            inputShape = {static_cast<int64_t>(n)};
+            // Raw waveform: [1, N] or [N].
+            if (ctx->inputRank == 2) inputShape = {1, static_cast<int64_t>(n)};
+            else                     inputShape = {static_cast<int64_t>(n)};
         }
 
         Ort::Value inputTensor = Ort::Value::CreateTensor<float>(
-            memInfo, ctx->samples.data(), n,
+            memInfo, const_cast<float*>(data), dataLen,
             inputShape.data(), inputShape.size());
 
         const char* inputNames[] = {ctx->inputName.c_str()};
@@ -343,6 +368,15 @@ static int audio_detect_start(zm_plugin_t* plugin, zm_host_api_t* host,
             ctx->topK = j.value("top_k", 3);
             if (j.contains("labels") && j["labels"].is_array())
                 ctx->labels = j["labels"].get<std::vector<std::string>>();
+            ctx->useLogMel = (j.value("input_type", std::string("waveform")) == "logmel");
+            ctx->melCfg.n_fft = j.value("n_fft", 512);
+            ctx->melCfg.hop_length = j.value("hop_length", 160);
+            ctx->melCfg.n_mels = j.value("n_mels", 64);
+            ctx->melCfg.fmin = j.value("fmin", 0.f);
+            ctx->melCfg.fmax = j.value("fmax", 0.f);
+            ctx->melCfg.log_offset = j.value("mel_log_offset", 1e-6f);
+            ctx->melCfg.log10 = j.value("mel_log10", false);
+            ctx->melCfg.slaney = j.value("mel_slaney", false);
         } catch (const std::exception& e) {
             ZM_LOG_ERROR("audio_detect: failed to parse config: %s", e.what());
         }
@@ -355,6 +389,22 @@ static int audio_detect_start(zm_plugin_t* plugin, zm_host_api_t* host,
         static_cast<size_t>(ctx->windowSec * ctx->sampleRate);
     ctx->hopSamples = static_cast<size_t>(ctx->hopSec * ctx->sampleRate);
     if (ctx->windowSamples == 0) ctx->windowSamples = 1;
+
+    // Build the log-mel front-end (CED/EfficientAT). Uses the model's sample rate.
+    if (ctx->useLogMel) {
+        ctx->melCfg.sample_rate = ctx->sampleRate;
+        ctx->mel = std::make_unique<zm::audio::MelExtractor>(ctx->melCfg);
+        if (!ctx->mel->valid()) {
+            ZM_LOG_ERROR("audio_detect: invalid log-mel config (n_fft must be power of 2); "
+                         "falling back to waveform input");
+            ctx->useLogMel = false;
+            ctx->mel.reset();
+        } else {
+            ZM_LOG_INFO("audio_detect: log-mel front-end (n_fft=%d hop=%d n_mels=%d sr=%d)",
+                        ctx->melCfg.n_fft, ctx->melCfg.hop_length, ctx->melCfg.n_mels,
+                        ctx->sampleRate);
+        }
+    }
 
     // The audio decoder is created lazily (in on_frame) once the codec is known —
     // auto-detected from the audio StreamMetadata, or the configured fallback.
