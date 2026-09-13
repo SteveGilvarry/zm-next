@@ -179,7 +179,10 @@ void WorkerLink::stop() {
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto& [fd, c] : clients_) {
             (void)c;
-            ::write(fd, bye->prefix.data(), bye->prefix.size());
+            // Best effort by design. The if() is needed: glibc marks write()
+            // warn_unused_result and GCC ignores a (void) cast, which broke the
+            // -Werror Release build on Linux.
+            if (::write(fd, bye->prefix.data(), bye->prefix.size()) < 0) { /* closing anyway */ }
         }
     }
 

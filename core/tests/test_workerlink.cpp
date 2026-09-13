@@ -97,6 +97,31 @@ std::string temp_socket_path(int n = -1) {
     return p + ".sock";
 }
 
+// connect() returns once the kernel queues the connection, before WorkerLink's
+// loop has accepted and registered the client; a live event published in that
+// gap has no subscriber. A Command always gets a Response, so waiting for one
+// proves the client is registered. Other queued frames (snapshot, Hello) are
+// skipped and not needed by callers.
+bool wait_registered(int fd) {
+    const std::string ping = R"({"name":"__ping__","request_id":424242})";
+    ss::Header h{};
+    h.length = ss::kHeaderLengthBytes + static_cast<uint32_t>(ping.size());
+    h.version = ss::kProtocolVersion;
+    h.type = static_cast<uint8_t>(ss::MessageType::Command);
+    h.stream = static_cast<uint8_t>(ss::StreamId::Monitor);
+    uint8_t hb[ss::kHeaderSize];
+    ss::SerializeHeader(h, hb);
+    if (::write(fd, hb, ss::kHeaderSize) != static_cast<ssize_t>(ss::kHeaderSize)) return false;
+    if (::write(fd, ping.data(), ping.size()) != static_cast<ssize_t>(ping.size())) return false;
+    for (int i = 0; i < 20; ++i) {
+        if (!wait_readable(fd, 2000)) return false;
+        ss::Header rh;
+        if (!read_msg(fd, rh)) return false;
+        if (rh.type == static_cast<uint8_t>(ss::MessageType::Response)) return true;
+    }
+    return false;
+}
+
 } // namespace
 
 TEST(WorkerLinkTest, SnapshotOnConnectThenEvent) {
@@ -372,6 +397,7 @@ TEST(WorkerLinkTest, RecordingSavedEvent) {
 
     int client = connect_client(path);
     ASSERT_GE(client, 0);
+    ASSERT_TRUE(wait_registered(client));
 
     link.publishEventJson(R"({"event":"EventClip","path":"/data/ev/1.mp4","duration":15})");
 
@@ -397,6 +423,7 @@ TEST(WorkerLinkTest, RecordingOpeningEvent) {
 
     int client = connect_client(path);
     ASSERT_GE(client, 0);
+    ASSERT_TRUE(wait_registered(client));
 
     link.publishEventJson(
         R"({"event":"RecordingOpening","clip_token":"14-7-1","trigger":"detection"})");
@@ -552,6 +579,7 @@ TEST(WorkerLinkTest, ReviewAssetsEvent) {
 
     int client = connect_client(path);
     ASSERT_GE(client, 0);
+    ASSERT_TRUE(wait_registered(client));
 
     link.publishEventJson(
         R"({"type":"review_assets","event_id":512,"clip_token":"16-7-1",)"
