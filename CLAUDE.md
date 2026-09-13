@@ -11,8 +11,11 @@ shared libraries communicating through a stable C ABI.
 
 ## Build & Test
 
-The project uses CMake + vcpkg (for `LibDataChannel`) and depends on Homebrew packages (FFmpeg ≥ 7.0,
-xsimd, nlohmann-json, Boost). `VCPKG_ROOT` must be set or vcpkg present at `~/vcpkg`.
+The project uses CMake and depends on Homebrew packages (FFmpeg ≥ 7.0, onnxruntime, xsimd,
+nlohmann-json, Boost, mosquitto). vcpkg is optional: the build uses it when `VCPKG_ROOT` is set or
+`~/vcpkg` exists (on Linux it supplies an FFmpeg built with VAAPI for the VAAPI backend).
+After an Xcode or Homebrew FFmpeg upgrade, a stale `build/CMakeCache.txt` can pin old SDK or library
+paths; `./build.sh clean` fixes it.
 
 ```bash
 ./build.sh            # configure (Debug) + build into build/
@@ -40,7 +43,8 @@ subdirs. Tests use GoogleTest, fetched automatically via CMake `FetchContent`.
 # Run from the build/ directory — plugin paths are resolved relative to CWD as
 # plugins/<kind>/<kind>.dylib (see path resolution note below).
 cd build
-./zm-core --pipeline ../pipelines/rtsp_basic_motion_webrtc.json
+./zm-core --pipeline ../pipelines/e2e_file_cascade.template.json --socket /tmp/zm.sock --monitor-id 1
+./wl_dump /tmp/zm.sock 7                      # watch Hello/Media/Event on the worker socket
 ./zm-core --pipelines-dir ../pipelines        # picks first .json found
 ```
 
@@ -95,8 +99,15 @@ settings via the cached `ZM_FFMPEG_INCLUDES` / `ZM_FFMPEG_LIBDIRS` / `ZM_FFMPEG_
 - `zones` — zone definitions + Boost.Geometry R-tree spatial indexing (ZoneMinder-format compatible).
 - `motion_pixel_diff` — SIMD (xsimd) pixel-difference motion detection; reads zones output.
 - `motion_hybrid` — older combined motion plugin (see its `MIGRATION_GUIDE.md`).
-- `output_webrtc` — H.264 WebRTC streaming via `LibDataChannel` (vcpkg).
-- `output_mse` — Media Source Extensions streaming output.
+- `decode_detect` — fused hardware decode + on-GPU motion gate + detect (CUDA / Metal+ANE /
+  VAAPI / Vulkan backends in `plugins/detect_onnx/hw_backend_*`); see `docs/GPU_Pipeline.md`.
+- `detect_onnx`, `detect_pose`, `detect_seg`, `detect_openvocab`, `recognize_face`, `lpr`,
+  `audio_detect`, `tracker`, `analytics_rules` (incl. pose-based fall), `alert_policy`,
+  `describe_vlm`, `llm_event_review` — the AI tier; config keys in `docs/Plugin_Config_Reference.md`.
+- `privacy_mask` — static polygons and dynamic person/face/plate masking from detection events.
+- `output_mqtt`, `output_webhook` — event outputs. There is no live-video output plugin: media goes
+  over the worker socket to zm-api, which serves WebRTC / HLS / MSE. (`output_webrtc`, `output_mse`
+  and the Node `signaling/` bridge were removed 2026-09-13.)
 - `store` — unified recorder; `mode` = `continuous` (time-rotated segments) | `event`
   (triggered pre/post-roll clips) | `both`. Writes media to disk and runs the zm-api
   event-id assignment handshake (recording_opening → assign_recording → EventClip).
@@ -109,16 +120,9 @@ is documented in `docs/Motion_Architecture.md`.
 ### Pipelines (`pipelines/*.json`)
 
 Declarative pipeline graphs. Note `pipelines/` is gitignored except `*.template.json` (configs may
-contain camera credentials in `rtsp://` URLs). `rtsp_basic_motion_webrtc.json` is a representative
-capture → decode → motion → WebRTC chain.
-
-### WebRTC signaling (`signaling/`, Node.js)
-
-Separate Node service supporting the `output_webrtc`/`output_mse` plugins: `signaling-server.js`
-(WebSocket signaling, port 8080) + `webrtc-bridge.js` (bridge API, port 8081), launched together by
-`signaling/start-signaling.sh`. The plugins communicate with the bridge via `plugin-events/` /
-`plugin-responses/` directories. FFI guidance lives in `docs/Rust_WebRTC_FFI_Instructions.md` and
-`docs/WebRTC_FFI_API_Guide.md`. (`signaling/` is also gitignored.)
+contain camera credentials in `rtsp://` URLs). `e2e_file_cascade.template.json` is the camera-free
+reference (file → decode → motion → detect + recording, observed on the worker socket); the others
+cover GPU detect, fall alerts, person alerts and production layouts.
 
 ## Conventions
 

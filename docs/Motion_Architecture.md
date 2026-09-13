@@ -92,7 +92,7 @@ Frame Input → Zones Plugin → Motion Algorithm Plugin → Output Plugin
   "pipeline": [
     {"plugin": "capture_rtsp_multi", "config": {"streams": [{"url": "rtsp://camera"}]}},
     {"plugin": "motion_pixel_diff", "config": {"threshold": 25}},
-    {"plugin": "output_webrtc", "config": {"port": 8080}}
+    {"plugin": "store", "config": {"mode": "event"}}
   ]
 }
 ```
@@ -104,7 +104,7 @@ Frame Input → Zones Plugin → Motion Algorithm Plugin → Output Plugin
     {"plugin": "capture_rtsp_multi", "config": {"streams": [{"url": "rtsp://camera"}]}},
     {"plugin": "zones", "config": {"zones": [...]}},
     {"plugin": "motion_pixel_diff", "config": {"zone_aware": true}},
-    {"plugin": "output_webrtc", "config": {"port": 8080}}
+    {"plugin": "store", "config": {"mode": "event"}}
   ]
 }
 ```
@@ -118,7 +118,7 @@ Frame Input → Zones Plugin → Motion Algorithm Plugin → Output Plugin
     {"plugin": "motion_pixel_diff", "config": {"zone_filter": [1, 2]}},
     {"plugin": "motion_background_sub", "config": {"zone_filter": [3, 4]}},
     {"plugin": "motion_fusion", "config": {"strategy": "consensus"}},
-    {"plugin": "output_webrtc"}
+    {"plugin": "store", "config": {"mode": "event"}}
   ]
 }
 ```
@@ -275,7 +275,7 @@ make
 ### **Integration Tests**
 ```bash
 # Test pipeline with sample data
-./zm-core --pipeline pipelines/rtsp_zones_motion_webrtc.json --input test.mp4
+./zm-core --pipeline ../pipelines/e2e_file_cascade.template.json
 
 # Benchmark performance
 ./zm-core --benchmark --pipeline config.json

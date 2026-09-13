@@ -142,8 +142,10 @@ optional with the defaults shown. Common keys:
   ("zm-next"), `client_id`, `username`, `password`, `qos` (0).
 - **output_webhook** — `url`, `timeout_ms` (2000), `auth_header`,
   `event_types` (filter; empty = all).
-- **output_webrtc** / **output_mse** — `port`, `stream_filter`, client limits
-  (video output is being superseded by the zm-api front door).
+- Live video is not a zm-next plugin. The worker socket carries compressed
+  media to zm-api, which serves WebRTC / HLS / MSE (`/api/v3/live/...`). The old
+  `output_webrtc` / `output_mse` plugins and their Node signaling bridge were
+  removed on 2026-09-13.
 - **store** — unified recorder. `mode` (`continuous` | `event` | `both`, default
   `continuous`), `root`, `monitor_id`, `stream_filter`. Continuous: `max_secs` (300,
   segment rotation). Event/both: `pre_roll_sec` (5), `post_roll_sec` (10),

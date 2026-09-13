@@ -14,8 +14,6 @@ add_subdirectory(overlay)
 add_subdirectory(zones)
 add_subdirectory(motion_pixel_diff)
 add_subdirectory(store)
-add_subdirectory(output_webrtc)
-add_subdirectory(output_mse)
 
 add_subdirectory(capture_file)
 

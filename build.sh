@@ -1,6 +1,7 @@
-m#!/bin/bash
+#!/bin/bash
 # ZM-Next Build Script
-# This script automatically sets up vcpkg environment and builds the project
+# Configures and builds the project. vcpkg is optional: it is used when present
+# (e.g. a Linux FFmpeg built with VAAPI); macOS builds need only Homebrew.
 
 set -e
 
@@ -18,9 +19,7 @@ if [ -z "$VCPKG_ROOT" ]; then
         export VCPKG_ROOT="$HOME/vcpkg"
         echo -e "${YELLOW}Auto-detected VCPKG_ROOT: $VCPKG_ROOT${NC}"
     else
-        echo -e "${RED}Error: VCPKG_ROOT not set and $HOME/vcpkg not found${NC}"
-        echo "Please install vcpkg or set VCPKG_ROOT environment variable"
-        exit 1
+        echo -e "${YELLOW}vcpkg not found; building with system/Homebrew packages only${NC}"
     fi
 else
     echo -e "${GREEN}Using VCPKG_ROOT: $VCPKG_ROOT${NC}"
@@ -51,4 +50,4 @@ if [ "$1" = "test" ] || [ "$2" = "test" ]; then
 fi
 
 echo -e "${GREEN}Build completed successfully!${NC}"
-echo -e "${GREEN}Run './zm-core pipelines/rtsp_multi_to_webrtc.json' to start${NC}"
+echo -e "${GREEN}Run 'cd build && ./zm-core --pipeline ../pipelines/<name>.json' to start (copy a *.template.json)${NC}"

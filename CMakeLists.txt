@@ -33,7 +33,7 @@ endif()
 if(CMAKE_TOOLCHAIN_FILE AND EXISTS "${CMAKE_TOOLCHAIN_FILE}")
     message(STATUS "vcpkg toolchain configured: ${CMAKE_TOOLCHAIN_FILE}")
 else()
-    message(WARNING "vcpkg not found. Some dependencies may not be available.")
+    message(STATUS "vcpkg not found; using system/Homebrew packages (vcpkg is only needed for e.g. a VAAPI FFmpeg on Linux).")
 endif()
 project(zm-next-core LANGUAGES CXX)
 

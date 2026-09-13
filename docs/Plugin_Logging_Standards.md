@@ -13,7 +13,7 @@ This document outlines the standardized logging approach for zm-next plugins. Lo
 ✅ **All builds and tests pass**  
 
 ### Next Steps
-1. **Migrate Existing Plugins**: Update output_webrtc, capture_rtsp_multi, etc.
+1. **Migrate Existing Plugins**: Update capture_rtsp_multi and any plugin still using its own log wrapper.
 2. **Documentation**: Update plugin development guide
 3. **Enhancement**: Add more advanced features (structured logging, advanced rate limiting)
 
@@ -146,7 +146,7 @@ void zm_plugin_publish_stats(const zm_plugin_stats_t* stats);
 ### Before (Current Pattern)
 
 ```cpp
-// Old pattern in output_webrtc.cpp
+// Old pattern: a plugin-local logging wrapper
 static zm_host_api_t* g_host_api = nullptr;
 static void* g_host_ctx = nullptr;
 
@@ -161,11 +161,11 @@ static void log_info(const char* format, ...) {
     g_host_api->log(g_host_ctx, ZM_LOG_INFO, buffer);
 }
 
-static int webrtc_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx, const char* json_cfg) {
+static int my_plugin_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx, const char* json_cfg) {
     g_host_api = host;
     g_host_ctx = host_ctx;
     
-    log_info("WebRTC plugin started");
+    log_info("plugin started");
     return 0;
 }
 ```
@@ -176,10 +176,10 @@ static int webrtc_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx
 // New pattern using utilities
 #include <zm_plugin_utils.h>
 
-static int webrtc_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx, const char* json_cfg) {
+static int my_plugin_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx, const char* json_cfg) {
     ZmPluginLogger logger(host, host_ctx);
     
-    ZM_LOG_INFO("WebRTC plugin started");
+    ZM_LOG_INFO("plugin started");
     return 0;
 }
 ```
@@ -213,7 +213,7 @@ static int webrtc_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx
 ✅ Created refactored MSE plugin example  
 
 ### Next Steps
-1. **Migrate Existing Plugins**: Update output_webrtc, capture_rtsp_multi, etc.
+1. **Migrate Existing Plugins**: Update capture_rtsp_multi and any plugin still using its own log wrapper.
 2. **Documentation**: Update plugin development guide
 3. **Testing**: Verify logging works correctly across all plugins
 4. **Enhancement**: Add more advanced features (structured logging, log levels)
@@ -251,7 +251,7 @@ zm_plugin_stats_t stats = {0};
 stats.frames_processed = total_frames;
 stats.bytes_processed = total_bytes;
 stats.errors_count = error_count;
-stats.plugin_name = "output_webrtc";
+stats.plugin_name = "my_plugin";
 stats.plugin_version = "1.0.0";
 
 zm_plugin_publish_stats(&stats);

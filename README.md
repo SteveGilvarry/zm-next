@@ -10,8 +10,8 @@
 ![FFmpeg 7](https://img.shields.io/badge/FFmpeg-%E2%89%A57.0-007808?logo=ffmpeg&logoColor=white)
 ![ONNX Runtime](https://img.shields.io/badge/ONNX_Runtime-detect_tier-005CED?logo=onnx&logoColor=white)
 ![CUDA](https://img.shields.io/badge/CUDA-zero--copy-76B900?logo=nvidia&logoColor=white)
-![CMake + vcpkg](https://img.shields.io/badge/build-CMake_%2B_vcpkg-064F8C?logo=cmake&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-27_passing-success?logo=githubactions&logoColor=white)
+![CMake](https://img.shields.io/badge/build-CMake-064F8C?logo=cmake&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-29_passing-success?logo=githubactions&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-macOS_%7C_Linux-lightgrey)
 ![License](https://img.shields.io/badge/license-AGPL--3.0_%2F_Commercial-blue)
 
@@ -58,11 +58,11 @@ flowchart TB
     mo["🚦 motion gate<br/>SIMD pixel-diff"]
     det["🧠 detect<br/>YOLO · pose · seg · open-vocab"]
     trk["🎯 track<br/>OC-SORT + OSNet ReID"]
-    an["📐 analytics<br/>intrusion · line · loiter"]
+    an["📐 analytics<br/>intrusion · line · loiter · fall"]
     vlm["💬 describe<br/>VLM scene caption"]
     aud["🔊 audio detect<br/>AudioSet events"]
     st["💾 store<br/>continuous · event"]
-    out["📡 output<br/>WebRTC · MSE<br/>MQTT · webhook"]
+    out["📡 output<br/>MQTT · webhook<br/>socket → zm-api"]
 
     cap --> dec --> mo --> det --> trk --> an --> vlm --> out
     cap -. audio .-> aud
@@ -113,18 +113,18 @@ flowchart TB
 | **Detect** | `detect_onnx` (YOLO + optional OSNet **ReID** embeddings, +CUDA zero-copy & shared cross-camera batched engine), `detect_openvocab`, `detect_pose`, `detect_seg` |
 | **Recognize** | `recognize_face` (detector + embedder gallery), `lpr` (plate detect + OCR) |
 | **Audio** | `audio_detect` (windowed audio-event classification; raw-waveform *or* log-mel front-end — YAMNet / PANNs / CED / EfficientAT) |
-| **Track / Analyze / Understand** | `tracker` (**OC-SORT**: Kalman + ByteTrack two-stage, appearance-gated ReID), `analytics_rules` (intrusion / line-cross / loiter), `alert_policy` (collapse per-frame detections into per-object alerts), `describe_vlm` (scene description via a VLM server), `llm_event_review` (LLM montage review + track-close narrator) |
-| **Output** | `output_webrtc`, `output_mse`, `output_mqtt`, `output_webhook` |
+| **Track / Analyze / Understand** | `tracker` (**OC-SORT**: Kalman + ByteTrack two-stage, appearance-gated ReID), `analytics_rules` (intrusion / line-cross / loiter / pose-based fall), `alert_policy` (collapse per-frame detections into per-object alerts), `describe_vlm` (scene description via a VLM server), `llm_event_review` (LLM montage review + track-close narrator) |
+| **Output** | `output_mqtt`, `output_webhook` (live video goes over the worker socket to zm-api, which serves WebRTC / HLS / MSE) |
 | **Store / Export** | `store` (`mode` = continuous keyframe-aligned rotation / event pre-roll+post-roll / both), `store_snapshot`, `review_export` (motion-synopsis tubes + plate refs for the renderer) |
-| **Utility** | `overlay`, `privacy_mask`, `hello` (reference plugin) |
+| **Utility** | `overlay`, `privacy_mask` (static polygons + dynamic person/face/plate masking), `hello` (reference plugin) |
 
 Every plugin's config keys are documented in **[docs/Plugin_Config_Reference.md](docs/Plugin_Config_Reference.md)**.
 
 ## 🚀 Quickstart
 
-**Prerequisites** — CMake, a C++20 toolchain, [vcpkg](https://github.com/microsoft/vcpkg)
-(`VCPKG_ROOT` set, or present at `~/vcpkg`), and Homebrew packages: FFmpeg ≥ 7.0, `onnxruntime`,
-`xsimd`, `nlohmann-json`, `boost`, `mosquitto`.
+**Prerequisites** — CMake, a C++20 toolchain, and Homebrew packages: FFmpeg ≥ 7.0, `onnxruntime`,
+`xsimd`, `nlohmann-json`, `boost`, `mosquitto`. [vcpkg](https://github.com/microsoft/vcpkg) is
+optional (picked up from `VCPKG_ROOT` or `~/vcpkg`); on Linux it supplies an FFmpeg built with VAAPI.
 
 ```bash
 ./build.sh            # configure (Debug) + build into build/
@@ -256,5 +256,5 @@ copyleft lineage. (`LICENSE` / `LICENSE-COMMERCIAL` files formalize the above.)
 ---
 
 <div align="center">
-<sub>Built on FFmpeg · ONNX Runtime · Boost.Interprocess · LibDataChannel · GoogleTest</sub>
+<sub>Built on FFmpeg · ONNX Runtime · Boost.Interprocess · GoogleTest</sub>
 </div>
