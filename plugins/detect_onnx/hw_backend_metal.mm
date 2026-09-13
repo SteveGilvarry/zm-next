@@ -388,6 +388,13 @@ public:
     // grid on the GPU, accumulating a changed-count + bbox + luma-sum verdict on
     // device; only the ~28-byte verdict crosses back. Mirrors the CUDA gpudiff
     // path (cuda_motion_bbox_gpudiff): prev grid stays device-resident (ping-pong).
+    void set_motion_params(const MotionParams& p) override {
+        if (p.downsample > 0)      ds_ = p.downsample;
+        if (p.pixel_threshold > 0) thr_ = p.pixel_threshold;
+        if (p.min_cells > 0)       minCells_ = p.min_cells;
+        if (p.luma_jump > 0)       lumaJumpThr_ = p.luma_jump;
+    }
+
     std::vector<Region> motion(const Surface& s) override {
         if (!s.native || !ctx_.ok) return {};
         CVPixelBufferRef pb = reinterpret_cast<CVPixelBufferRef>(s.native);

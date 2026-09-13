@@ -228,6 +228,12 @@ public:
     // OpenVINO/OpenCL kernel (or an ov:: preprocessing op) could move the diff
     // on-device too — see the OPENCL TODO below — but for a coarse grid the host diff
     // is negligible, so the scaffold keeps it on the CPU.
+    void set_motion_params(const MotionParams& p) override {
+        if (p.downsample > 0)      ds_ = p.downsample;
+        if (p.pixel_threshold > 0) thr_ = p.pixel_threshold;
+        if (p.min_cells > 0)       minCells_ = p.min_cells;
+    }
+
     std::vector<Region> motion(const Surface& s) override {
         const int sw = std::max(1, s.width / ds_);
         const int sh = std::max(1, s.height / ds_);

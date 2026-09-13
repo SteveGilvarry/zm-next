@@ -7,7 +7,9 @@
 // different backend (cuda today; metal/openvino/rocm later).
 //
 // Config: model_path, input_size(640), conf_threshold(0.25), roi_motion(false),
-//         class_filter([ids]), stream_filter([ids]), hw("cuda"),
+//         motion{downsample, pixel_threshold, min_cells, luma_jump, max_regions}
+//         (gate tunables, see zm::hw::MotionParams; omitted = backend default),
+//         class_filter([ids]), stream_filter([ids]), hw("auto"),
 //         decode_path("plugins/decode_ffmpeg/decode_ffmpeg.so"), codec(optional).
 
 #include "zm_plugin.h"
@@ -42,7 +44,18 @@ struct Ctx {
     std::string model; int net = 640; float conf = 0.25f;
     bool roiMotion = false;
     std::vector<int> classes, streamFilter;
+    // Gate accounting, logged every kStatsEvery frames and on stop: how many
+    // decoded surfaces arrived, how many the motion gate dropped, how many
+    // regions ran through preprocess+infer, and how many detections came out.
+    uint64_t framesIn = 0, framesGated = 0, infers = 0, dets = 0;
 };
+constexpr uint64_t kStatsEvery = 250;
+
+void logStats(Ctx* c, const char* when) {
+    ZM_LOG_INFO("decode_detect stats (%s): frames=%llu gated=%llu infers=%llu detections=%llu",
+                when, (unsigned long long)c->framesIn, (unsigned long long)c->framesGated,
+                (unsigned long long)c->infers, (unsigned long long)c->dets);
+}
 
 bool streamAllowed(Ctx* c, uint32_t sid) {
     if (c->streamFilter.empty()) return true;
@@ -77,17 +90,24 @@ void on_decoded(void* vc, const void* buf, size_t size) {
     zm::hw::Surface s = be.acquire(g->av_frame);
     if (!s.owner) return;
     std::vector<zm::hw::Detection> dets;
+    c->framesIn++;
     if (c->roiMotion) {
-        for (const auto& r : be.motion(s)) {
+        auto regions = be.motion(s);
+        if (regions.empty()) c->framesGated++;
+        for (const auto& r : regions) {
             auto t = be.preprocess(s, r);
             auto d = be.infer(t, c->conf, c->classes);
+            c->infers++;
             dets.insert(dets.end(), d.begin(), d.end());
         }
     } else {
         auto t = be.preprocess(s);
         dets = be.infer(t, c->conf, c->classes);
+        c->infers++;
     }
     be.release(s);
+    c->dets += dets.size();
+    if (c->framesIn % kStatsEvery == 0) logStats(c, "periodic");
     publish(c, hdr, dets);
 }
 
@@ -103,6 +123,7 @@ int start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx, const char* 
     auto* c = new Ctx(); c->host = host; c->hostCtx = host_ctx;
     zm_plugin_set_log_context(host, host_ctx);
     std::string hw = "auto", decPath, codec;
+    zm::hw::MotionParams mp;
 #if defined(__APPLE__)
     decPath = "plugins/decode_ffmpeg/decode_ffmpeg.dylib";
 #else
@@ -114,6 +135,14 @@ int start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx, const char* 
         c->net = j.value("input_size", 640);
         c->conf = j.value("conf_threshold", 0.25f);
         c->roiMotion = j.value("roi_motion", false);
+        if (j.contains("motion") && j["motion"].is_object()) {
+            const auto& m = j["motion"];
+            mp.downsample      = m.value("downsample", 0);
+            mp.pixel_threshold = m.value("pixel_threshold", 0);
+            mp.min_cells       = m.value("min_cells", 0);
+            mp.luma_jump       = m.value("luma_jump", 0);
+            mp.max_regions     = m.value("max_regions", 0);
+        }
         if (j.contains("class_filter") && j["class_filter"].is_array()) c->classes = j["class_filter"].get<std::vector<int>>();
         if (j.contains("stream_filter") && j["stream_filter"].is_array()) c->streamFilter = j["stream_filter"].get<std::vector<int>>();
         hw = j.value("hw", hw); decPath = j.value("decode_path", decPath); codec = j.value("codec", std::string());
@@ -135,6 +164,7 @@ int start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx, const char* 
     for (const auto& k : order) { c->be = zm::hw::make_backend(k); if (c->be) { chosen = k; break; } }
     if (!c->be) { ZM_LOG_ERROR("decode_detect: no backend for hw='%s' (pass-through)", hw.c_str()); plugin->instance = c; return 0; }
     if (!c->be->load_model(c->model, c->net)) ZM_LOG_ERROR("decode_detect: load_model('%s') failed", c->model.c_str());
+    c->be->set_motion_params(mp);
 
     // The inner decode's hwaccel must produce the surface kind the backend expects.
     auto hwaccelFor = [](const std::string& b) -> std::string {
@@ -157,8 +187,10 @@ int start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx, const char* 
     if (c->dec.start(&c->dec, &c->decHost, c, dcfg.dump().c_str()) == 0) c->decStarted = true;
     else ZM_LOG_ERROR("decode_detect: internal decode start failed");
 
-    ZM_LOG_INFO("decode_detect: fused decode+detect via %s backend (hwaccel=%s, roi_motion=%d)",
-                chosen.c_str(), decHwaccel.c_str(), static_cast<int>(c->roiMotion));
+    ZM_LOG_INFO("decode_detect: fused decode+detect via %s backend (hwaccel=%s, roi_motion=%d, "
+                "motion{ds=%d thr=%d min_cells=%d luma_jump=%d max_regions=%d}; 0 = backend default)",
+                chosen.c_str(), decHwaccel.c_str(), static_cast<int>(c->roiMotion),
+                mp.downsample, mp.pixel_threshold, mp.min_cells, mp.luma_jump, mp.max_regions);
     plugin->instance = c;
     return 0;
 }
@@ -166,6 +198,7 @@ int start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx, const char* 
 void stop(zm_plugin_t* plugin) {
     if (!plugin || !plugin->instance) return;
     auto* c = static_cast<Ctx*>(plugin->instance);
+    if (c->framesIn) logStats(c, "final");
     if (c->decStarted && c->dec.stop) c->dec.stop(&c->dec);
     if (c->decLib) dlclose(c->decLib);
     delete c; plugin->instance = nullptr;

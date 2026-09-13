@@ -51,6 +51,19 @@ struct DeviceTensor {
     bool valid() const { return ptr != nullptr; }
 };
 
+// Motion-gate tunables, the same across backends. 0 = keep the backend's default.
+// The gate downsamples luma into a grid of `downsample`-px cells, diffs each cell
+// against the previous frame, and fires when at least `min_cells` cells moved by
+// more than `pixel_threshold`. Defaults: 8 px cells, threshold 25 (Vulkan 18),
+// min_cells = max(8, cells/400), luma_jump off, 8 regions.
+struct MotionParams {
+    int downsample = 0;       // grid cell size in source pixels
+    int pixel_threshold = 0;  // per-cell |luma diff| that counts as changed
+    int min_cells = 0;        // changed cells needed before the gate fires
+    int luma_jump = 0;        // suppress a frame whose mean luma jumps by more than this (exposure change)
+    int max_regions = 0;      // cap for the multi-region path (CUDA ZM_MOTION_REGIONS=1)
+};
+
 class HwBackend {
 public:
     virtual ~HwBackend() = default;
@@ -58,6 +71,10 @@ public:
 
     // Load the detection model once (net = square input size, e.g. 640).
     virtual bool load_model(const std::string& model_path, int net) = 0;
+
+    // Apply gate tunables. Call before the first motion(); backends that have no
+    // gate ignore it.
+    virtual void set_motion_params(const MotionParams&) {}
 
     // Take ownership of a decoded hw frame so it survives until release() (e.g.
     // across a StageRunner queue). For FFmpeg-backed surfaces av_frame is an AVFrame*.

@@ -225,7 +225,14 @@ private:
         VASurfaceID s=(VASurfaceID)(uintptr_t)f->data[3]; vaSyncSurface(dpy,s);
         return vaExportSurfaceHandle(dpy,s,VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,VA_EXPORT_SURFACE_READ_ONLY|VA_EXPORT_SURFACE_SEPARATE_LAYERS,&d)==VA_STATUS_SUCCESS;
     }
-    bool ensure_ctx(int w,int h){ if(ctxOK_) return true; const char* sd=std::getenv("ZM_VK_SHADER_DIR"); ctxOK_=ctx_.init(sd?sd:"bench/vk",w,h,ds_,net_); minCells_=std::max(8,(w/ds_)*(h/ds_)/400); return ctxOK_; }
+    bool ensure_ctx(int w,int h){ if(ctxOK_) return true; const char* sd=std::getenv("ZM_VK_SHADER_DIR"); ctxOK_=ctx_.init(sd?sd:"bench/vk",w,h,ds_,net_); if(!minCellsSet_) minCells_=std::max(8,(w/ds_)*(h/ds_)/400); return ctxOK_; }
+public:
+    void set_motion_params(const MotionParams& p) override {
+        if (p.downsample > 0)      ds_ = p.downsample;
+        if (p.pixel_threshold > 0) thr_ = p.pixel_threshold;
+        if (p.min_cells > 0)     { minCells_ = p.min_cells; minCellsSet_ = true; }
+    }
+private:
 
     void run_motion(VkImage img, VkImageView view){
         VkDescriptorSetAllocateInfo da{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; da.descriptorPool=ctx_.pool; da.descriptorSetCount=1; da.pSetLayouts=&ctx_.mDsl; VkDescriptorSet set; vkAllocateDescriptorSets(ctx_.dev,&da,&set);
@@ -266,7 +273,7 @@ private:
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount=1; si.pCommandBuffers=&ctx_.cmd; vkQueueSubmit(ctx_.queue,1,&si,VK_NULL_HANDLE); vkQueueWaitIdle(ctx_.queue);
     }
 
-    VkCtx ctx_; bool ctxOK_=false, modelOK_=false, hasPrev_=false;
+    VkCtx ctx_; bool ctxOK_=false, modelOK_=false, hasPrev_=false, minCellsSet_=false;
     NcnnYolo ncnnYolo_;
     int net_=640, ds_=8, thr_=18, minCells_=8;
 };

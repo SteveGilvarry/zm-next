@@ -55,6 +55,13 @@ public:
         if (s.owner) { AVFrame* f = static_cast<AVFrame*>(s.owner); av_frame_free(&f); s.owner = nullptr; }
     }
 
+    void set_motion_params(const MotionParams& p) override {
+        if (p.downsample > 0)      ds_ = p.downsample;
+        if (p.pixel_threshold > 0) thr_ = p.pixel_threshold;
+        if (p.min_cells > 0)       minCells_ = p.min_cells;
+        if (p.max_regions > 0)     maxRegions_ = p.max_regions;
+    }
+
     // Motion gate. DEFAULT: cuda_motion_bbox_gpudiff — fully GPU-resident (downsample
     // AND diff on the device, prev grid stays device-resident, only a ~24B verdict
     // crosses PCIe), returning ONE merged ROI. Set ZM_MOTION_REGIONS=1 for the

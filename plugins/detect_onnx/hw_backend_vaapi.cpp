@@ -292,6 +292,12 @@ public:
     // few-KB grid. A Vulkan compute shader importing the scaled surface as a dmabuf
     // could do the diff on-device and return only a ~24B verdict (matching the CUDA
     // gpudiff path). Left as a TODO; the grid is tiny so host diff is cheap for now.
+    void set_motion_params(const MotionParams& p) override {
+        if (p.downsample > 0)      ds_ = p.downsample;
+        if (p.pixel_threshold > 0) thr_ = p.pixel_threshold;
+        if (p.min_cells > 0)       minCells_ = p.min_cells;
+    }
+
     std::vector<Region> motion(const Surface& s) override {
         AVFrame* in = static_cast<AVFrame*>(s.owner);
         if (!in || s.width <= 0 || s.height <= 0) return {};
