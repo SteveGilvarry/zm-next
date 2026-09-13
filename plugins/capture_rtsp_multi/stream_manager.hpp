@@ -27,7 +27,9 @@ extern "C" {
 
 // Configuration for a single RTSP stream
 struct StreamConfig {
-    std::string url;               // RTSP URL
+    std::string url;               // RTSP URL (may still carry embedded userinfo; log only redacted)
+    std::string username;          // camera credentials, joined to the URL only at open time
+    std::string password;
     std::string transport;         // "tcp" or "udp"  
     uint32_t stream_id;           // Unique stream identifier
     bool hw_decode;               // Hardware decoding enabled

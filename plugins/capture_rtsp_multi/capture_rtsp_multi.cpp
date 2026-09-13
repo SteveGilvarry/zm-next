@@ -1,5 +1,6 @@
 #include "zm_plugin.h"
 #include "stream_manager.hpp"
+#include "url_credentials.hpp"
 
 #include <memory>
 #include <cstring>
@@ -22,7 +23,8 @@ static void ffmpeg_log_callback(void* avcl, int level, const char* fmt, va_list 
     else zm_level = ZM_LOG_INFO;
     
     if (g_host_api && g_host_api->log) {
-        g_host_api->log(g_host_ctx, zm_level, buf);
+        // FFmpeg may quote the (credentialed) URL it is opening.
+        g_host_api->log(g_host_ctx, zm_level, zm::capture::redact_text(buf).c_str());
     }
 }
 

@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include "zm/PipelineLoader.hpp"
 #include <fstream>
+#include <iostream>
+#include <sstream>
 #include <cstdio>
 
 using namespace zm;
@@ -41,6 +43,22 @@ TEST(PipelineLoaderTest, FlatArrayLinearFallback) {
     EXPECT_EQ(p[1].children, (std::vector<int>{2}));
     EXPECT_TRUE(p[2].children.empty());
     remove(f.c_str());
+}
+
+// "-" reads the pipeline from stdin, as zm-api launches workers.
+TEST(PipelineLoaderTest, DashReadsStdin) {
+    std::istringstream in(R"({"plugins":[{"kind":"capture_rtsp_multi",)"
+                          R"("cfg":{"streams":[{"url":"rtsp://10.0.0.5/live","username":"u","password":"p"}]},)"
+                          R"("children":[{"kind":"store"}]}]})");
+    std::streambuf* saved = std::cin.rdbuf(in.rdbuf());
+    PipelineLoader loader("-");
+    const bool ok = loader.load();
+    std::cin.rdbuf(saved);
+    ASSERT_TRUE(ok);
+    const auto& p = loader.getPipeline();
+    ASSERT_EQ(p.size(), 2u);
+    EXPECT_EQ(p[0].children, (std::vector<int>{1}));
+    EXPECT_NE(p[0].config_json.find("\"username\":\"u\""), std::string::npos);
 }
 
 // main omitted; use gtest_main

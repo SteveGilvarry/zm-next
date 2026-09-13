@@ -21,13 +21,19 @@ PipelineLoader::~PipelineLoader() {}
 bool PipelineLoader::load() {
     pipeline_.clear();
     try {
-        std::ifstream f(path_);
-        if (!f) {
-            std::cerr << "Cannot open file: " << path_ << std::endl;
-            return false;
-        }
+        // "-" reads the pipeline from stdin: zm-api delivers it in memory so the
+        // camera credentials inside never touch disk.
         nlohmann::json root;
-        f >> root;
+        if (path_ == "-") {
+            std::cin >> root;
+        } else {
+            std::ifstream f(path_);
+            if (!f) {
+                std::cerr << "Cannot open file: " << path_ << std::endl;
+                return false;
+            }
+            f >> root;
+        }
         if (!root.is_object()) {
             std::cerr << "JSON root is not an object in " << path_ << std::endl;
             return false;

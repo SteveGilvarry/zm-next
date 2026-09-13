@@ -1,4 +1,6 @@
 #include "stream_manager.hpp"
+#include "url_credentials.hpp"
+#include <nlohmann/json.hpp>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -45,137 +47,56 @@ bool StreamManager::initialize(zm_host_api_t* host_api, void* host_ctx, const ch
     return true;
 }
 
+// Config: either a single stream object {"url":..., ...} or {"streams":[{...}, ...]}.
+// Per stream: url (required), stream_id (default: position), transport ("tcp"),
+// hw_decode, max_retry_attempts (5; -1 = forever), retry_delay_ms (2000),
+// forward_audio (true), username / password (joined to the URL only at open
+// time; zm-api passes them separately so they are never in a logged URL).
 bool StreamManager::parse_configuration(const char* json_config) {
-    // Simplified JSON parsing for demonstration
-    // In production, use a proper JSON library like nlohmann/json
-    
     if (!json_config) {
         log(ZM_LOG_ERROR, "No configuration provided");
         return false;
     }
-    
-    log(ZM_LOG_DEBUG, "Parsing configuration: %s", json_config);
-    
-    // For now, implement basic parsing for common cases
-    // This is a simplified parser - replace with proper JSON library
-    std::string config_str(json_config);
-    
-    // Look for "streams" array
-    size_t streams_pos = config_str.find("\"streams\"");
-    if (streams_pos == std::string::npos) {
-        // Single stream configuration for backward compatibility
-        StreamConfig config;
-        config.stream_id = 0;
-        
-        // Extract URL
-        size_t url_start = config_str.find("\"url\"");
-        if (url_start != std::string::npos) {
-            url_start = config_str.find(":", url_start) + 1;
-            url_start = config_str.find("\"", url_start) + 1;
-            size_t url_end = config_str.find("\"", url_start);
-            config.url = config_str.substr(url_start, url_end - url_start);
-        }
-        
-        // Extract transport
-        size_t transport_start = config_str.find("\"transport\"");
-        if (transport_start != std::string::npos) {
-            transport_start = config_str.find(":", transport_start) + 1;
-            transport_start = config_str.find("\"", transport_start) + 1;
-            size_t transport_end = config_str.find("\"", transport_start);
-            config.transport = config_str.substr(transport_start, transport_end - transport_start);
-        } else {
-            config.transport = default_transport_;
-        }
-        
-        // Extract hw_decode
-        size_t hw_pos = config_str.find("\"hw_decode\"");
-        if (hw_pos != std::string::npos) {
-            size_t value_pos = config_str.find(":", hw_pos) + 1;
-            config.hw_decode = (config_str.find("true", value_pos) != std::string::npos);
-        } else {
-            config.hw_decode = global_hw_decode_;
-        }
-        
-        if (!config.url.empty()) {
-            stream_configs_[config.stream_id] = config;
-            log(ZM_LOG_INFO, "Added single stream: %s (transport: %s, hw_decode: %s)", 
-                config.url.c_str(), config.transport.c_str(), config.hw_decode ? "true" : "false");
-        }
-    } else {
-        // Multi-stream configuration
-        log(ZM_LOG_INFO, "Multi-stream configuration detected");
-        
-        // This is a simplified parser - in production use proper JSON library
-        // For now, assume format like:
-        // {"streams": [{"url": "rtsp://...", "stream_id": 0}, {"url": "rtsp://...", "stream_id": 1}]}
-        
-        // Extract each stream entry
-        size_t stream_start = 0;
-        uint32_t stream_counter = 0;
-        
-        while ((stream_start = config_str.find("{", stream_start)) != std::string::npos) {
-            size_t stream_end = config_str.find("}", stream_start);
-            if (stream_end == std::string::npos) break;
-            
-            std::string stream_json = config_str.substr(stream_start, stream_end - stream_start + 1);
-            
-            // Check if this contains a URL (indicates it's a stream object)
-            if (stream_json.find("\"url\"") != std::string::npos) {
-                StreamConfig config;
-                config.stream_id = stream_counter++;
-                
-                // Extract URL
-                size_t url_start = stream_json.find("\"url\"");
-                if (url_start != std::string::npos) {
-                    url_start = stream_json.find(":", url_start) + 1;
-                    url_start = stream_json.find("\"", url_start) + 1;
-                    size_t url_end = stream_json.find("\"", url_start);
-                    config.url = stream_json.substr(url_start, url_end - url_start);
-                }
-                
-                // Extract stream_id if specified
-                size_t id_pos = stream_json.find("\"stream_id\"");
-                if (id_pos != std::string::npos) {
-                    size_t id_start = stream_json.find(":", id_pos) + 1;
-                    size_t id_end = stream_json.find_first_of(",}", id_start);
-                    std::string id_str = stream_json.substr(id_start, id_end - id_start);
-                    // Remove whitespace
-                    id_str.erase(std::remove_if(id_str.begin(), id_str.end(), ::isspace), id_str.end());
-                    config.stream_id = std::stoul(id_str);
-                }
-                
-                // Extract transport
-                size_t transport_start = stream_json.find("\"transport\"");
-                if (transport_start != std::string::npos) {
-                    transport_start = stream_json.find(":", transport_start) + 1;
-                    transport_start = stream_json.find("\"", transport_start) + 1;
-                    size_t transport_end = stream_json.find("\"", transport_start);
-                    config.transport = stream_json.substr(transport_start, transport_end - transport_start);
-                } else {
-                    config.transport = default_transport_;
-                }
-                
-                // Extract hw_decode
-                size_t hw_pos = stream_json.find("\"hw_decode\"");
-                if (hw_pos != std::string::npos) {
-                    size_t value_pos = stream_json.find(":", hw_pos) + 1;
-                    config.hw_decode = (stream_json.find("true", value_pos) != std::string::npos);
-                } else {
-                    config.hw_decode = global_hw_decode_;
-                }
-                
-                if (!config.url.empty()) {
-                    stream_configs_[config.stream_id] = config;
-                    log(ZM_LOG_INFO, "Added stream %u: %s (transport: %s, hw_decode: %s)", 
-                        config.stream_id, config.url.c_str(), config.transport.c_str(), 
-                        config.hw_decode ? "true" : "false");
-                }
-            }
-            
-            stream_start = stream_end + 1;
-        }
+    nlohmann::json root = nlohmann::json::parse(json_config, nullptr, /*allow_exceptions=*/false);
+    if (!root.is_object()) {
+        log(ZM_LOG_ERROR, "Configuration is not a JSON object");
+        return false;
     }
-    
+
+    std::vector<nlohmann::json> entries;
+    if (root.contains("streams") && root["streams"].is_array()) {
+        for (const auto& s : root["streams"]) entries.push_back(s);
+    } else {
+        entries.push_back(root);  // single-stream form
+    }
+
+    uint32_t position = 0;
+    for (const auto& s : entries) {
+        const uint32_t pos = position++;
+        if (!s.is_object() || !s.contains("url") || !s["url"].is_string()) {
+            log(ZM_LOG_WARN, "Skipping stream entry %u without a url", pos);
+            continue;
+        }
+        StreamConfig config;
+        config.url = s["url"].get<std::string>();
+        config.stream_id = pos;
+        if (s.contains("stream_id") && s["stream_id"].is_number_integer() && s["stream_id"].get<int64_t>() >= 0)
+            config.stream_id = static_cast<uint32_t>(s["stream_id"].get<int64_t>());
+        config.transport = s.value("transport", default_transport_);
+        config.hw_decode = s.value("hw_decode", global_hw_decode_);
+        config.max_retry_attempts = s.value("max_retry_attempts", config.max_retry_attempts);
+        config.retry_delay_ms = s.value("retry_delay_ms", config.retry_delay_ms);
+        config.forward_audio = s.value("forward_audio", config.forward_audio);
+        config.username = s.value("username", std::string());
+        config.password = s.value("password", std::string());
+        if (config.url.empty()) continue;
+
+        stream_configs_[config.stream_id] = config;
+        log(ZM_LOG_INFO, "Added stream %u: %s (transport: %s, hw_decode: %s, retries: %d, credentials: %s)",
+            config.stream_id, zm::capture::redact(config.url).c_str(), config.transport.c_str(),
+            config.hw_decode ? "true" : "false", config.max_retry_attempts,
+            (!config.username.empty() || zm::capture::userinfo_end(config.url) != std::string::npos) ? "yes" : "no");
+    }
     return !stream_configs_.empty();
 }
 
@@ -278,7 +199,7 @@ void StreamManager::capture_loop(uint32_t stream_id) {
     const auto& config = config_it->second;
     auto& state = state_it->second;
     
-    log_stream(stream_id, ZM_LOG_INFO, "Starting capture loop for %s", config.url.c_str());
+    log_stream(stream_id, ZM_LOG_INFO, "Starting capture loop for %s", zm::capture::redact(config.url).c_str());
     
     while (state->running) {
         // Try to connect if not connected
@@ -404,7 +325,9 @@ bool StreamManager::connect_stream(StreamState* state, const StreamConfig& confi
     av_dict_set(&opts, "reconnect_delay_max", "5", 0);   // Max 5 seconds between reconnection attempts
     
     // Open input
-    int ret = avformat_open_input(&state->fmt_ctx, config.url.c_str(), nullptr, &opts);
+    // The only place credentials meet the URL; the joined string is not logged.
+    const std::string open_url = zm::capture::with_credentials(config.url, config.username, config.password);
+    int ret = avformat_open_input(&state->fmt_ctx, open_url.c_str(), nullptr, &opts);
     av_dict_free(&opts);
     
     if (ret < 0) {
@@ -490,15 +413,15 @@ bool StreamManager::connect_stream(StreamState* state, const StreamConfig& confi
         return false;
     }
     
-    log_stream(state->stream_id, ZM_LOG_INFO, "Successfully connected to %s", config.url.c_str());
-    
-    // Publish connection event with stream info
-    char json_event[512];
-    snprintf(json_event, sizeof(json_event), 
-            "{\"event\":\"StreamConnected\",\"stream_id\":%u,\"url\":\"%s\",\"video_streams\":%d,\"audio_streams\":%d}", 
-            config.stream_id, config.url.c_str(), video_count, audio_count);
+    const std::string shown_url = zm::capture::redact(config.url);
+    log_stream(state->stream_id, ZM_LOG_INFO, "Successfully connected to %s", shown_url.c_str());
+
+    // Publish connection event with stream info (redacted URL; JSON-escaped).
+    nlohmann::json connected = {{"event", "StreamConnected"}, {"stream_id", config.stream_id},
+                                {"url", shown_url}, {"video_streams", video_count},
+                                {"audio_streams", audio_count}};
     if (host_api_ && host_api_->publish_evt) {
-        host_api_->publish_evt(host_ctx_, json_event);
+        host_api_->publish_evt(host_ctx_, connected.dump().c_str());
     }
     
     // Publish stream metadata with codec parameters (video, and audio if present)
@@ -746,7 +669,7 @@ bool StreamManager::add_stream(const StreamConfig& config) {
     }
     
     stream_configs_[config.stream_id] = config;
-    log(ZM_LOG_INFO, "Added new stream %u: %s", config.stream_id, config.url.c_str());
+    log(ZM_LOG_INFO, "Added new stream %u: %s", config.stream_id, zm::capture::redact(config.url).c_str());
     
     return true;
 }

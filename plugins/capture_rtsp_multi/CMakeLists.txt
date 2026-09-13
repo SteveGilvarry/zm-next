@@ -24,8 +24,9 @@ target_include_directories(capture_rtsp_multi PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For stream_manager.hpp
 )
 
+find_package(nlohmann_json REQUIRED)
 target_link_directories(capture_rtsp_multi PRIVATE ${ZM_FFMPEG_LIBDIRS})
-target_link_libraries(capture_rtsp_multi PRIVATE ${ZM_FFMPEG_LIBS} zmcore)
+target_link_libraries(capture_rtsp_multi PRIVATE ${ZM_FFMPEG_LIBS} zmcore nlohmann_json::nlohmann_json)
 
 # Enable threading support
 find_package(Threads REQUIRED)

@@ -28,7 +28,7 @@ extern "C" void handle_signal(int sig) {
 }
 
 void print_usage(const char* prog) {
-    std::cout << "Usage: " << prog << " --pipeline <pipeline.json>\n";
+    std::cout << "Usage: " << prog << " --pipeline <pipeline.json | ->   (- = read JSON from stdin)\n";
     std::cout << "       or: " << prog << " --pipelines-dir <dir>\n";
     std::cout << "Options:\n";
     std::cout << "  --socket <path>      Unix socket for the worker link (media+events+control)\n";
