@@ -135,7 +135,8 @@ optional with the defaults shown. Common keys:
   (700, spacing of the sampled keyframe ring), `json_output` (false; when true,
   requests a strict JSON schema and emits `threat_level` + `scene_confidence` on
   the event), `max_tokens` (128). Best with a temporally-aware model
-  (Qwen3-VL-4B-Instruct).
+  (Qwen3-VL-4B-Instruct). Answers the `describe_now` worker command (see
+  "On-demand commands" below).
 
 ## Outputs / store
 - **output_mqtt** — `host` ("localhost"), `port` (1883), `base_topic`
@@ -154,7 +155,29 @@ optional with the defaults shown. Common keys:
   via the recording_opening → assign_recording → EventClip handshake.
 - **store_snapshot** — `root`, `trigger_types`, `min_interval_ms` (2000),
   `jpeg_quality` (2–31, lower=better), `frame_width`/`frame_height`,
-  `stream_filter`.
+  `stream_filter`. Each snapshot publishes `EventSnapshot` (EVENT `0x0307`) with
+  `path`, `width`, `height`, `bytes`, `pts_usec`. Answers the `snapshot_now`
+  worker command. `trigger_types: ["none"]` gives a snapshot-on-command-only
+  instance.
+
+## On-demand commands (worker socket)
+
+zm-api can ask a running worker for work now, for an agent/MCP tool or a UI
+button. Send a Command (`0x11`) with a JSON body; zm-core replies at once with a
+Response (`0x12`) `{"ok":true,"message":"dispatched","request_id":N}`, then the
+plugin that owns the command publishes exactly one result EVENT carrying the same
+`request_id`, `on_demand:true` and `ok` (with `error` when `ok` is false). The
+result can arrive before or after the Response; match on `request_id`. Instances
+with a `stream_filter` only answer commands naming one of their streams; a
+command without `stream_id` goes to every instance. If no plugin in the pipeline
+owns the command, only the Response arrives, so callers should time out.
+
+| Command | Keys | Result EVENT |
+|---|---|---|
+| `snapshot_now` | `request_id`, `stream_id`?, `inline`? (true adds `jpeg_base64`) | `0x0307` `EventSnapshot`: `path`, `width`, `height`, `bytes`, `pts_usec` (store_snapshot). Ignores trigger list and throttle. |
+| `describe_now` | `request_id`, `stream_id`?, `prompt`? (one-off override) | `0x0302` `description`: `text`, `prompt`, `model`, `frames`, `pts_usec` (describe_vlm). Ignores trigger gate and cooldown and does not reset it. |
+
+Try it with `./wl_dump /tmp/zm.sock 5 '{"cmd":"snapshot_now","request_id":1}'`.
 
 ## Event flow (what produces/consumes what)
 

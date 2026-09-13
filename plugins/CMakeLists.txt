@@ -35,3 +35,11 @@ add_subdirectory(output_mqtt)
 add_subdirectory(output_webhook)
 add_subdirectory(store_snapshot)
 add_subdirectory(review_export)
+
+# Shared header-only helpers in plugins/common (no library to build, tests only).
+find_package(nlohmann_json REQUIRED)
+add_executable(test_on_demand common/tests/test_on_demand.cpp)
+target_include_directories(test_on_demand PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
+target_link_libraries(test_on_demand PRIVATE GTest::gtest_main nlohmann_json::nlohmann_json)
+set_target_properties(test_on_demand PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+add_test(NAME OnDemandCommandTest COMMAND $<TARGET_FILE:test_on_demand>)

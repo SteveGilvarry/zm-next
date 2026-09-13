@@ -2,7 +2,10 @@
 // every framed message (Hello / Media / Keyframe / Stats / Event / Bye). A live
 // end-to-end probe for the per-monitor worker interface, speaking the same wire
 // protocol as the ZoneMinder zmc producer and the zm-api consumer.
-// Usage: wl_dump <socket> [seconds]
+// Usage: wl_dump <socket> [seconds] [command-json]
+//   With command-json (e.g. '{"cmd":"snapshot_now","request_id":1}') the tool
+//   sends it as a Command right after connecting and prints the Response. Events
+//   answering a command (they carry "request_id") are printed at more length.
 
 #include "zm/stream_socket_protocol.hpp"
 
@@ -24,9 +27,10 @@ int main(int argc, char** argv) {
     // piped (not held in a block buffer and flushed in bursts) — keeps a live feed
     // through `wl_dump | grep ...` real-time.
     setvbuf(stdout, nullptr, _IOLBF, 0);
-    if (argc < 2) { std::cerr << "usage: wl_dump <socket> [seconds]\n"; return 2; }
+    if (argc < 2) { std::cerr << "usage: wl_dump <socket> [seconds] [command-json]\n"; return 2; }
     const std::string path = argv[1];
     const int seconds = argc > 2 ? atoi(argv[2]) : 5;
+    const std::string command = argc > 3 ? argv[3] : "";
 
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     sockaddr_un addr{};
@@ -39,6 +43,23 @@ int main(int argc, char** argv) {
     }
     std::cout << "connected to " << path << "\n";
     // No Subscribe needed: a canonical consumer receives everything by default.
+
+    if (!command.empty()) {
+        ss::Header ch{};
+        ch.length = ss::kHeaderLengthBytes + static_cast<uint32_t>(command.size());
+        ch.version = ss::kProtocolVersion;
+        ch.type = static_cast<uint8_t>(ss::MessageType::Command);
+        ch.stream = static_cast<uint8_t>(ss::StreamId::Monitor);
+        uint8_t hb[ss::kHeaderSize];
+        ss::SerializeHeader(ch, hb);
+        std::string frame(reinterpret_cast<const char*>(hb), ss::kHeaderSize);
+        frame += command;
+        if (::write(fd, frame.data(), frame.size()) != static_cast<ssize_t>(frame.size())) {
+            std::cerr << "failed to send command\n";
+            return 1;
+        }
+        std::cout << "COMMAND sent " << command << "\n";
+    }
 
     std::string buf;
     int hello = 0, media = 0, keyframe = 0, events = 0, stats = 0, bye = 0, other = 0;
@@ -100,7 +121,8 @@ int main(int argc, char** argv) {
                     if (ss::ParseEvent(body, payload_len, ev)) {
                         std::cout << "EVENT code=0x" << std::hex << ev.code << std::dec;
                         if (!ev.json_detail.empty())
-                            std::cout << " detail=" << ev.json_detail.substr(0, 160);
+                            std::cout << " detail=" << ev.json_detail.substr(
+                                0, ev.json_detail.find("\"request_id\"") != std::string::npos ? 600 : 160);
                         else if (!ev.message.empty())
                             std::cout << " msg=" << ev.message.substr(0, 120);
                         std::cout << "\n";
@@ -112,6 +134,9 @@ int main(int argc, char** argv) {
                 case ss::MessageType::Bye:
                     ++bye;
                     std::cout << "BYE\n";
+                    break;
+                case ss::MessageType::Response:
+                    std::cout << "RESPONSE " << std::string(reinterpret_cast<const char*>(body), payload_len) << "\n";
                     break;
                 default:
                     ++other;

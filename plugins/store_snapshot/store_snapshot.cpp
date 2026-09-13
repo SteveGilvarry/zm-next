@@ -10,6 +10,12 @@
 // Snapshots are throttled to at most one per `min_interval_ms` so a burst of
 // detections does not flood the disk.
 //
+// On demand: a {"cmd":"snapshot_now","request_id":N} command (optional
+// "stream_id"; "inline":true adds the JPEG as base64) writes a snapshot at once,
+// ignoring the trigger list and the throttle, and always publishes one
+// EventSnapshot tagged with request_id / on_demand / ok (success or the reason it
+// failed). See plugins/common/on_demand.hpp.
+//
 // Data flow:
 //   on_frame (capture thread):
 //     - if the frame is ZM_FRAME_RGB24 and passes stream_filter, copy it into
@@ -25,6 +31,8 @@
 // plus an atomic `running`; we unsubscribe in stop(). The event callback (reader
 // of the latest frame) and on_frame (writer) are serialised by st->mtx.
 
+#include "base64.hpp"
+#include "on_demand.hpp"
 #include "snapshot_util.hpp"
 
 #include <zm_plugin.h>
@@ -238,11 +246,27 @@ bool write_file(const std::string& path, const std::vector<uint8_t>& data) {
 // ---------------------------------------------------------------------------
 // Snapshot — invoked from the host event callback. Caller does NOT hold mtx;
 // we take it here to copy the latest frame, then encode/IO outside the lock.
+// `req` is set for a snapshot_now command: then every outcome publishes an
+// EventSnapshot tagged with its request_id, so the caller always gets an answer.
 // ---------------------------------------------------------------------------
-void take_snapshot(StoreSnapshotState* st, int64_t now_ms) {
+void take_snapshot(StoreSnapshotState* st, int64_t now_ms,
+                   const zm::ondemand::Request* req = nullptr) {
+    auto publish = [&](json ev) {
+        if (st->host && st->host->publish_evt)
+            st->host->publish_evt(st->host_ctx, ev.dump().c_str());
+    };
+    auto fail = [&](const std::string& why) {
+        if (!req) return;
+        json ev = {{"event", "EventSnapshot"}};
+        if (req->has_stream) ev["stream_id"] = req->stream_id;
+        zm::ondemand::tag(ev, *req, false, why);
+        publish(std::move(ev));
+    };
+
     std::vector<uint8_t> rgb;
     int width = 0, height = 0;
     uint32_t stream_id = 0;
+    int64_t pts_usec = 0;
     {
         std::lock_guard<std::mutex> lk(st->mtx);
         if (!st->have_frame || st->latest_frame.empty()) {
@@ -252,13 +276,16 @@ void take_snapshot(StoreSnapshotState* st, int64_t now_ms) {
                      "skipping snapshot");
                 st->warned_no_frame = true;
             }
-            return;
+            return fail("no RGB24 frame received yet");
         }
+        if (req && req->has_stream && st->latest_stream_id != req->stream_id)
+            return fail("no recent frame for stream " + std::to_string(req->stream_id));
         rgb = st->latest_frame;  // copy under lock
         width = st->latest_width;
         height = st->latest_height;
         stream_id = st->latest_stream_id;
-        st->last_snapshot_ms = now_ms;  // reserve the throttle slot
+        pts_usec = st->latest_pts_usec;
+        if (!req) st->last_snapshot_ms = now_ms;  // reserve the throttle slot
     }
 
     if (width <= 0 || height <= 0) {
@@ -266,38 +293,45 @@ void take_snapshot(StoreSnapshotState* st, int64_t now_ms) {
              "store_snapshot: invalid frame dimensions %dx%d (set frame_width/"
              "frame_height in config)",
              width, height);
-        return;
+        return fail("frame dimensions unknown (set frame_width/frame_height)");
     }
     if (rgb.size() < (size_t)width * (size_t)height * 3) {
         slog(st, ZM_LOG_ERROR,
              "store_snapshot: frame buffer too small for %dx%d RGB24", width,
              height);
-        return;
+        return fail("frame buffer smaller than the configured dimensions");
     }
 
     std::vector<uint8_t> jpeg;
     if (!encode_rgb24_to_jpeg(rgb.data(), width, height, st->jpeg_quality,
                               jpeg)) {
         slog(st, ZM_LOG_ERROR, "store_snapshot: JPEG encode failed");
-        return;
+        return fail("JPEG encode failed");
     }
 
     std::string path = make_snapshot_path(st->root, stream_id);
     if (!write_file(path, jpeg)) {
         slog(st, ZM_LOG_ERROR, "store_snapshot: failed to write %s",
              path.c_str());
-        return;
+        return fail("could not write " + path);
     }
 
     slog(st, ZM_LOG_INFO, "store_snapshot: wrote %s (%zu bytes)", path.c_str(),
          jpeg.size());
 
-    if (st->host && st->host->publish_evt) {
-        json ev = {{"event", "EventSnapshot"},
-                   {"path", path},
-                   {"stream_id", stream_id}};
-        st->host->publish_evt(st->host_ctx, ev.dump().c_str());
+    json ev = {{"event", "EventSnapshot"},
+               {"path", path},
+               {"stream_id", stream_id},
+               {"pts_usec", pts_usec},
+               {"width", width},
+               {"height", height},
+               {"bytes", jpeg.size()}};
+    if (req) {
+        zm::ondemand::tag(ev, *req, true);
+        if (req->args.value("inline", false))
+            ev["jpeg_base64"] = zm::b64::encode(jpeg.data(), jpeg.size());
     }
+    publish(std::move(ev));
 }
 
 // ---------------------------------------------------------------------------
@@ -312,6 +346,14 @@ void event_cb(void* user, const char* json_event) {
     try {
         j = json::parse(json_event);
     } catch (...) {
+        return;
+    }
+
+    // snapshot_now: no trigger-type check, no throttle.
+    zm::ondemand::Request req;
+    if (zm::ondemand::parse(j, "snapshot_now", req)) {
+        if (zm::ondemand::for_this_instance(req, st->stream_filter))
+            take_snapshot(st, now_wall_ms(), &req);
         return;
     }
 

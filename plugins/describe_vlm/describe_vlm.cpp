@@ -11,6 +11,11 @@
 // client. The HTTP call happens on a background thread so the pipeline thread is
 // never blocked. Every frame is forwarded downstream unchanged.
 //
+// On demand: a {"cmd":"describe_now","request_id":N} command (optional
+// "stream_id", "prompt") describes the current frame(s) at once, skipping the
+// trigger gate and cooldown, and publishes a "description" event tagged with
+// request_id / on_demand / ok (see plugins/common/on_demand.hpp).
+//
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -29,6 +34,7 @@
 #include "zm_plugin.h"
 #include "vlm_client.hpp"
 #include "image_encode.hpp"
+#include "on_demand.hpp"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -53,6 +59,7 @@ struct TriggerState {
     std::vector<std::string> types;          // event "type"s that trigger a describe
     std::vector<uint32_t> streamFilter;      // empty = any stream
     std::string lastTrigger;                 // JSON of the event that armed the describe (guarded by mtx)
+    std::deque<zm::ondemand::Request> onDemand;   // describe_now commands waiting (guarded by mtx)
 };
 
 struct DescribeVlmCtx {
@@ -163,7 +170,32 @@ static const char* kSceneSchema =
     R"("threat_level":{"type":"string","enum":["LOW","MEDIUM","HIGH"]},)"
     R"("confidence":{"type":"number"}},"required":["description","threat_level"]})";
 
-static void run_inference_cycle(DescribeVlmCtx* ctx) {
+// Publish the result of a describe_now that could not produce a description.
+static void publish_on_demand_failure(DescribeVlmCtx* ctx, const zm::ondemand::Request& req,
+                                      const std::string& error) {
+    json evt;
+    evt["type"] = "description";
+    evt["model"] = ctx->model;
+    if (req.has_stream) evt["stream_id"] = req.stream_id;
+    zm::ondemand::tag(evt, req, false, error);
+    if (ctx->host && ctx->host->publish_evt) ctx->host->publish_evt(ctx->hostCtx, evt.dump().c_str());
+    ZM_LOG_WARN("describe_vlm: describe_now %llu failed: %s",
+                (unsigned long long)req.request_id, error.c_str());
+}
+
+// One describe. `req` is set for an on-demand describe: its prompt override is
+// used and every outcome, including failure, publishes an event tagged with its
+// request_id. Returns false when no description was published.
+static bool run_inference_cycle(DescribeVlmCtx* ctx, const zm::ondemand::Request* req = nullptr) {
+    auto fail = [&](const std::string& why) {
+        if (req) publish_on_demand_failure(ctx, *req, why);
+        return false;
+    };
+    const std::string prompt = (req && req->args.contains("prompt") && req->args["prompt"].is_string() &&
+                                !req->args["prompt"].get<std::string>().empty())
+                                   ? req->args["prompt"].get<std::string>()
+                                   : ctx->prompt;
+
     // Gather frame(s): the sampled ring (multi-frame mode) or the latest snapshot.
     DescribeVlmCtx::RingFrame single;
     std::vector<DescribeVlmCtx::RingFrame> picked;
@@ -171,7 +203,9 @@ static void run_inference_cycle(DescribeVlmCtx* ctx) {
     uint64_t ptsUsec = 0;
     {
         std::lock_guard<std::mutex> lk(ctx->frameMutex);
-        if (!ctx->haveFrame || ctx->latestFrame.empty()) return;
+        if (!ctx->haveFrame || ctx->latestFrame.empty()) return fail("no frame received yet");
+        if (req && req->has_stream && ctx->latestStreamId != req->stream_id)
+            return fail("no recent frame for stream " + std::to_string(req->stream_id));
         streamId = ctx->latestStreamId;
         ptsUsec = ctx->latestPtsUsec;
         if (ctx->frames > 1 && !ctx->ring.empty()) {
@@ -205,17 +239,17 @@ static void run_inference_cycle(DescribeVlmCtx* ctx) {
     }
     if (reqs.empty()) {
         ZM_LOG_ERROR("describe_vlm: no encodable frame for inference");
-        return;
+        return fail("no encodable frame (set frame_width/frame_height)");
     }
 
     const std::string schema = ctx->jsonOutput ? std::string(kSceneSchema) : std::string();
-    std::string body = vlm::build_chat_request_json_multi(ctx->model, ctx->prompt, reqs,
+    std::string body = vlm::build_chat_request_json_multi(ctx->model, prompt, reqs,
                                                           ctx->maxTokens, schema);
 
     std::string response;
     if (!http_post_json(ctx->serverUrl, body, response)) {
         // http_post_json already logged the error.
-        return;
+        return fail("VLM server request failed (" + ctx->serverUrl + ")");
     }
 
     // Structured (json_output) → pull description/threat_level/confidence; else plain text.
@@ -235,14 +269,15 @@ static void run_inference_cycle(DescribeVlmCtx* ctx) {
     }
     if (text.empty()) {
         ZM_LOG_ERROR("describe_vlm: failed to parse VLM response");
-        return;
+        return fail("could not parse the VLM response");
     }
 
     // Publish the description event.
     json evt;
     evt["type"] = "description";
     evt["text"] = text;
-    evt["prompt"] = ctx->prompt;
+    evt["prompt"] = prompt;
+    if (req) zm::ondemand::tag(evt, *req, true);
     evt["model"] = ctx->model;
     evt["stream_id"] = streamId;
     evt["pts_usec"] = ptsUsec;
@@ -254,7 +289,7 @@ static void run_inference_cycle(DescribeVlmCtx* ctx) {
 
     // Embed the detection that triggered this describe, so the published event (and
     // thus the MQTT payload) is a single rich alert: VLM text + what was detected.
-    if (!ctx->curTrigger.empty()) {
+    if (!req && !ctx->curTrigger.empty()) {
         try {
             auto tj = json::parse(ctx->curTrigger);
             evt["trigger_type"] = tj.value("type", std::string("detection"));
@@ -273,15 +308,24 @@ static void run_inference_cycle(DescribeVlmCtx* ctx) {
         ctx->host->publish_evt(ctx->hostCtx, evt.dump().c_str());
     }
     ZM_LOG_INFO("describe_vlm: %s", text.c_str());
+    return true;
 }
 
 // Host event callback: a detection/motion event from an upstream stage (e.g.
-// decode_detect) arms a describe. Only touches the leaked TriggerState.
+// decode_detect) arms a describe, and a describe_now command queues one. Only
+// touches the leaked TriggerState.
 static void describe_trigger_cb(void* user, const char* json_event) {
     auto* ts = static_cast<TriggerState*>(user);
     if (!ts || !ts->running.load() || !json_event) return;
     try {
         auto j = nlohmann::json::parse(json_event);
+        zm::ondemand::Request req;
+        if (zm::ondemand::parse(j, "describe_now", req)) {
+            if (!zm::ondemand::for_this_instance(req, ts->streamFilter)) return;
+            { std::lock_guard<std::mutex> lk(ts->mtx); ts->onDemand.push_back(std::move(req)); }
+            ts->cv.notify_one();
+            return;
+        }
         const std::string type = j.value("type", std::string());
         if (std::find(ts->types.begin(), ts->types.end(), type) == ts->types.end()) return;
         if (!ts->streamFilter.empty()) {
@@ -306,12 +350,24 @@ static void worker_loop(DescribeVlmCtx* ctx) {
     auto lastDescribe = std::chrono::steady_clock::now() - cooldown;  // allow an immediate first describe
 
     while (ctx->running.load()) {
+        std::deque<zm::ondemand::Request> onDemand;
         {
             std::unique_lock<std::mutex> lk(ts->mtx);
-            // Wake on: shutdown, a fired trigger, or (interval mode) the timeout tick.
-            ts->cv.wait_for(lk, cooldown, [&] { return !ctx->running.load() || ts->fired.load(); });
+            // Wake on: shutdown, a fired trigger, a describe_now, or (interval mode) the tick.
+            ts->cv.wait_for(lk, cooldown, [&] {
+                return !ctx->running.load() || ts->fired.load() || !ts->onDemand.empty();
+            });
+            onDemand.swap(ts->onDemand);
         }
         if (!ctx->running.load()) break;
+
+        // On-demand describes run first and ignore the trigger gate and cooldown:
+        // someone asked for this frame now. They don't reset the cooldown either,
+        // so a describe_now never delays the next triggered describe.
+        for (const auto& r : onDemand) {
+            ctx->curTrigger.clear();
+            run_inference_cycle(ctx, &r);
+        }
 
         const bool fired = ts->fired.exchange(false);
         if (gated && !fired) continue;                       // trigger mode: only describe on a detection
@@ -380,7 +436,8 @@ static int describe_vlm_start(zm_plugin_t* plugin, zm_host_api_t* host,
     ctx->trig = new TriggerState;
     ctx->trig->types = ctx->triggerTypes;
     ctx->trig->streamFilter = ctx->streamFilter;
-    if (!ctx->triggerTypes.empty() && host && host->subscribe_evt)
+    // Always subscribe: describe_now commands arrive on the bus in every mode.
+    if (host && host->subscribe_evt)
         ctx->trigSub = host->subscribe_evt(host_ctx, &describe_trigger_cb, ctx->trig);
 
     ctx->running.store(true);

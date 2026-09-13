@@ -22,6 +22,7 @@ endif()
 
 target_include_directories(store_snapshot PRIVATE
     ${CMAKE_SOURCE_DIR}/core/include
+    ${CMAKE_SOURCE_DIR}/plugins/common
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 

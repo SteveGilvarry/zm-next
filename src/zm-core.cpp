@@ -108,10 +108,13 @@ int main(int argc, char** argv) {
             } else if (name == "reload") {
                 // Hot reload is Phase 2 — daemon should restart the process for now.
                 r.ok = false; r.message = "not_implemented";
-            } else if (name == "assign_recording") {
+            } else if (name == "assign_recording" || name == "snapshot_now" ||
+                       name == "describe_now") {
                 // Plugin-targeted command: dispatch the full command JSON onto the
-                // in-process event bus so the store plugin (subscribed via the host
-                // API) can match it by clip_token. `args` is the raw command JSON.
+                // in-process event bus for the plugin that owns it (store matches
+                // assign_recording by clip_token; store_snapshot and describe_vlm
+                // answer snapshot_now / describe_now with an EVENT carrying the
+                // command's request_id). `args` is the raw command JSON.
                 EventBus::instance().publish("plugin_event", args);
                 r.ok = true; r.message = "dispatched";
             } else {
