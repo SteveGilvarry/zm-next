@@ -7,7 +7,7 @@
       "children": [
         { "id": "detect", "kind": "decode_detect",
           "cfg": { "model_path": "/path/to/yolo26n_fp16.onnx", "hw": "auto",
-                   "input_size": 640, "conf_threshold": 0.25 },
+                   "input_size": 640, "conf_threshold": 0.25, "roi_motion": true },
           "queue_depth": 4 }
       ] }
   ]

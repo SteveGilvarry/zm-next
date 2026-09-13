@@ -30,6 +30,19 @@ optional with the defaults shown. Common keys:
   (0), `hwaccel` ("none" | "auto" | "cuda" | "videotoolbox" | "vaapi" | "qsv" |
   "d3d11va"/"dxva2"). CUDA → zero-copy GPU surface; other hw → decode on GPU then
   download to CPU; all fall back to software if the device is unavailable.
+- **decode_detect** — fused hardware decode + on-GPU motion gate + detect in one
+  synchronous stage (see `docs/GPU_Pipeline.md`). `model_path`, `input_size` (640),
+  `conf_threshold` (0.25), `hw` ("auto" | "cuda" | "metal" | "vaapi" | "vulkan" |
+  "openvino"; auto picks the platform's backend and sets the inner decoder's
+  hwaccel to match), `roi_motion` (false; true = run the gate and infer only on
+  frames/regions that moved), `motion` (gate tunables, every key optional, omit to
+  keep the backend default): `downsample` (cell size px, 8), `pixel_threshold`
+  (per-cell luma diff, 25; Vulkan 18), `min_cells` (max(8, cells/400)),
+  `luma_jump` (suppress whole-scene exposure jumps above this, off; Metal),
+  `max_regions` (CUDA multi-region path, 8). `class_filter` ([ids]),
+  `stream_filter`, `codec` (override), `decode_path` (inner decode_ffmpeg
+  library). Logs `decode_detect stats` (frames/gated/infers/detections) every 250
+  frames and on stop.
 - **encode_ffmpeg** — `codec` (output: "h264" | "hevc"/"h265", default "h264"),
   `hwaccel` ("none" | "nvenc" | "videotoolbox" | "vaapi" | "qsv" | "amf") which
   resolves to the encoder (e.g. h265+nvenc → `hevc_nvenc`); `encoder` (explicit

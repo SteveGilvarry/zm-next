@@ -1,87 +1,107 @@
-# Zero-copy GPU pipeline (NVDEC → CUDA → ORT, gated)
+# GPU pipeline: decode, motion and detection without leaving the GPU
 
-Status (2026-06): **implemented behind `-DZM_WITH_CUDA=ON` (OFF by default).**
-Built and compile-checked on macOS with the option OFF (so the default CPU build
-is unaffected) and the FFmpeg decode side compile-checked with the portable API.
-The CUDA-specific code (kernel, NPP-free fused preprocess, ORT CUDA IoBinding) has
-**NOT been run** — validate on a Linux/NVIDIA box. See "Validate" below.
+Status (2026-09-13): **implemented and validated on NVIDIA (CUDA), Apple silicon (VideoToolbox +
+Metal + CoreML/ANE) and AMD/Intel (VAAPI, Vulkan prototypes).** The fused stage is the
+`decode_detect` plugin. The measured numbers below come from runs on this branch; the June
+validation of the CUDA and VAAPI paths is recorded in the commit messages for `07c0790`,
+`94cd302` and `docs/Mixed_GPU_Findings.md`.
 
-## What is implemented
+## What runs where
 
-- **ABI:** `zm_gpu_frame_t` (`core/include/zm_plugin.h`) describes a GPU surface —
-  per-plane device pointers + pitches, dims, native pix_fmt, and the owning
-  `AVFrame*` (valid for the synchronous on_frame call). When a frame's `hw_type`
-  is a GPU type, the on_frame payload is this descriptor, not pixel bytes.
-- **decode_ffmpeg:** `"hwaccel":"cuda"` config creates a CUDA `hw_device_ctx`,
-  selects `AV_PIX_FMT_CUDA` via `get_format`, and emits the decoded NV12 surface
-  as a `zm_gpu_frame_t` (no CPU download). Falls back to software decode if no
-  CUDA device is available — so the same plugin runs everywhere. (FFmpeg must be
-  built with `--enable-cuda --enable-nvdec`.)
-- **detect_onnx:** with a model and `"ep":"cuda"`, a CUDA `hw_type` frame is run
-  zero-copy: a fused CUDA kernel (`detect_cuda.cu`) samples the NV12 surface into a
-  letterboxed, normalized CHW float tensor **on the device**, which is bound as the
-  ORT input via `IoBinding` (CUDA memory — no host image readback); only the small
-  output tensor returns to the CPU for NMS-free decode. Without `ZM_WITH_CUDA`, a
-  CUDA frame is logged (throttled) and passed through.
-- **Chain:** the synchronous stage-to-stage routing (see capture→decode→detect)
-  bounds the surface lifetime to the on_frame call, so the descriptor's `AVFrame*`
-  stays valid through detect without refcount juggling.
+`decode_detect` is a PROCESS plugin that dlopens `decode_ffmpeg` internally and, for every decoded
+surface, runs a `HwBackend` (`plugins/detect_onnx/hw_backend.hpp`) in the same synchronous call:
 
-## Known caveats (validate / tune on GPU)
+    acquire(surface) -> motion(surface) -> preprocess(surface, region) -> infer(tensor) -> release
 
-- The fused kernel uses **nearest-neighbour** sampling and **BT.601 limited-range**
-  YUV→RGB. Fine for detection; revisit (bilinear / BT.709 / full-range) if accuracy
-  needs it or the camera signals a different matrix.
-- CPU consumers of a GPU frame (motion, describe_vlm) are **not** yet wired to a
-  download-on-demand helper — today only `detect_onnx` consumes CUDA frames. Add an
-  `av_hwframe_transfer_data` helper before mixing CPU stages after a GPU decode.
-- The previous CPU reality still applies when `hwaccel` != `cuda`: software decode →
-  `sws_scale` → CPU RGB/gray; `motion_pixel_diff` CPU; `ShmRing` CPU bytes.
+Because decode and detect share one call, the surface never crosses a `StageRunner` queue and never
+touches CPU memory. What comes back to the host is a ~28-byte motion verdict (changed-cell count,
+bbox, luma sum) and the detection tensor. With `roi_motion: true` the gate runs first and inference
+only happens for frames with enough changed cells.
 
-## Build & validate (Linux/NVIDIA)
+| Backend (`hw`) | Decode | Motion on GPU | Preprocess + inference | Build flag | Validated |
+|---|---|---|---|---|---|
+| `cuda` | NVDEC (`hwaccel: cuda`) | `gpudiff` kernel, previous grid stays device-resident | CUDA kernel -> ORT CUDA EP, IoBinding | `-DZM_WITH_CUDA=ON` | RTX 50-series. Motion diff byte-identical to the host diff (8/8). Default gate on CUDA. |
+| `metal` | VideoToolbox (`hwaccel: videotoolbox`), CVPixelBuffer imported with `CVMetalTextureCache` | Metal downsample + diff kernels, ping-pong grids on device | Metal NV12->CHW letterbox -> ORT CoreML EP (Neural Engine) | `-DZM_WITH_METAL=ON` (Apple only) | M4 Pro. Bench: 0 mismatches vs CPU over 120 frames. Pipeline: this document. |
+| `vaapi` | VAAPI | `scale_vaapi` VPP downsample | ORT | `-DZM_WITH_VAAPI=ON` | Ryzen iGPU, 196 detections in `bench/bench_vaapi.cpp`. Needs vcpkg FFmpeg with VAAPI. |
+| `vulkan` | VAAPI -> dma_buf import | Vulkan compute, 0 mismatches, 0.13 ms at 720p | Vulkan preprocess -> ncnn-Vulkan | `-DZM_WITH_VULKAN=ON` | Prototypes in `bench/vk/`; backend compiles, not run end to end in a pipeline. |
+| `openvino` | -- | -- | OpenVINO EP | `-DZM_WITH_OPENVINO=ON` | Compiles. Never run. |
 
-```
-cmake -B build -DZM_WITH_CUDA=ON -DONNXRUNTIME_ROOT=/opt/onnxruntime-gpu ..
-```
-Requires the CUDA toolkit, FFmpeg with NVDEC, and an onnxruntime built with the
-CUDA execution provider. Then run a pipeline with `decode_ffmpeg` cfg
-`"hwaccel":"cuda"` feeding `detect_onnx` cfg `"ep":"cuda"`, and confirm detections
-with `nvidia-smi` showing decode+compute on the GPU and no per-frame host copies.
+`hw: "auto"` (the default) tries `metal` on Apple and `cuda, vaapi, vulkan, openvino` elsewhere until
+one is compiled in and available, then derives the inner decoder's `hwaccel` from the choice.
 
-## Goal
+## Measured: the Apple motion gate in a real pipeline
 
-Decode on the GPU and keep frames there; run detection/motion on the surface;
-**download to CPU only when a CPU consumer needs it** (CPU motion, VLM JPEG, or no
-GPU present). The worker-socket media path sends compressed packets, so it never
-needs decoded frames — it's already free of decoded-frame copies.
+Run on 2026-09-13, M4 Pro, `capture_file -> decode_detect(hw: auto)`, YOLO26n fp16, 4K 25 fps
+H.264 night-street CCTV clip, 30 s realtime, socket consumer attached. Counters are the plugin's own
+(`decode_detect stats` log lines, every 250 frames and on stop).
 
-## Design
+| | `roi_motion: true` | `roi_motion: false` |
+|---|---|---|
+| Frames decoded | 726 | 723 |
+| Frames dropped by the gate | 563 (78%) | 0 |
+| Inferences | 163 | 723 |
+| Raw detections | 1024 | 4284 |
+| `zm-core` CPU at 30 s | **5.6%** | 33.5% |
+| RSS at 30 s | 157 MB | 155 MB |
 
-- **HW decode in `decode_ffmpeg`:** set up `hw_device_ctx` per backend, implement
-  the `get_format` callback to select the hw pixfmt, and keep the AVFrame in
-  `hw_frames_ctx` (do **not** call `av_hwframe_transfer_data`). Emit a frame whose
-  `hw_type` is the GPU type and whose `handle` references the surface.
-- **In-process GPU fan-out (not ShmRing):** GPU surface handles are process-local
-  and can't go through Boost.Interprocess shared memory. Keep surfaces in a GPU
-  frame pool and fan out the *handle* in the header to in-process GPU consumers;
-  the `ShmRing` stays the CPU transport. (This is a second, parallel path in
-  `CaptureThread`/`PluginManager`, selected by `hw_type`.)
-- **GPU consumers:**
-  - Detection (embedded ORT): CUDA EP via `IoBinding` with a device pointer (zero
-    readback); CoreML/Metal on Apple; map the FFmpeg surface to the EP's memory.
-  - Motion: a GPU kernel (CUDA/Metal) or VAAPI/CL — later.
-- **Download-on-demand:** a helper that materializes a CPU `RGB24`/`GRAYSCALE`
-  buffer from a surface, called lazily only by CPU consumers.
+The gate's inference count follows the clip's real motion. ffmpeg's own per-frame luma difference
+(`signalstats` YDIF, mean per 50-frame block) peaks at frames 150-350 (0.6-1.2) and flatlines at 0.04
+from frame 400 on. The gate ran 101 inferences in frames 1-250, 62 in 251-500 and 0 in 501-726.
+Parked cars are still there in every frame (the ungated run finds ~6 per frame) but nothing moves, so
+nothing is inferred.
 
-## Per-backend
+Static control: a 12 s clip made by looping one frame of the same footage (`ffmpeg -loop 1`) gave
+287 frames, 286 gated, 1 inference, 7 detections. The one inference is the first frame; after that the
+previous-grid comparison holds.
 
-- macOS: VideoToolbox decode → `CVPixelBuffer`/`IOSurface` → Metal/CoreML.
-- Linux NVIDIA: NVDEC → CUDA frames → ORT CUDA/TensorRT EP (CUDA interop).
-- Linux Intel/AMD: VAAPI surfaces → VAAPI/OpenCL or download.
+Repro from `build/`:
 
-## Sequencing
+    ./zm-core --pipeline ../pipelines/apple_metal_detect.json --socket /tmp/zm.sock --monitor-id 1
+    ./wl_dump /tmp/zm.sock 27      # EVENT code=0x301 per frame with detections
 
-Best done after the embedded detection tier lands (so there's a GPU consumer to
-justify it), and it should be designed jointly with that plugin's `IoBinding`
-input path. Until then, the CPU path is correct and portable; GPU is a throughput
-optimization for many-camera / high-resolution installs.
+Copy `pipelines/apple_metal_detect.template.json` to a `.json` with real paths. `wl_dump` prints the
+first 160 characters of each event's JSON, so count detections from the plugin stats, not from its
+output.
+
+## Apple specifics
+
+- VideoToolbox emits `420v` NV12, video range, so the kernels use BT.601 `1.164*(Y-16)`.
+- The ANE only helps with an **fp16** model. fp32 falls back to about CPU speed (13.9 ms vs 1.95 ms
+  for yolo26n at 640). Export with `half=True`. `ZM_COREML_UNITS` overrides the compute-unit choice
+  (`ALL`, `CPUAndNeuralEngine`, `CPUAndGPU`, `CPUOnly`).
+- Metal kernels compile at runtime from source; no offline Metal toolchain is needed.
+- `decode_detect` dlopens `plugins/decode_ffmpeg/decode_ffmpeg.dylib` from disk. After changing
+  `decode_ffmpeg`, rebuild its dylib or the stale one silently downloads VTB frames to CPU and
+  `on_decoded` sees no GPU surface (0 detections, no error).
+
+## Known gaps
+
+- **GPU motion exists only inside `decode_detect`.** `motion_gate`, `motion_pixel_diff` and `zones`
+  are CPU plugins that never see a GPU frame. There is no standalone GPU motion stage.
+- **No download-on-demand.** A CPU plugin placed after a GPU decode (`describe_vlm`, `overlay`,
+  `privacy_mask`, CPU motion) gets a `zm_gpu_frame_t` descriptor, not pixels. An
+  `av_hwframe_transfer_data` helper is still to be written before GPU and CPU stages can be mixed.
+- **Zones are not applied on the GPU path.** The gate works on a whole-frame grid. Zone geometry
+  only applies through `analytics_rules` on tracker output.
+- **Gate tunables** live under `motion` in the `decode_detect` config and apply to every backend
+  (`zm::hw::MotionParams`): `downsample` (cell size in px, default 8), `pixel_threshold` (per-cell
+  luma diff, default 25, Vulkan 18), `min_cells` (default `max(8, cells/400)`), `luma_jump`
+  (exposure-change suppression, default off; Metal only for now), `max_regions` (CUDA multi-region
+  path, default 8). Omit a key to keep the backend default. CUDA's multi-region path is still
+  selected by `ZM_MOTION_REGIONS=1` in the environment, not by config.
+- **Don't mix two GPU stacks in one process.** Running the AMD VAAPI/Vulkan stack and ORT-CUDA in
+  the same process slows CUDA inference from 1.8 ms to 30 ms. Splitting decode and inference across
+  GPUs only pays with separate processes. See `docs/Mixed_GPU_Findings.md`.
+- **Per-monitor sessions don't scale past ~8 cameras on a 16 GB card.** Each worker owns a CUDA
+  context and ORT session (~1.2-1.5 GB host, ~0.7 GB VRAM). The per-GPU `zm-infer` daemon design is
+  in `zm-api/docs/ZMNEXT_SHARED_INFERENCE_PLAN.md`; not built.
+- OpenVINO and the Vulkan backend have not been run in a pipeline.
+
+## ABI
+
+`zm_gpu_frame_t` (`core/include/zm_plugin.h`) describes a GPU surface: per-plane device pointers and
+pitches, dims, native pix_fmt, and the owning `AVFrame*`, valid for the synchronous `on_frame` call.
+When a frame's `hw_type` is `ZM_HW_CUDA` or `ZM_HW_VTB`, the `on_frame` payload is this descriptor,
+not pixel bytes. `decode_ffmpeg` emits it when `hwaccel` is `cuda` or `videotoolbox` and falls back to
+software decode when the device is missing, so the same plugin runs everywhere. GPU surface handles
+are process-local and cannot cross the `ShmRing`; the ring stays the CPU transport.

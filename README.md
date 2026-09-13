@@ -78,7 +78,7 @@ flowchart TB
     class st,out sink
 ```
 
-> ⚡ **On NVIDIA**, `decode_detect` fuses NVDEC decode + ROI-motion + YOLO into one zero-copy GPU stage, and a shared batched engine coalesces frames **across cameras** into single inference passes.
+> ⚡ **On NVIDIA and Apple silicon**, `decode_detect` fuses hardware decode + on-GPU motion gate + YOLO into one zero-copy stage (NVDEC → CUDA → ORT CUDA EP; VideoToolbox → Metal → CoreML on the Neural Engine). Frames never leave GPU memory; only a ~28-byte motion verdict and the detection tensor come back. On NVIDIA a shared batched engine also coalesces frames **across cameras** into single inference passes. See [GPU_Pipeline.md](docs/GPU_Pipeline.md).
 
 ## ✨ Highlights
 
@@ -209,7 +209,7 @@ gracefully when FFmpeg isn't on the host. See **[docs/End_To_End_Proof.md](docs/
 | [End_To_End_Proof.md](docs/End_To_End_Proof.md) | The runnable proof + `wl_dump`, and the bugs it surfaced |
 | [Plugin_Config_Reference.md](docs/Plugin_Config_Reference.md) | Every plugin's JSON config keys |
 | [AI_Architecture.md](docs/AI_Architecture.md) | The detection/VLM tier and runtime choices |
-| [GPU_Pipeline.md](docs/GPU_Pipeline.md) | Zero-copy decode → inference (CUDA) |
+| [GPU_Pipeline.md](docs/GPU_Pipeline.md) | Zero-copy decode → motion → inference on CUDA, Apple Metal/ANE, VAAPI/Vulkan; measured gate numbers |
 | [Motion_Architecture.md](docs/Motion_Architecture.md) | Modular `zones → motion → output` design |
 | [Two_Way_Audio.md](docs/Two_Way_Audio.md) | Talkback to camera speakers |
 | [ONVIF_Integration.md](docs/ONVIF_Integration.md) | Discovery / camera management (a control-plane concern) |
@@ -233,9 +233,11 @@ src/         zm-core.cpp — the per-monitor worker entry point
 
 ZM-Next is under active development. The capture → decode → motion → detect → track → record pipeline,
 the per-stage threading, and the canonical worker-socket contract are implemented and validated
-end-to-end. The **GPU zero-copy path is validated on Linux/NVIDIA** (RTX 50-series): NVDEC decode →
-on-GPU YOLO → OC-SORT + OSNet ReID, cross-camera dynamic batching through a shared inference engine,
-and AudioSet audio classification on the live stream. On the horizon: hardening for daemon supervision
+end-to-end. The **GPU zero-copy path is validated on Linux/NVIDIA** (RTX 50-series: NVDEC decode →
+on-GPU motion gate → on-GPU YOLO → OC-SORT + OSNet ReID, cross-camera dynamic batching through a
+shared inference engine) **and on Apple silicon** (M4 Pro: VideoToolbox → Metal motion gate → CoreML
+on the Neural Engine; the gate drops 78% of frames on a 4K night-street clip and cuts the worker from
+33% to 6% CPU). AudioSet audio classification runs on the live stream. On the horizon: hardening for daemon supervision
 (watchdog/liveness, `SO_PEERCRED` access control, per-stage health metrics), the ONNX Runtime TensorRT
 EP (fp16/INT8), and per-camera cutover alongside legacy `zmc`/`zma`.
 

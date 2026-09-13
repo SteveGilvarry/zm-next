@@ -4,6 +4,45 @@ _Generated 2026-06-26 from a multi-agent literature + ecosystem sweep (9 domains
 
 > Scope: zm-next (C++ plugin pipeline), zm-api (Rust control plane), and the apps (zm-dashboard, zm-mobile, zmNinjaNg). Competitive frame: Frigate, Scrypted, Viseron, Home Assistant.
 
+## Status update, 13 September 2026
+
+Re-scored eleven weeks on. The rest of this document is the June snapshot and is unchanged.
+
+**What landed from the near-term list (all on 26 June, the same day this survey was written):**
+YOLO26 NMS-free default, OC-SORT with Kalman and ByteTrack two-stage association (64b79d5),
+optional OSNet ReID feeding the tracker gate (68b871b), multi-frame VLM keyframes with structured
+JSON output (2cc7e31), log-mel front end for CED/EfficientAT in audio_detect (b44f170), and the
+ANE-vs-GPU docs correction. zm-next has had no commits since.
+
+**Landed elsewhere:** zm-api built the NL/semantic search vertical slice on MariaDB 11.8 native
+VECTOR (`GET /api/v3/search`, `/events/{id}/similar`, embed-at-ingest, RRF fusion, rerank, SQL
+counting). No UI calls it yet, image embeddings are not done, and the local embed/rerank servers are
+not packaged. zm-api also shipped native replacements for zmstats/zmaudit/zmtelemetry, a hardened
+takeover mode, an AI registry API over ZoneMinder's new `AI_*` tables, and the H.265 WebRTC server
+side (Safari unverified).
+
+**Not started:** WHEP/WHIP signaling, dynamic privacy redaction (privacy_mask is still static
+polygons), the pose fall heuristic and detect_action, INT8 export, vllm-mlx serving, guided-filter
+matte refine, Coral/Hailo/RKNN, any review or timeline UI, the DETR tier. The shared-inference daemon
+is blocked on a worker RSS leak (about 40 MB/min per worker on the CUDA box, found 27 June, not yet
+attributed).
+
+**Changes in the field since June:**
+- ZoneMinder upstream 1.39.17 (1 July) added `Monitors.ObjectDetection*` columns, the
+  `AI_Datasets`/`AI_Models`/`AI_Object_Classes` tables seeded with COCO, and an Options UI for them.
+  No detection engine reads them on master yet. Upstream is at 1.39.34 as of 13 September.
+- Frigate 0.17.2 went stable 28 June; 0.18 is at RC1 with full UI configuration, a tool-calling chat
+  agent (search, similar, live context, recap), motion preview clips in review, and a debug replay
+  tool. This is the UX bar for March 2027.
+- Scrypted NVR ships AI summaries in a "Stories" tab, cloud or local LLM.
+
+**Read of the position:** the engine leads (GPU-resident three-vendor pipeline, ANE, batched ORT,
+OC-SORT + ReID, local multi-frame VLM, grounded search). What the user sees trails. The six-month plan
+(shared with the ZoneMinder maintainer 13 September) is: October unblock (`UseZmNext` column and
+stream socket upstream, leak fixed), November show descriptions and search in zm-web and zmNinjaNg,
+December pilot on mixed installs and settle zm-next as the engine behind the 1.39.17 AI schema,
+January redaction/synopsis/actions, February apps, March one release train.
+
 ## Executive summary
 
 zm-next is genuinely near-SOTA on the hard parts almost no NVR gets right — the emit-ingredients plugin ABI, a shared batched ONNX engine with cross-camera dynamic batching, a multi-EP HwBackend with a validated fp16 ANE path, an NMS-free YOLO26 decode path already in code, and a local VLM describer that is architecturally ahead of Frigate GenAI. The wins are mostly model swaps and small wiring jobs on plumbing you already own, NOT rewrites. The four biggest gaps are all execution, not capability: (1) no shipped semantic/NL event search (the single largest competitive gap vs Frigate 0.15-0.17, and your own sqlite-vec design is correct but unbuilt); (2) the tracker is 2017-era SORT (no Kalman, ReID hooks present but fed a colour histogram); (3) privacy_mask is static-polygon only when the market sells subject-tracking redaction; (4) describe_vlm throws away Qwen3-VL's temporal grounding by sending one frame to a non-batching server. Ship YOLO26+INT8, multi-frame VLM, OC-SORT+real ReID, EdgeTAM dynamic redaction, and the sqlite-vec search loop, and zm-next moves from at-parity to ahead of Frigate on detection, tracking, redaction, and local GenAI.
