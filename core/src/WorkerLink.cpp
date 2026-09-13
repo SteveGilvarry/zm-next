@@ -87,13 +87,14 @@ uint16_t map_event_code(const std::string& type, const std::string& event) {
     if (type == "review_assets")          return ss::kEventReviewAssets;
     if (event == "EventClip")             return ss::kEventRecordingSaved;
     if (event == "RecordingOpening")      return ss::kEventRecordingOpening;
+    if (event == "EventSnapshot")         return ss::kEventSnapshotSaved;
     return 0;
 }
 
 bool is_ai_code(uint16_t code) {
     return code == ss::kEventDetection || code == ss::kEventDescription ||
            code == ss::kEventRecordingSaved || code == ss::kEventRecordingOpening ||
-           code == ss::kEventReviewAssets;
+           code == ss::kEventReviewAssets || code == ss::kEventSnapshotSaved;
 }
 
 } // namespace
@@ -290,6 +291,8 @@ void WorkerLink::runLoop() {
         if (rc > 0 && (pfds[0].revents & POLLIN))
             acceptClient();
 
+        std::vector<std::function<void()>> deferred;
+        {
         std::lock_guard<std::mutex> lock(mutex_);
         if (rc > 0) {
             for (size_t i = 1; i < pfds.size(); ++i) {
@@ -322,6 +325,11 @@ void WorkerLink::runLoop() {
             }
         }
         reapDead();
+        deferred.swap(deferred_);
+        }
+
+        // Command / talkback handlers run without mutex_ held (see deferred_).
+        for (auto& fn : deferred) fn();
     }
 }
 
@@ -394,37 +402,50 @@ void WorkerLink::onClientReadable(Client& c) {
             }
             case ss::MessageType::Command: {
                 json j = json::parse(body, body + payload_len, nullptr, false);
-                CommandResult r{false, "bad command", ""};
                 std::string name;
                 uint64_t request_id = 0;
-                if (j.is_object()) {
+                const bool valid = j.is_object();
+                if (valid) {
                     // Accept either {"cmd":...} (zm-api plugin-targeted commands) or
                     // {"name":...,"args":...} (core control). Pass the FULL payload
                     // JSON to the handler so plugin commands keep every field.
                     name = j.value("cmd", j.value("name", std::string{}));
                     request_id = j.value("request_id", 0ull);
-                    std::string raw(body, payload_len);
-                    if (handler_) r = handler_(name, raw);
-                    else r = {false, "no command handler", ""};
                 }
-                json resp = {{"request_id", request_id}, {"ok", r.ok},
-                             {"message", r.message}, {"data", r.data_json}};
-                std::string rs = resp.dump();
-                MessagePtr out = makeControl(static_cast<uint8_t>(ss::MessageType::Response),
-                                             static_cast<uint8_t>(ss::StreamId::Monitor),
-                                             /*flags=*/0, /*sequence=*/0, /*pts_us=*/0,
-                                             std::vector<uint8_t>(rs.begin(), rs.end()));
-                c.queue.push_back(out);
-                c.queued_bytes += out->wire_size();
-                onClientWritable(c);
+                // Run the handler after runLoop drops mutex_ (see deferred_), then
+                // queue the Response for this client if it is still connected.
+                deferred_.push_back([this, fd = c.fd, valid, name, request_id,
+                                     raw = std::string(body, payload_len)] {
+                    CommandResult r{false, "bad command", ""};
+                    if (valid) {
+                        if (handler_) r = handler_(name, raw);
+                        else r = {false, "no command handler", ""};
+                    }
+                    json resp = {{"request_id", request_id}, {"ok", r.ok},
+                                 {"message", r.message}, {"data", r.data_json}};
+                    std::string rs = resp.dump();
+                    MessagePtr out = makeControl(static_cast<uint8_t>(ss::MessageType::Response),
+                                                 static_cast<uint8_t>(ss::StreamId::Monitor),
+                                                 /*flags=*/0, /*sequence=*/0, /*pts_us=*/0,
+                                                 std::vector<uint8_t>(rs.begin(), rs.end()));
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    auto it = clients_.find(fd);
+                    if (it == clients_.end() || it->second.dead) return;
+                    it->second.queue.push_back(out);
+                    it->second.queued_bytes += out->wire_size();
+                    onClientWritable(it->second);
+                });
                 break;
             }
             case ss::MessageType::Talkback: {
-                // Payload = [u32 codec_le][raw audio]; pts in the header.
+                // Payload = [u32 codec_le][raw audio]; pts in the header. Deferred
+                // like commands: the handler may publish events.
                 if (talkbackHandler_ && payload_len >= 4) {
                     uint32_t codec = get_u32_le(reinterpret_cast<const uint8_t*>(body));
-                    talkbackHandler_(codec, static_cast<int64_t>(h.pts_us),
-                                     std::string(body + 4, payload_len - 4));
+                    deferred_.push_back([this, codec, pts = static_cast<int64_t>(h.pts_us),
+                                         data = std::string(body + 4, payload_len - 4)] {
+                        talkbackHandler_(codec, pts, data);
+                    });
                 }
                 break;
             }

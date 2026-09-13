@@ -153,6 +153,7 @@ constexpr uint16_t kEventRecordingSaved       = 0x0303;  // a clip was written t
 constexpr uint16_t kEventRecordingOpening     = 0x0304;  // a clip segment opened; requests an event-id assignment
 // 0x0305 reserved for a future "reasoning" event (see docs/Research_Motion_and_LLM_Review.md).
 constexpr uint16_t kEventReviewAssets         = 0x0306;  // motion-synopsis tube/plate manifest (see docs/Motion_Synopsis.md)
+constexpr uint16_t kEventSnapshotSaved        = 0x0307;  // a JPEG snapshot was written (store_snapshot; also the snapshot_now result)
 
 // EVENT TLV tags
 constexpr uint8_t kTlvWallClockUs = 0x01;  // u64, unix-epoch microseconds

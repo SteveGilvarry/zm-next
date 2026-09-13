@@ -137,8 +137,9 @@ int main(int argc, char** argv) {
         EventBus::instance().subscribe("plugin_event", [wl](const std::string& evt) {
             // Inbound plugin-targeted commands are re-published on this same bus to
             // reach the plugins (see the command handler above). Don't echo those
-            // back out to socket consumers — and never call back into WorkerLink
-            // here (this runs under WorkerLink's lock during command dispatch).
+            // back out to socket consumers. A plugin may answer a command inline, so
+            // this can run inside the command handler; WorkerLink calls handlers
+            // without its lock held, so publishing the answer here is safe.
             if (evt.find("\"cmd\"") != std::string::npos) {
                 auto j = nlohmann::json::parse(evt, nullptr, /*allow_exceptions=*/false);
                 if (j.is_object() && j.contains("cmd")) return;

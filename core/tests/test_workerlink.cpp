@@ -9,6 +9,9 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <poll.h>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -414,8 +417,7 @@ TEST(WorkerLinkTest, RecordingOpeningEvent) {
 
 // A client→server cmd-style Command (assign_recording) is delivered to the
 // command handler with the cmd name + full payload; when the handler dispatches
-// it onto the event bus (as zm-core does), a bus subscriber receives it — with
-// no deadlock despite the dispatch happening under WorkerLink's lock.
+// it onto the event bus (as zm-core does), a bus subscriber receives it.
 TEST(WorkerLinkTest, CmdStyleCommandDispatchedToBus) {
     const std::string path = temp_socket_path(990);
     zm::WorkerLink link(/*monitor_id=*/15, path);
@@ -460,6 +462,83 @@ TEST(WorkerLinkTest, CmdStyleCommandDispatchedToBus) {
     zm::EventBus::instance().unsubscribe("plugin_event", sub);
     ::close(client);
     link.stop();
+}
+
+// Regression: a plugin that answers a command synchronously. zm-core's handler
+// publishes the command on the bus; the plugin's subscriber publishes its result
+// on the same thread, and zm-core's bus->socket bridge hands that result straight
+// to WorkerLink::publishEventJson. When the handler ran under WorkerLink's mutex
+// this self-deadlocked and the socket went dead (found with store_snapshot's
+// snapshot_now). Both the Response and the result EVENT must now arrive.
+TEST(WorkerLinkTest, CommandAnsweredSynchronouslyDoesNotDeadlock) {
+    // A deadlock would hang link.stop() too; fail loudly instead of hanging ctest.
+    std::atomic<bool> finished{false};
+    std::thread watchdog([&] {
+        for (int i = 0; i < 100 && !finished.load(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!finished.load()) {
+            std::fprintf(stderr, "CommandAnsweredSynchronouslyDoesNotDeadlock: deadlocked\n");
+            std::_Exit(1);
+        }
+    });
+
+    const std::string path = temp_socket_path(985);
+    zm::WorkerLink link(/*monitor_id=*/16, path);
+
+    // zm-core's bridge: every bus event that isn't a command goes to the socket.
+    auto bridge = zm::EventBus::instance().subscribe("plugin_event", [&](const std::string& m) {
+        if (m.find("\"cmd\"") == std::string::npos) link.publishEventJson(m);
+    });
+    // The plugin: answers snapshot_now inline on the publisher's thread.
+    auto plugin = zm::EventBus::instance().subscribe("plugin_event", [](const std::string& m) {
+        json j = json::parse(m, nullptr, false);
+        if (j.is_object() && j.value("cmd", std::string()) == "snapshot_now") {
+            json ev = {{"event", "EventSnapshot"}, {"path", "/tmp/x.jpg"},
+                       {"request_id", j.value("request_id", 0)}, {"ok", true}};
+            zm::EventBus::instance().publish("plugin_event", ev.dump());
+        }
+    });
+    link.setCommandHandler([](const std::string& name, const std::string& args) {
+        zm::WorkerLink::CommandResult r;
+        zm::EventBus::instance().publish("plugin_event", args);  // mimic zm-core
+        r.ok = true; r.message = "dispatched: " + name;
+        return r;
+    });
+    ASSERT_TRUE(link.start());
+
+    int client = connect_client(path);
+    ASSERT_GE(client, 0);
+    write_msg(client, ss::MessageType::Command, ss::StreamId::Monitor, 0,
+              R"({"cmd":"snapshot_now","request_id":77})");
+
+    bool gotResponse = false, gotEvent = false;
+    for (int i = 0; i < 20 && !(gotResponse && gotEvent); ++i) {
+        if (!wait_readable(client, 2000)) break;
+        ss::Header h;
+        std::vector<uint8_t> body;
+        if (!read_msg(client, h, &body)) break;
+        if (h.type == static_cast<uint8_t>(ss::MessageType::Response)) {
+            json resp = json::parse(body.begin(), body.end());
+            EXPECT_EQ(resp["request_id"], 77);
+            EXPECT_TRUE(resp["ok"]);
+            gotResponse = true;
+        } else if (h.type == static_cast<uint8_t>(ss::MessageType::Event)) {
+            ss::MonitorEvent ev;
+            if (ss::ParseEvent(body.data(), body.size(), ev) && ev.code == ss::kEventSnapshotSaved) {
+                EXPECT_NE(ev.json_detail.find("\"request_id\":77"), std::string::npos);
+                gotEvent = true;
+            }
+        }
+    }
+    EXPECT_TRUE(gotResponse);
+    EXPECT_TRUE(gotEvent);
+
+    zm::EventBus::instance().unsubscribe("plugin_event", plugin);
+    zm::EventBus::instance().unsubscribe("plugin_event", bridge);
+    ::close(client);
+    link.stop();
+    finished.store(true);
+    watchdog.join();
 }
 
 // A review_assets event (motion synopsis tube manifest) maps to the 0x0306

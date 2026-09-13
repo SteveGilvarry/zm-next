@@ -155,6 +155,12 @@ private:
     std::unordered_map<int, Client> clients_;
     CommandHandler handler_;
     TalkbackHandler talkbackHandler_;
+    // Handler calls collected while reading clients under mutex_ and run by
+    // runLoop after it releases the lock. A command handler dispatches onto the
+    // event bus, and a plugin may answer inline with an event that comes straight
+    // back into publishEventJson — which takes mutex_. Running handlers under the
+    // lock self-deadlocked the worker thread. Guarded by mutex_.
+    std::vector<std::function<void()>> deferred_;
 
     uint32_t event_sequence_{0};
     uint32_t sequence_[2]{0, 0};     // per-stream media counter, indexed by wire StreamId (Video, Audio)
