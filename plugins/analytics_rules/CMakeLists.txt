@@ -36,3 +36,10 @@ target_include_directories(test_geometry PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(test_geometry PRIVATE GTest::gtest_main)
 set_target_properties(test_geometry PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 add_test(NAME AnalyticsRulesTest COMMAND $<TARGET_FILE:test_geometry>)
+
+# Pose-based fall / person-down heuristic (pure header, no ABI).
+add_executable(test_fall tests/test_fall.cpp)
+target_include_directories(test_fall PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_fall PRIVATE GTest::gtest_main)
+set_target_properties(test_fall PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+add_test(NAME AnalyticsFallTest COMMAND $<TARGET_FILE:test_fall>)

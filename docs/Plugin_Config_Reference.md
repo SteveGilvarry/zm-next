@@ -95,7 +95,19 @@ optional with the defaults shown. Common keys:
   high/low confidence split; 0 = single-stage), `low_iou_threshold` (0.2),
   `ocm_weight` (0.2). Kalman motion + observation-centric recovery are always on.
 - **analytics_rules** — `rules`: array of
-  `{name, type:"intrusion"|"linecross"|"loiter", polygon|line, direction, seconds, classes, stream_id}`.
+  `{name, type:"intrusion"|"linecross"|"loiter"|"fall", polygon|line, direction, seconds, classes, stream_id}`.
+  intrusion/linecross/loiter consume the tracker's `tracked_detection`. **fall**
+  consumes detect_pose's `pose` events (needs detect_pose upstream, no extra
+  model) and fires once when a person goes from upright to down and stays down
+  and still: `seconds` (2.0, down this long), `polygon` (optional; only people
+  whose feet are inside), `tilt_deg` (55, torso angle from vertical),
+  `aspect` (1.0, bbox w/h), `min_signals` (2 of torso tilt / wide bbox / head at
+  or below hips), `keypoint_conf` (0.5), `max_drift` (0.5 bbox heights of
+  movement allowed while down; more restarts the clock, so crawling doesn't
+  fire), `require_upright` (true; must have been seen upright within
+  `upright_window_sec`, 5.0, so someone already lying down doesn't fire).
+  Emits `rule_type:"fall"` with `down_sec`, `drift`, `tilt_deg`, `bbox`;
+  `track_id` is the rule's own person id. Re-arms when the person is upright again.
 - **describe_vlm** — `server_url` (OpenAI-compatible VLM), `model`,
   `prompt`, `interval_sec` (10), `frame_width`/`frame_height`, `stream_filter`,
   `trigger_types` (e.g. `["detection"]`): when set, the VLM describes a frame

@@ -1,0 +1,54 @@
+{
+  "_comment": [
+    "Person-down alert with no extra model: detect_pose skeletons -> analytics_rules",
+    "fall rule -> MQTT, plus event recording on the main stream. Copy to",
+    "pipelines/<name>.json with a real camera URL and model path (git-ignored).",
+    "Use the substream for pose (640-ish wide is plenty) and the main stream for",
+    "recording. Tune `seconds` up for rooms where people lie on the floor on purpose."
+  ],
+  "plugins": [
+    {
+      "id": "capture",
+      "kind": "capture_rtsp_multi",
+      "cfg": { "streams": [
+        { "stream_id": 0, "url": "rtsp://USER:PASS@CAMERA:554/Streaming/Channels/101", "transport": "tcp", "max_retry_attempts": -1 },
+        { "stream_id": 1, "url": "rtsp://USER:PASS@CAMERA:554/Streaming/Channels/102", "transport": "tcp", "max_retry_attempts": -1 }
+      ] },
+      "queue_depth": 32,
+      "children": [
+        {
+          "id": "record",
+          "kind": "store",
+          "cfg": { "mode": "event", "root": "/var/lib/zm/recordings", "monitor_id": 1, "stream_filter": [0], "trigger_types": ["analytics"] },
+          "queue_depth": 120
+        },
+        {
+          "id": "decode",
+          "kind": "decode_ffmpeg",
+          "cfg": { "output_format": "rgb24", "stream_filter": [1] },
+          "queue_depth": 8,
+          "children": [
+            {
+              "id": "pose",
+              "kind": "detect_pose",
+              "cfg": { "model_path": "/path/to/yolo26n-pose.onnx", "input_size": 640, "conf_threshold": 0.4, "stream_filter": [1] },
+              "queue_depth": 4,
+              "children": [
+                {
+                  "id": "rules",
+                  "kind": "analytics_rules",
+                  "cfg": { "rules": [
+                    { "name": "person_down", "type": "fall", "seconds": 3.0, "stream_id": 1 }
+                  ] },
+                  "children": [
+                    { "id": "mqtt", "kind": "output_mqtt", "cfg": { "host": "localhost", "base_topic": "zm-next" } }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
