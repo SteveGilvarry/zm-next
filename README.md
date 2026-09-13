@@ -110,7 +110,7 @@ flowchart TB
 | **Input** | `capture_rtsp_multi` (multi-stream RTSP + audio), `capture_file` (file replay, loop, audio) |
 | **Decode / Encode** | `decode_ffmpeg` (auto codec + hwaccel), `decode_detect` (fused NVDEC decode + on-GPU detect in one synchronous stage), `encode_ffmpeg` (H.264/HEVC, nvenc/videotoolbox/…) |
 | **Motion / pre-filter** | `motion_gate` (SIMD pixel-diff gate), `zones` (R-tree spatial index), `motion_pixel_diff`, `motion_hybrid` |
-| **Detect** | `detect_onnx` (YOLO + optional OSNet **ReID** embeddings, +CUDA zero-copy & shared cross-camera batched engine), `detect_openvocab`, `detect_pose`, `detect_seg` |
+| **Detect** | `detect_onnx` (YOLO + optional OSNet **ReID** embeddings, shared cross-camera batched engine; zero-copy GPU detection is `decode_detect`), `detect_openvocab`, `detect_pose`, `detect_seg` |
 | **Recognize** | `recognize_face` (detector + embedder gallery), `lpr` (plate detect + OCR) |
 | **Audio** | `audio_detect` (windowed audio-event classification; raw-waveform *or* log-mel front-end — YAMNet / PANNs / CED / EfficientAT) |
 | **Track / Analyze / Understand** | `tracker` (**OC-SORT**: Kalman + ByteTrack two-stage, appearance-gated ReID), `analytics_rules` (intrusion / line-cross / loiter / pose-based fall), `alert_policy` (collapse per-frame detections into per-object alerts), `describe_vlm` (scene description via a VLM server), `llm_event_review` (LLM montage review + track-close narrator) |

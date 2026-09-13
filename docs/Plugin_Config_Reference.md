@@ -28,8 +28,12 @@ optional with the defaults shown. Common keys:
   decoder name; only set it to force a codec). `output_format`
   ("yuv420p" | "rgb24" | "gray"), `scale` ("orig" | "720p" | "WxH"), `threads`
   (0), `hwaccel` ("none" | "auto" | "cuda" | "videotoolbox" | "vaapi" | "qsv" |
-  "d3d11va"/"dxva2"). CUDA → zero-copy GPU surface; other hw → decode on GPU then
-  download to CPU; all fall back to software if the device is unavailable.
+  "d3d11va"/"dxva2"): decode on the GPU, then download to CPU so every downstream
+  plugin gets normal pixels; falls back to software if the device is unavailable.
+  `gpu_output` (false) emits CUDA / VideoToolbox frames as GPU descriptors
+  instead. Those are only valid inside the decoder's own `on_frame` call, so don't
+  set it in a pipeline (a queued child reads a freed frame); `decode_detect` sets
+  it for its internal decoder. For zero-copy detection use `decode_detect`.
 - **decode_detect** — fused hardware decode + on-GPU motion gate + detect in one
   synchronous stage (see `docs/GPU_Pipeline.md`). `model_path`, `input_size` (640),
   `conf_threshold` (0.25), `hw` ("auto" | "cuda" | "metal" | "vaapi" | "vulkan" |

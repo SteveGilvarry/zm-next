@@ -182,7 +182,10 @@ int start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ctx, const char* 
     init(&c->dec);
     c->decHost.log = fwd_log; c->decHost.on_frame = on_decoded; c->decHost.publish_evt = fwd_pub;
     c->decHost.subscribe_evt = fwd_sub; c->decHost.unsubscribe_evt = fwd_unsub;
+    // gpu_output: on_decoded consumes each surface inside the decoder's on_frame
+    // call, which is the one case where passing the GPU descriptor is safe.
     json dcfg; dcfg["hwaccel"] = decHwaccel; dcfg["output_format"] = "yuv420p"; dcfg["scale"] = "orig";
+    dcfg["gpu_output"] = true;
     if (!codec.empty()) dcfg["codec"] = codec;
     if (c->dec.start(&c->dec, &c->decHost, c, dcfg.dump().c_str()) == 0) c->decStarted = true;
     else ZM_LOG_ERROR("decode_detect: internal decode start failed");

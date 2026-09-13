@@ -79,6 +79,13 @@ struct DecoderCtx {
     enum AVHWDeviceType hw_type = AV_HWDEVICE_TYPE_NONE;
     enum AVPixelFormat hw_pix_fmt = AV_PIX_FMT_NONE;  // surface fmt for hw_type
     bool use_cuda = false;               // CUDA zero-copy surface path active
+    // Emit CUDA / VideoToolbox frames as zm_gpu_frame_t descriptors instead of
+    // downloading them. The descriptor holds a raw AVFrame* that is unref'd as
+    // soon as on_frame returns, so this is only safe when the consumer uses the
+    // frame inside that call (decode_detect's internal decoder). In a normal
+    // pipeline the host copies the descriptor into a child's queue and the child
+    // reads it after the frame is gone, so it stays off by default.
+    bool gpu_output = false;
     AVBufferRef* hw_device_ctx = nullptr;
     AVCodecContext* codec_ctx = nullptr;
     SwsContext* sws_ctx = nullptr;
@@ -195,7 +202,8 @@ static bool ensure_decoder(DecoderCtx* ctx) {
         }
     }
 
-    // Optional hardware decode (CUDA = zero-copy surface; others download to CPU).
+    // Optional hardware decode. Frames are downloaded to CPU unless gpu_output is
+    // set (CUDA / VideoToolbox descriptors for a synchronous consumer).
     enum AVHWDeviceType want = (ctx->hwaccel == "auto")
                                    ? (
 #ifdef __APPLE__
@@ -260,6 +268,7 @@ static int process_start(zm_plugin_t* plugin, zm_host_api_t* host, void* host_ct
         }
         ctx->hw_decode = cfg.value("hw_decode", false);
         ctx->hwaccel = cfg.value("hwaccel", std::string("none"));
+        ctx->gpu_output = cfg.value("gpu_output", false);
 
         if (ctx->output_format == "rgb24") {
             ctx->out_pix_fmt = AV_PIX_FMT_RGB24;
@@ -366,10 +375,10 @@ static void process_on_frame(zm_plugin_t* plugin, const void* buf, size_t size) 
     while (avcodec_receive_frame(ctx->codec_ctx, avf) == 0) {
         ctx->frames_decoded++;
 
-        // Zero-copy GPU path: the frame is a CUDA surface. Emit a descriptor
-        // referencing the device memory instead of downloading/converting on CPU.
-        // The AVFrame stays valid for the synchronous downstream on_frame call.
-        if (avf->format == AV_PIX_FMT_CUDA && avf->hw_frames_ctx) {
+        // Zero-copy GPU path (gpu_output only): the frame is a CUDA surface. Emit a
+        // descriptor referencing the device memory instead of downloading/converting
+        // on CPU. The AVFrame is valid only for this synchronous on_frame call.
+        if (ctx->gpu_output && avf->format == AV_PIX_FMT_CUDA && avf->hw_frames_ctx) {
             zm_gpu_frame_t g{};
             g.hw_type = ZM_HW_CUDA;
             g.width = avf->width;
@@ -397,12 +406,12 @@ static void process_on_frame(zm_plugin_t* plugin, const void* buf, size_t size) 
             continue;  // next frame; skip the CPU swscale path below
         }
 
-        // Zero-copy VideoToolbox path (Apple): pass the CVPixelBuffer surface
-        // through as a GPU descriptor (the AVFrame holds it in data[3]) instead of
-        // downloading to CPU. The Metal HwBackend acquire()s it (av_frame_clone
-        // refs the CVPixelBuffer), so it survives past this synchronous on_frame —
-        // same contract as the CUDA path above.
-        if (avf->format == AV_PIX_FMT_VIDEOTOOLBOX) {
+        // Zero-copy VideoToolbox path (Apple, gpu_output only): pass the
+        // CVPixelBuffer surface through as a GPU descriptor (the AVFrame holds it in
+        // data[3]) instead of downloading to CPU. The Metal HwBackend acquire()s it
+        // (av_frame_clone refs the CVPixelBuffer) within this on_frame call — same
+        // contract as the CUDA path above.
+        if (ctx->gpu_output && avf->format == AV_PIX_FMT_VIDEOTOOLBOX) {
             zm_gpu_frame_t g{};
             g.hw_type = ZM_HW_VTB;
             g.width = avf->width;
@@ -424,9 +433,9 @@ static void process_on_frame(zm_plugin_t* plugin, const void* buf, size_t size) 
             continue;  // skip the CPU download/swscale path below
         }
 
-        // Non-CUDA hardware frame (VAAPI/QSV): download to CPU and continue through
-        // the normal swscale path (no zero-copy consumer exists for those surfaces
-        // today). Software frames skip this.
+        // Any other hardware frame (every hw type when gpu_output is off; VAAPI/QSV
+        // always): download to CPU and continue through the normal swscale path.
+        // Software frames skip this.
         if (avf->hw_frames_ctx && avf->format == ctx->hw_pix_fmt) {
             if (!ctx->sw_frame) ctx->sw_frame = av_frame_alloc();
             const int64_t pts = avf->best_effort_timestamp;

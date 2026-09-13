@@ -78,9 +78,14 @@ output.
 
 - **GPU motion exists only inside `decode_detect`.** `motion_gate`, `motion_pixel_diff` and `zones`
   are CPU plugins that never see a GPU frame. There is no standalone GPU motion stage.
-- **No download-on-demand.** A CPU plugin placed after a GPU decode (`describe_vlm`, `overlay`,
-  `privacy_mask`, CPU motion) gets a `zm_gpu_frame_t` descriptor, not pixels. An
-  `av_hwframe_transfer_data` helper is still to be written before GPU and CPU stages can be mixed.
+- **GPU surfaces don't leave `decode_detect`.** Everything after it in the pipeline is CPU.
+  A standalone `decode_ffmpeg` with `hwaccel` decodes on the GPU and downloads each frame to CPU
+  (`av_hwframe_transfer_data`), so CPU plugins after it work. Until 2026-09-13 it emitted GPU
+  descriptors instead: CPU children silently got no pixels (on the M4 Pro, detect_onnx after a
+  VideoToolbox decode produced 0 detection events vs 123 in software), and a GPU child read an
+  `AVFrame` already freed by the time it left the queue. `gpu_output: true` restores descriptors
+  and is only for a synchronous consumer. Sharing one GPU surface across several plugins would need
+  refcounted surfaces through the queues (`av_frame_clone` + release on consume); not built.
 - **Zones are not applied on the GPU path.** The gate works on a whole-frame grid. Zone geometry
   only applies through `analytics_rules` on tracker output.
 - **Gate tunables** live under `motion` in the `decode_detect` config and apply to every backend
@@ -102,6 +107,9 @@ output.
 `zm_gpu_frame_t` (`core/include/zm_plugin.h`) describes a GPU surface: per-plane device pointers and
 pitches, dims, native pix_fmt, and the owning `AVFrame*`, valid for the synchronous `on_frame` call.
 When a frame's `hw_type` is `ZM_HW_CUDA` or `ZM_HW_VTB`, the `on_frame` payload is this descriptor,
-not pixel bytes. `decode_ffmpeg` emits it when `hwaccel` is `cuda` or `videotoolbox` and falls back to
-software decode when the device is missing, so the same plugin runs everywhere. GPU surface handles
-are process-local and cannot cross the `ShmRing`; the ring stays the CPU transport.
+not pixel bytes. `decode_ffmpeg` emits it only with `gpu_output: true` and `hwaccel` `cuda` or
+`videotoolbox`; the `AVFrame` is unref'd when that `on_frame` returns, so only a consumer that
+acquires it inside the call (`decode_detect`'s `on_decoded` → `HwBackend::acquire`) may use it.
+`StageRunner` queues copy the descriptor bytes, not the surface, so a descriptor must never cross a
+stage boundary. GPU surface handles are process-local and cannot cross the `ShmRing`; the ring stays
+the CPU transport.
