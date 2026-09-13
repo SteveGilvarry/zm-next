@@ -35,3 +35,10 @@ add_executable(test_mask_util tests/test_mask_util.cpp)
 target_link_libraries(test_mask_util PRIVATE GTest::gtest_main)
 set_target_properties(test_mask_util PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 add_test(NAME PrivacyMaskTest COMMAND $<TARGET_FILE:test_mask_util>)
+
+# Dynamic (detection-driven) masking: rect fills + box store.
+add_executable(test_dynamic_mask tests/test_dynamic_mask.cpp)
+target_include_directories(test_dynamic_mask PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_dynamic_mask PRIVATE GTest::gtest_main)
+set_target_properties(test_dynamic_mask PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+add_test(NAME PrivacyDynamicMaskTest COMMAND $<TARGET_FILE:test_dynamic_mask>)

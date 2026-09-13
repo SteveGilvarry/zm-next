@@ -59,6 +59,23 @@ optional with the defaults shown. Common keys:
   thresholds, ...).
 - **motion_pixel_diff** — `frame_width`/`frame_height`, `out_width`/`out_height`,
   pixel/blob thresholds, zone-aware options.
+- **privacy_mask** — obscures regions in decoded RGB24/gray frames, never the
+  caller's buffer. `frame_width`/`frame_height` (required), `mode` ("black" |
+  "blur" | "pixelate"; pixelate is the usual choice for identities),
+  `blur_size` (16; blur radius or pixelate block px), `stream_filter`.
+  Static: `regions` (array of polygons `[[x,y],...]`); place right after decode
+  so detection never sees them. Dynamic: `dynamic` object masks what detectors
+  found on each frame; place **downstream** of the detectors and before
+  encode/store/output (detectors publish before forwarding, so the boxes for a
+  frame arrive before the frame). Keys: `enabled` (true), `sources`
+  (["detection","tracked_detection","face","lpr"]), `classes` (["person"],
+  labels taken from detection events; empty = all), `min_confidence` (0.25,
+  detections only; faces and plates are always masked), `padding` (0.15 of box
+  size per side), `hold_ms` (400; reuse boxes from frames this close, covering
+  skipped or missed detections), `person_region` ("body" | "head"; head masks
+  the top `head_fraction`, 0.3, of person boxes). Logs `privacy_mask stats`
+  (frames/masked/boxes) every 500 frames and on stop. A frame the detectors
+  miss for longer than `hold_ms` passes unmasked.
 
 ## Detect / recognize
 - **detect_onnx** — `model_path`, `input_size` (640), `conf_threshold` (0.25),
