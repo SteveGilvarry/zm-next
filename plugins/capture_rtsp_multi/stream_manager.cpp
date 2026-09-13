@@ -323,6 +323,11 @@ void StreamManager::capture_loop(uint32_t stream_id) {
                 if (state->packet->stream_index == state->video_stream_index) {
                     process_and_publish_frame(state.get(), config);
                     state->frames_captured++;
+                    // Release the packet's refcounted buffer here rather than inside
+                    // process_and_publish_frame, so every early return in there is
+                    // covered too. Without this every video packet leaked its buffer
+                    // (measured ~40 MB/min per 4K camera, 2026-06-27).
+                    av_packet_unref(state->packet);
                 } else if (config.forward_audio &&
                            state->packet->stream_index == state->audio_stream_index) {
                     publish_audio_packet(state.get(), config);
