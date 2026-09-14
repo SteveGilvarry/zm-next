@@ -1,6 +1,7 @@
 #pragma once
 
 #include "zm_plugin.h"
+#include "reconnect_policy.hpp"
 
 #ifdef __cplusplus
 extern "C" {
@@ -56,6 +57,8 @@ struct StreamState {
     std::thread capture_thread;
     
     // Connection/retry state
+    zm::capture::ReconnectPolicy policy;  // backoff + health events (reconnect_policy.hpp)
+    int last_error = 0;                   // AVERROR from the last failed connect
     int retry_count;
     int current_retry_delay_ms;
     std::chrono::steady_clock::time_point last_retry_time;
@@ -139,6 +142,10 @@ private:
     void capture_loop(uint32_t stream_id);
     bool connect_stream(StreamState* state, const StreamConfig& config);
     void handle_stream_disconnect(uint32_t stream_id);
+    // Publish a health event from ReconnectPolicy as {"type":..., "stream_id", ...}.
+    void publish_health(uint32_t stream_id, const zm::capture::HealthEvent& ev, int av_error = 0);
+    // Sleep up to `ms`, returning early when the stream is stopped.
+    static void sleep_while_running(const StreamState* state, int64_t ms);
     
     // Frame processing and publishing
     void process_and_publish_frame(StreamState* state, const StreamConfig& config);

@@ -36,3 +36,10 @@ set_property(TARGET test_url_credentials PROPERTY CXX_STANDARD 17)
 target_include_directories(test_url_credentials PRIVATE ${CMAKE_SOURCE_DIR}/plugins/capture_rtsp_multi)
 target_link_libraries(test_url_credentials gtest gtest_main)
 add_test(NAME CaptureUrlCredentialsTest COMMAND test_url_credentials)
+
+# Reconnect backoff + health event policy (pure header).
+add_executable(test_reconnect_policy test_reconnect_policy.cpp)
+set_property(TARGET test_reconnect_policy PROPERTY CXX_STANDARD 17)
+target_include_directories(test_reconnect_policy PRIVATE ${CMAKE_SOURCE_DIR}/plugins/capture_rtsp_multi)
+target_link_libraries(test_reconnect_policy gtest gtest_main)
+add_test(NAME CaptureReconnectPolicyTest COMMAND test_reconnect_policy)

@@ -188,7 +188,15 @@ per-call-site redaction in `capture_rtsp_multi` stays as a second layer.
 
 ### Status
 
-EVENT frames, `StreamId::Monitor`, JSON detail TLV `0x10`:
+EVENT frames, `StreamId::Monitor`. The detail is a JSON object: in the JSON detail TLV `0x10` for
+the zm-next `0x04xx` codes, and in the message TLV `0x02` for the canonical lifecycle codes (as
+zmc-compatible consumers already read them). Status codes, unlike `0x03xx` analysis events, replace
+the on-connect snapshot.
+
+*Implemented 2026-09-14:* the `0x0101`/`0x0102`/`0x0105`/`0x0106`/`0x0402` rows, emitted by
+`capture_rtsp_multi` (`plugins/capture_rtsp_multi/reconnect_policy.hpp`), and the `0x0401`–`0x0403`
+constants and WorkerLink mapping. `connection_failed` also carries `attempt`; it is sent once per
+outage and then at most once a minute.
 
 | Code | Name | When | Detail |
 |---|---|---|---|
@@ -202,8 +210,10 @@ EVENT frames, `StreamId::Monitor`, JSON detail TLV `0x10`:
 | **`0x0403`** | worker_degraded | a dependency is down (e.g. shared inference daemon) and a stage is skipped | `component`, `effect` |
 
 **Auth backoff.** On 401/403 capture stops normal reconnect backoff and waits 60 s, doubling to 15
-min, publishing `stream_auth_failed` each time. A configure with new secrets resets it. This is
-separate from `max_retry_attempts`, which keeps governing network failures.
+min, publishing `stream_auth_failed` each time. A successful login, or (once built) a configure with
+new secrets, resets it. `max_retry_attempts` counts consecutive failures of both kinds; `-1` retries
+forever. Measured on a mediamtx camera with a wrong password: 2 logins in 126 s (60 s apart), where
+the network backoff would have made one every 1-30 s.
 
 ### Worker lifetime
 

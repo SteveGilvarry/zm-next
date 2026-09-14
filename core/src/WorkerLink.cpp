@@ -88,13 +88,23 @@ uint16_t map_event_code(const std::string& type, const std::string& event) {
     if (event == "EventClip")             return ss::kEventRecordingSaved;
     if (event == "RecordingOpening")      return ss::kEventRecordingOpening;
     if (event == "EventSnapshot")         return ss::kEventSnapshotSaved;
+    if (type == "worker_state")           return ss::kEventWorkerState;
+    if (type == "stream_auth_failed")     return ss::kEventStreamAuthFailed;
+    if (type == "worker_degraded")        return ss::kEventWorkerDegraded;
     return 0;
 }
 
-bool is_ai_code(uint16_t code) {
-    return code == ss::kEventDetection || code == ss::kEventDescription ||
-           code == ss::kEventRecordingSaved || code == ss::kEventRecordingOpening ||
-           code == ss::kEventReviewAssets || code == ss::kEventSnapshotSaved;
+// zm-next extension codes (0x03xx analysis, 0x04xx worker status) carry their
+// payload in the JSON detail TLV; canonical lifecycle codes put it in `message`.
+bool carries_json_detail(uint16_t code) {
+    const uint16_t range = code & 0xFF00;
+    return range == 0x0300 || range == 0x0400;
+}
+
+// Status events describe the monitor's current condition and replace the
+// on-connect snapshot; analysis events (0x03xx) are a stream of happenings.
+bool is_status_code(uint16_t code) {
+    return code != 0 && code != ss::kEventSnapshot && (code & 0xFF00) != 0x0300;
 }
 
 } // namespace
@@ -552,16 +562,15 @@ void WorkerLink::publishEventJson(const std::string& raw_event_json) {
     ev.has_wall_clock = true;
     // Lifecycle events surface human-readable detail in `message`; analysis/AI
     // events carry their structured payload in the JSON detail TLV.
-    if (is_ai_code(ev.code))
+    if (carries_json_detail(ev.code))
         ev.json_detail = raw_event_json;
     else
         ev.message = raw_event_json;
 
-    // Lifecycle/health events represent current monitor status, so cache the
-    // latest as the connect-time snapshot. Detection/description/recording are
-    // per-event streams (not "status") and must not clobber the snapshot.
-    const bool is_health = ev.code != 0 && ev.code != ss::kEventSnapshot &&
-                           !is_ai_code(ev.code);
+    // Lifecycle/health and worker status events represent current monitor status,
+    // so cache the latest as the connect-time snapshot. Detection/description/
+    // recording are per-event streams (not "status") and must not clobber it.
+    const bool is_health = is_status_code(ev.code);
 
     std::lock_guard<std::mutex> lock(mutex_);
     MessagePtr msg = makeControl(static_cast<uint8_t>(ss::MessageType::Event),

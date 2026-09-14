@@ -15,9 +15,15 @@ optional with the defaults shown. Common keys:
   `-DZM_WITH_CUDA` build).
 
 ## Inputs
-- **capture_rtsp_multi** — `streams` (or single `url`), `transport` ("tcp"),
-  `hw_decode` (false), `forward_audio` (true), `max_retry_attempts` (5),
-  `retry_delay_ms` (2000).
+- **capture_rtsp_multi** — `streams` (or single `url`); per stream `url`,
+  `stream_id`, `username` / `password` (kept out of the URL, logs and events),
+  `transport` ("tcp"), `hw_decode` (false), `forward_audio` (true),
+  `max_retry_attempts` (5; -1 = forever; counts consecutive failures). Network
+  failures back off 1 s → 30 s; a 401/403 backs off 60 s → 15 min so a wrong
+  password can't lock the camera account. Publishes `connection_failed` /
+  `connection_restored` / `capture_failed` / `capture_resumed` (canonical codes
+  0x0101/0x0102/0x0105/0x0106) on transitions and `stream_auth_failed` (0x0402)
+  per rejected login. (`retry_delay_ms` is parsed but the backoff above governs.)
 - **capture_file** — `path` (required), `stream_id` (0), `loop` (true),
   `realtime` (true).
 

@@ -600,6 +600,44 @@ TEST(WorkerLinkTest, ReviewAssetsEvent) {
     link.stop();
 }
 
+// stream_auth_failed maps to 0x0402 with JSON detail, and as a status event it
+// becomes the on-connect snapshot a later client receives; an analysis event
+// published afterwards does not replace it.
+TEST(WorkerLinkTest, StreamAuthFailedIsJsonStatusAndSnapshot) {
+    const std::string path = temp_socket_path(965);
+    zm::WorkerLink link(/*monitor_id=*/17, path);
+    ASSERT_TRUE(link.start());
+
+    int first = connect_client(path);
+    ASSERT_GE(first, 0);
+    ASSERT_TRUE(wait_registered(first));
+
+    link.publishEventJson(R"({"type":"stream_auth_failed","stream_id":0,"attempt":2,"retry_in_sec":120})");
+    link.publishEventJson(R"({"type":"detection","detections":[]})");
+
+    ss::Header h;
+    std::vector<uint8_t> body;
+    ASSERT_TRUE(read_msg(first, h, &body));
+    ss::MonitorEvent ev;
+    ASSERT_TRUE(ss::ParseEvent(body.data(), body.size(), ev));
+    EXPECT_EQ(ev.code, ss::kEventStreamAuthFailed);
+    EXPECT_TRUE(ev.message.empty());
+    EXPECT_NE(ev.json_detail.find("\"retry_in_sec\":120"), std::string::npos);
+
+    // A client connecting now gets the auth failure as its snapshot, not the detection.
+    int second = connect_client(path);
+    ASSERT_GE(second, 0);
+    ASSERT_TRUE(wait_readable(second, 2000));
+    ASSERT_TRUE(read_msg(second, h, &body));
+    EXPECT_EQ(h.type, static_cast<uint8_t>(ss::MessageType::Event));
+    ASSERT_TRUE(ss::ParseEvent(body.data(), body.size(), ev));
+    EXPECT_EQ(ev.code, ss::kEventStreamAuthFailed);
+
+    ::close(first);
+    ::close(second);
+    link.stop();
+}
+
 TEST(WorkerLinkTest, PeriodicStats) {
     const std::string path = temp_socket_path();
     zm::WorkerLink::Config cfg;

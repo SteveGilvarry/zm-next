@@ -154,6 +154,11 @@ constexpr uint16_t kEventRecordingOpening     = 0x0304;  // a clip segment opene
 // 0x0305 reserved for a future "reasoning" event (see docs/Research_Motion_and_LLM_Review.md).
 constexpr uint16_t kEventReviewAssets         = 0x0306;  // motion-synopsis tube/plate manifest (see docs/Motion_Synopsis.md)
 constexpr uint16_t kEventSnapshotSaved        = 0x0307;  // a JPEG snapshot was written (store_snapshot; also the snapshot_now result)
+// zm-next worker status codes (additive, reserved 0x04xx range; docs/Worker_Control_Protocol.md).
+// Status like the lifecycle codes (replayed in the on-connect snapshot), with a JSON detail TLV.
+constexpr uint16_t kEventWorkerState          = 0x0401;  // worker state change: unconfigured/configuring/running/stopping
+constexpr uint16_t kEventStreamAuthFailed     = 0x0402;  // camera rejected the credentials (401/403); slow retry
+constexpr uint16_t kEventWorkerDegraded       = 0x0403;  // a dependency is down and a stage is skipped
 
 // EVENT TLV tags
 constexpr uint8_t kTlvWallClockUs = 0x01;  // u64, unix-epoch microseconds

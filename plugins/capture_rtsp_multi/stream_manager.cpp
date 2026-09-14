@@ -198,40 +198,45 @@ void StreamManager::capture_loop(uint32_t stream_id) {
     
     const auto& config = config_it->second;
     auto& state = state_it->second;
-    
+    state->policy = zm::capture::ReconnectPolicy(config.max_retry_attempts);
+    auto now_ms = [] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+
     log_stream(stream_id, ZM_LOG_INFO, "Starting capture loop for %s", zm::capture::redact(config.url).c_str());
-    
+
     while (state->running) {
         // Try to connect if not connected
         if (!state->connected) {
-            // Record attempt time for backoff calculation
             state->last_attempt_time = std::chrono::steady_clock::now();
-            
+
             if (connect_stream(state.get(), config)) {
                 state->connected = true;
                 state->retry_count = 0;
-                state->current_retry_delay_ms = MIN_RECONNECT_DELAY_MS; // Reset delay on success
+                for (const auto& ev : state->policy.on_connected()) publish_health(stream_id, ev);
                 log_stream(stream_id, ZM_LOG_INFO, "Connected successfully");
             } else {
-                state->retry_count++;
-                if (config.max_retry_attempts > 0 && state->retry_count >= config.max_retry_attempts) {
+                // A 401/403 from the camera goes on the slow auth track so a wrong
+                // password doesn't lock the camera account (reconnect_policy.hpp).
+                const bool auth = state->last_error == AVERROR_HTTP_UNAUTHORIZED ||
+                                  state->last_error == AVERROR_HTTP_FORBIDDEN;
+                auto decision = state->policy.on_connect_failed(auth, now_ms());
+                state->retry_count = state->policy.attempts();
+                for (const auto& ev : decision.events) publish_health(stream_id, ev, state->last_error);
+                if (decision.give_up) {
                     log_stream(stream_id, ZM_LOG_ERROR, "Max retry attempts reached, stopping stream");
                     break;
                 }
-                
-                // Calculate exponential backoff with jitter
-                int base_delay = std::min(state->current_retry_delay_ms, MAX_RECONNECT_DELAY_MS);
-                int jitter = jitter_dist_(gen_);
-                int delay_ms = base_delay + jitter;
-                delay_ms = std::max(delay_ms, MIN_RECONNECT_DELAY_MS);
-                
-                log_stream(stream_id, ZM_LOG_WARN, "Connection failed, retrying in %d ms (attempt %d)", 
-                          delay_ms, state->retry_count);
-                
-                // Increase delay for next attempt (exponential backoff)
-                state->current_retry_delay_ms = std::min(state->current_retry_delay_ms * 2, MAX_RECONNECT_DELAY_MS);
-                
-                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                // Jitter spreads reconnects when many cameras fail together; the auth
+                // track's minute-scale delays don't need it.
+                int64_t delay_ms = decision.delay_ms + (auth ? 0 : jitter_dist_(gen_));
+                delay_ms = std::max<int64_t>(delay_ms, MIN_RECONNECT_DELAY_MS);
+                log_stream(stream_id, auth ? ZM_LOG_ERROR : ZM_LOG_WARN,
+                           "%s, retrying in %lld ms (attempt %d)",
+                           auth ? "Camera rejected the credentials" : "Connection failed",
+                           static_cast<long long>(delay_ms), state->retry_count);
+                sleep_while_running(state.get(), delay_ms);
                 continue;
             }
         }
@@ -262,6 +267,7 @@ void StreamManager::capture_loop(uint32_t stream_id) {
             } else {
                 if (ret == AVERROR_EOF) {
                     log_stream(stream_id, ZM_LOG_INFO, "End of stream reached");
+                    for (const auto& ev : state->policy.on_stream_dropped(now_ms())) publish_health(stream_id, ev, ret);
                     handle_stream_disconnect(stream_id);
                 } else if (ret == AVERROR(EAGAIN)) {
                     // Temporary unavailability - just wait a bit and continue
@@ -278,7 +284,7 @@ void StreamManager::capture_loop(uint32_t stream_id) {
                     if (host_api_ && host_api_->publish_evt) {
                         host_api_->publish_evt(host_ctx_, json_event);
                     }
-                    
+                    for (const auto& ev : state->policy.on_stream_dropped(now_ms())) publish_health(stream_id, ev, ret);
                     handle_stream_disconnect(stream_id);
                 }
             }
@@ -330,15 +336,17 @@ bool StreamManager::connect_stream(StreamState* state, const StreamConfig& confi
     int ret = avformat_open_input(&state->fmt_ctx, open_url.c_str(), nullptr, &opts);
     av_dict_free(&opts);
     
+    state->last_error = ret;
     if (ret < 0) {
         char err_buf[AV_ERROR_MAX_STRING_SIZE];
         av_strerror(ret, err_buf, sizeof(err_buf));
         log_stream(state->stream_id, ZM_LOG_ERROR, "Failed to open RTSP stream: %s", err_buf);
         return false;
     }
-    
+
     // Find stream info
     ret = avformat_find_stream_info(state->fmt_ctx, nullptr);
+    state->last_error = ret;
     if (ret < 0) {
         char err_buf[AV_ERROR_MAX_STRING_SIZE];
         av_strerror(ret, err_buf, sizeof(err_buf));
@@ -472,6 +480,25 @@ bool StreamManager::init_hardware_acceleration(StreamState* state, const AVCodec
     
     av_buffer_unref(&hw_device_ref);
     return true;
+}
+
+void StreamManager::publish_health(uint32_t stream_id, const zm::capture::HealthEvent& ev, int av_error) {
+    if (!host_api_ || !host_api_->publish_evt) return;
+    nlohmann::json j = {{"type", ev.type}, {"stream_id", stream_id}};
+    if (ev.attempt > 0) j["attempt"] = ev.attempt;
+    if (ev.retry_in_ms > 0) j["retry_in_sec"] = ev.retry_in_ms / 1000.0;
+    if (av_error < 0) {
+        char err_buf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(av_error, err_buf, sizeof(err_buf));
+        j["error"] = err_buf;   // FFmpeg's text for the code only; never contains the URL
+    }
+    host_api_->publish_evt(host_ctx_, j.dump().c_str());
+}
+
+void StreamManager::sleep_while_running(const StreamState* state, int64_t ms) {
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (state->running && std::chrono::steady_clock::now() < until)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
 }
 
 void StreamManager::handle_stream_disconnect(uint32_t stream_id) {
