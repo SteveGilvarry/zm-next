@@ -1,6 +1,7 @@
 # Worker control protocol (zm-api ↔ zm-core)
 
-Status: **proposal**, 2026-09-13. Nothing here is implemented. It replaces how zm-api configures,
+Status: **Phase 1 in progress** (zm-next), 2026-09-14. Proposed 2026-09-13. Sections marked
+*Implemented* are built; the rest is still proposal. It replaces how zm-api configures,
 supervises and talks to zm-next workers; media and analysis events keep the canonical stream-socket
 protocol unchanged.
 
@@ -110,36 +111,61 @@ Sent to every peer right after accept, before the cached HELLO/snapshot/keyframe
 ```json
 {
   "protocol": {"canonical": 1, "control": 1},
-  "zm_next": {"version": "0.1.0", "commit": "9217bdf", "plugin_abi": 1},
-  "monitor_id": 3,
+  "zm_next": {"version": "0.1.0", "commit": "525a391", "plugin_abi": 1},
+  "monitor_id": 21,
   "state": "running",
-  "pipeline_hash": "sha256:4f1c…",
+  "pipeline_hash": "sha256:fa7a5e2e…",
   "plugins": [
-    {"kind": "capture_rtsp_multi", "version": "1.0.0", "schema_sha256": "9ab2…"},
-    {"kind": "tracker", "version": "1.2.0", "schema_sha256": "77e0…"}
+    {"kind": "capture_rtsp_multi", "version": "1.0.0", "schema_sha256": "sha256:9ab2…"},
+    {"kind": "capture_file", "version": null, "schema_sha256": null}
   ],
-  "hw": {"backends": ["metal"], "decoders": ["videotoolbox"]},
+  "hw": {"backends": ["metal"]},
+  "secrets_fingerprint": "sha256:8489f816…",
   "control_peer": true
 }
 ```
 
 - `state`: `unconfigured` | `configuring` | `running` | `stopping`.
-- `pipeline_hash`: hash of the canonical JSON of the active pipeline with secret values removed, so
-  zm-api can tell whether a running worker already has the graph it wants.
-- `plugins`: every plugin found in the plugin directory, whether or not the pipeline uses it.
-  Schemas are fetched on demand (below) so the hello stays small.
+- `pipeline_hash`: SHA-256 of the active pipeline (keys sorted, compact) with every secret value
+  replaced by `"<secret>"`. Secret keys are those marked `x-secret` in the plugin's schema plus
+  `password`, `username`, `auth_header`, `api_key`, `token`, `secret` for any plugin. Safe for any
+  peer; unchanged by a password change.
+- `secrets_fingerprint` (**control peers only**): SHA-256 of `salt` + the pipeline's secret values
+  in a stable order, or `null` if the pipeline has none. It tells zm-api whether a running worker
+  already has the secrets it would send. The salt is `secrets_salt` from the last configure (empty
+  when the worker was started with `--pipeline`). Observers never receive it: unsalted, a hash of
+  a short password can be brute-forced.
+- `plugins`: every plugin in this build's `plugins/manifest.json` (written by CMake), whether or not
+  the pipeline uses it; `version` and `schema_sha256` are `null` for plugins without a schema.
+  Libraries left over in the plugin directory from older builds are not listed. Schemas are fetched
+  on demand (below) so the hello stays small.
+- `hw.backends`: hardware detection backends compiled in (`cuda`, `metal`, `vaapi`, `vulkan`,
+  `openvino`). Available decoders aren't reported yet.
+- `catalog_error`: present only if `manifest.json` couldn't be read.
+
+*Implemented 2026-09-14:* message type `0x14`, `zm/WorkerHello.{hpp,cpp}`, `WorkerLink::setWorkerHello`,
+zm-core sends it with `state: "running"` (configure doesn't exist yet). `commit` is taken when
+CMake configures, so it can lag a rebuild without reconfiguring.
 
 ### Plugin schemas
 
 Each plugin ships `plugins/<kind>/<kind>.schema.json`, a JSON Schema (2020-12 subset: `type`,
 `properties`, `required`, `enum`, `minimum`/`maximum`, `items`, `additionalProperties`, `default`,
-`description`), installed next to the library. Keys that hold secrets are marked
-`"x-secret": true`. The schema is the plugin's config reference; `docs/Plugin_Config_Reference.md`
-is generated from the schemas once they exist.
+`description`, `oneOf`), copied next to the built library and installed with it. Extra keywords:
+`x-plugin-kind`, `x-plugin-version`, `"x-secret": true` on secret properties, and `x-not-config`,
+the keys the plugin's source reads that aren't config (event fields, server responses).
+`tools/check_plugin_schemas.py` (ctest `PluginSchemaCheck`) fails when a schema property isn't read
+by the source or the source reads a key the schema doesn't account for.
 
 `{"cmd":"describe_plugins","kinds":["tracker"]}` returns `data: {"tracker": {"version": "…",
-"schema": {…}}}`. zm-api caches by `schema_sha256` and replaces `KNOWN_KINDS` and its hand-written
+"schema": {…}}}`; omitting `kinds` returns every plugin with a schema, and a kind without one maps
+to `null`. zm-api caches by `schema_sha256` and replaces `KNOWN_KINDS` and its hand-written
 validation with schema validation.
+
+*Implemented 2026-09-14:* schemas for the 16 kinds zm-api's generator emits: `analytics_rules`,
+`capture_rtsp_multi`, `decode_detect`, `decode_ffmpeg`, `detect_onnx`, `encode_ffmpeg`,
+`llm_event_review`, `motion_pixel_diff`, `output_mqtt`, `output_webhook`, `privacy_mask`,
+`review_export`, `store`, `store_snapshot`, `tracker`, `zones`.
 
 ### Configure
 
@@ -157,6 +183,7 @@ validation with schema validation.
     ]
   },
   "secrets": {"cam.user": "admin", "cam.pass": "p@ss:w/d"},
+  "secrets_salt": "c2FsdC1mcm9tLXptLWFwaQ",
   "apply": "restart"
 }
 ```
@@ -170,7 +197,9 @@ The worker:
    [{"path": "plugins[0].children[1].cfg.iou_threshold", "message": "must be <= 1"},
     {"path": "plugins[0].cfg.streams[0].password", "message": "secret must be a $secret reference"}]
    ```
-2. **Resolves** references into the config each plugin receives, so the plugin ABI is unchanged.
+2. **Resolves** references into the config each plugin receives, so the plugin ABI is unchanged,
+   and keeps `secrets_salt` (chosen by zm-api, stored with the monitor) for the hello's
+   `secrets_fingerprint`.
 3. **Registers** every secret value with core's redaction set (below).
 4. **Applies**. `apply: "restart"` stops the running pipeline and starts the new one inside the same
    process: the socket, its clients and the worker's state survive. A later `apply: "hot"` lets

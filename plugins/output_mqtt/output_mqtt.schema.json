@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "output_mqtt",
+  "description": "Publishes every pipeline event as JSON to an MQTT broker, on a topic derived from the event type.",
+  "x-plugin-kind": "output_mqtt",
+  "x-plugin-version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "host": {
+      "type": "string",
+      "description": "MQTT broker hostname or IP address.",
+      "default": "localhost"
+    },
+    "port": {
+      "type": "integer",
+      "description": "MQTT broker TCP port.",
+      "default": 1883,
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "base_topic": {
+      "type": "string",
+      "description": "Topic prefix; the event type is appended to it.",
+      "default": "zm-next"
+    },
+    "client_id": {
+      "type": "string",
+      "description": "MQTT client id used when connecting.",
+      "default": "zm-next"
+    },
+    "username": {
+      "type": "string",
+      "description": "Broker username; no authentication is sent when absent.",
+      "x-secret": true
+    },
+    "password": {
+      "type": "string",
+      "description": "Broker password; only used when username is also set.",
+      "x-secret": true
+    },
+    "qos": {
+      "type": "integer",
+      "description": "MQTT quality-of-service level for published messages.",
+      "default": 0,
+      "enum": [0, 1, 2]
+    }
+  },
+  "x-not-config": ["type"]
+}

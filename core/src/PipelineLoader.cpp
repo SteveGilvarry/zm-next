@@ -38,6 +38,7 @@ bool PipelineLoader::load() {
             std::cerr << "JSON root is not an object in " << path_ << std::endl;
             return false;
         }
+        raw_json_ = root.dump();
         if (!root.contains("plugins")) {
             std::cerr << "\"plugins\" key not found in " << path_ << std::endl;
             return false;

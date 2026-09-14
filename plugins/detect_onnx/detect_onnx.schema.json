@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "detect_onnx",
+  "description": "Runs a YOLO-style ONNX detection model on decoded frames and publishes detection events, with optional ReID embeddings.",
+  "x-plugin-kind": "detect_onnx",
+  "x-plugin-version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "model_path": {
+      "type": "string",
+      "description": "Path to the ONNX detection model."
+    },
+    "input_size": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "default": 640,
+      "description": "Square network input size in pixels."
+    },
+    "conf_threshold": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.25,
+      "description": "Minimum confidence for a detection to be reported."
+    },
+    "frame_width": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Width of incoming RGB24 CPU frames; CPU frames are skipped while 0."
+    },
+    "frame_height": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Height of incoming RGB24 CPU frames; CPU frames are skipped while 0."
+    },
+    "reid": {
+      "type": "boolean",
+      "default": false,
+      "description": "Attach an appearance embedding to each detection."
+    },
+    "reid_model_path": {
+      "type": "string",
+      "default": "",
+      "description": "Optional ReID ONNX model; without it the embedding is an HSV colour histogram."
+    },
+    "reid_input_w": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "default": 128,
+      "description": "ReID model input width in pixels."
+    },
+    "reid_input_h": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "default": 256,
+      "description": "ReID model input height in pixels."
+    },
+    "ep": {
+      "type": "string",
+      "enum": [
+        "cpu",
+        "coreml",
+        "cuda"
+      ],
+      "default": "cpu",
+      "description": "ONNX Runtime execution provider; cuda needs a CUDA build and others fall back to CPU."
+    },
+    "class_filter": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "default": [],
+      "description": "Class ids to report; empty reports all classes."
+    },
+    "stream_filter": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "default": [],
+      "description": "Stream ids to process; empty processes every stream."
+    },
+    "class_names": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": [],
+      "description": "Labels indexed by class id; empty uses the COCO-80 names."
+    },
+    "roi_motion": {
+      "type": "boolean",
+      "default": false,
+      "description": "CUDA path: infer only on regions that moved, with a periodic full-frame sweep."
+    },
+    "motion_downscale": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "default": 8,
+      "description": "CUDA motion gate cell size in pixels."
+    },
+    "motion_threshold": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 25,
+      "description": "CUDA motion gate per-cell luma difference threshold."
+    },
+    "motion_min_changed": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Changed cells needed per region; 0 means max(8, cells/400)."
+    },
+    "max_regions": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 8,
+      "description": "Maximum motion regions inferred per frame."
+    },
+    "full_sweep_sec": {
+      "type": "number",
+      "minimum": 0,
+      "default": 2.0,
+      "description": "Seconds between full-frame sweeps when roi_motion is on."
+    },
+    "shared_engine": {
+      "type": "boolean",
+      "default": false,
+      "description": "With ep cuda, use the process-wide batched inference engine; disables roi_motion."
+    },
+    "shared_max_batch": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "default": 8,
+      "description": "Maximum requests batched into one shared-engine run."
+    },
+    "shared_max_wait_us": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 2000,
+      "description": "Microseconds the shared engine waits for a batch to fill."
+    }
+  },
+  "required": [
+    "model_path"
+  ],
+  "x-not-config": [
+    "bbox",
+    "class_id",
+    "confidence",
+    "detections",
+    "embedding",
+    "label",
+    "pts_usec",
+    "stream_id",
+    "type"
+  ]
+}

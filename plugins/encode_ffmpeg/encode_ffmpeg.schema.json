@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "encode_ffmpeg",
+  "description": "Encodes raw RGB24, grayscale or YUV420P frames to H.264 or H.265 with FFmpeg and forwards the compressed packets downstream.",
+  "x-plugin-kind": "encode_ffmpeg",
+  "x-plugin-version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "codec": {
+      "type": "string",
+      "description": "Output codec; \"h265\" or \"hevc\" selects H.265, any other value selects H.264.",
+      "default": "h264",
+      "enum": [
+        "h264",
+        "h265",
+        "hevc"
+      ]
+    },
+    "hwaccel": {
+      "type": "string",
+      "description": "Hardware encoder family; unknown values fall back to the software encoder.",
+      "default": "none",
+      "enum": [
+        "none",
+        "nvenc",
+        "videotoolbox",
+        "vaapi",
+        "qsv",
+        "amf"
+      ]
+    },
+    "encoder": {
+      "type": "string",
+      "description": "Explicit FFmpeg encoder name that overrides codec and hwaccel; empty means resolve from them.",
+      "default": ""
+    },
+    "bitrate": {
+      "type": "integer",
+      "description": "Target bitrate in bits per second.",
+      "default": 4000000,
+      "minimum": 1
+    },
+    "gop": {
+      "type": "integer",
+      "description": "Keyframe interval in frames.",
+      "default": 50,
+      "minimum": 0
+    },
+    "fps": {
+      "type": "integer",
+      "description": "Encoder frame rate; 0 uses a microsecond time base instead.",
+      "default": 0,
+      "minimum": 0
+    },
+    "preset": {
+      "type": "string",
+      "description": "Encoder preset option; empty skips setting it.",
+      "default": "veryfast"
+    },
+    "tune": {
+      "type": "string",
+      "description": "Encoder tune option; empty skips setting it.",
+      "default": "zerolatency"
+    },
+    "frame_width": {
+      "type": "integer",
+      "description": "Width of incoming frames; frames pass through unencoded while this is 0.",
+      "default": 0,
+      "minimum": 0
+    },
+    "frame_height": {
+      "type": "integer",
+      "description": "Height of incoming frames; frames pass through unencoded while this is 0.",
+      "default": 0,
+      "minimum": 0
+    },
+    "stream_filter": {
+      "type": "integer",
+      "description": "Only this stream id is encoded and other streams pass through; -1 encodes all streams.",
+      "default": -1,
+      "minimum": -1
+    }
+  },
+  "x-not-config": [
+    "amf",
+    "nvenc",
+    "qsv",
+    "vaapi",
+    "videotoolbox"
+  ]
+}

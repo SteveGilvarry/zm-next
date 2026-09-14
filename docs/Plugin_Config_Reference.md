@@ -1,5 +1,36 @@
 # Plugin Configuration Reference
 
+**Machine-readable:** 16 plugins ship `plugins/<kind>/<kind>.schema.json` (JSON Schema with types,
+defaults, ranges and secret markers), checked against the source by `tools/check_plugin_schemas.py`.
+Where a schema and this page disagree, the schema is closer to the code. A running worker returns
+them with the `describe_plugins` command.
+
+## Known config problems (found writing the schemas, 2026-09-14)
+
+Not fixed yet. Each was read from the source; the `zones` one was also reproduced by compiling it.
+
+- **zones can't load zones in the documented shape.** `zones_start` passes the `zones` array to a
+  loader that looks for a `zones` key inside it, so a plain `"zones": [...]` loads nothing. Zones
+  load only as `"zones": {"zones": [...]}` with PascalCase keys (`Id`, `Name`, `Coords`,
+  `MinBlobs`...). camelCase keys in that nested shape give a zone with no polygon and a Boost R-tree
+  assertion abort.
+- **motion_pixel_diff never uses zones.** Its zone parser is never called, so `zone_aware` has no
+  effect and `zone_motion` events are never published. `enable_filtering` is read but unused.
+- **decode_detect vs detect_onnx name the same motion settings differently:** `motion.downsample` /
+  `motion.pixel_threshold` / `motion.min_cells` vs `motion_downscale` / `motion_threshold` /
+  `motion_min_changed`.
+- **encode_ffmpeg's `stream_filter` is a single integer** (-1 = all), not an array like every other plugin.
+- **Unknown enum values can silently fall back** instead of failing, e.g. `privacy_mask.mode`
+  becomes black for anything other than `blur` or `pixelate`.
+- **Missing required settings start a plugin that does nothing:** `detect_onnx` without
+  `model_path` runs as a pass-through, and `output_webhook` without `url` posts nothing.
+- **Read but unused:** `capture_rtsp_multi.retry_delay_ms` (the reconnect policy sets the delay),
+  `decode_ffmpeg.hw_decode` (`hwaccel` is the working key), `motion_pixel_diff.enable_filtering`.
+- **Not documented below:** `llm_event_review` and `review_export` (see their schemas), and
+  `detect_onnx`'s motion / shared-engine keys and `ep: "cuda"`.
+
+## Overview
+
 Every plugin is configured via the JSON object on its pipeline node (`"config"`,
 or `"cfg"`), passed to the plugin's `start()` as a JSON string. All keys are
 optional with the defaults shown. Common keys:

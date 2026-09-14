@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "review_export",
+  "description": "Collects per-track cutouts and background plates during a recording and publishes a review_assets manifest when the event clip closes.",
+  "x-plugin-kind": "review_export",
+  "x-plugin-version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["frame_width", "frame_height"],
+  "properties": {
+    "monitor_id": {
+      "type": "integer",
+      "description": "Monitor id written into the manifest.",
+      "default": 0
+    },
+    "frame_width": {
+      "type": "integer",
+      "description": "Width in pixels of the decoded RGB24 frames; no frames are buffered while this is 0.",
+      "default": 0,
+      "minimum": 0
+    },
+    "frame_height": {
+      "type": "integer",
+      "description": "Height in pixels of the decoded RGB24 frames; no frames are buffered while this is 0.",
+      "default": 0,
+      "minimum": 0
+    },
+    "sample_fps": {
+      "type": "integer",
+      "description": "Maximum cutout samples per second; 0 or less samples every detection.",
+      "default": 4
+    },
+    "cutout_max_edge": {
+      "type": "integer",
+      "description": "Longest edge in pixels of each saved cutout.",
+      "default": 256,
+      "minimum": 1
+    },
+    "feather": {
+      "type": "integer",
+      "description": "Number of blur passes applied to the cutout mask edge.",
+      "default": 1,
+      "minimum": 0
+    },
+    "ring_size": {
+      "type": "integer",
+      "description": "Number of recent frames kept for matching detections to pixels; clamped to 1 through 64.",
+      "default": 8,
+      "minimum": 1,
+      "maximum": 64
+    },
+    "max_samples": {
+      "type": "integer",
+      "description": "Cap on buffered cutout samples per recording; values below 1 become 1.",
+      "default": 2000,
+      "minimum": 1
+    },
+    "stream_filter": {
+      "type": "array",
+      "description": "Stream ids to take detections from; empty or absent means all streams.",
+      "default": [],
+      "items": {
+        "type": "integer",
+        "description": "A stream id."
+      }
+    }
+  },
+  "x-not-config": [
+    "bbox",
+    "cause",
+    "class_id",
+    "clip_path",
+    "clip_token",
+    "data",
+    "detections",
+    "event",
+    "event_id",
+    "format",
+    "h",
+    "illum",
+    "label",
+    "mask",
+    "path",
+    "path_base",
+    "plates",
+    "polygon",
+    "pts_usec",
+    "schema",
+    "source_h",
+    "source_w",
+    "stream_id",
+    "t_end_us",
+    "t_start_us",
+    "track_id",
+    "tubes",
+    "type",
+    "w",
+    "wallclock_ms"
+  ]
+}

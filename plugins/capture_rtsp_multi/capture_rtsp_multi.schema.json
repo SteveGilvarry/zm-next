@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "capture_rtsp_multi",
+  "description": "Captures one or more RTSP camera streams with FFmpeg and forwards compressed video and audio packets downstream.",
+  "x-plugin-kind": "capture_rtsp_multi",
+  "x-plugin-version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "streams": {
+      "type": "array",
+      "description": "Streams to capture; when absent the top-level object is read as a single stream.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "RTSP URL of the camera stream; credentials may be given separately."
+          },
+          "stream_id": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Stream id stamped on frames; defaults to the entry's position in the list."
+          },
+          "transport": {
+            "type": "string",
+            "enum": [
+              "tcp",
+              "udp"
+            ],
+            "default": "tcp",
+            "description": "RTSP transport passed to FFmpeg as rtsp_transport."
+          },
+          "hw_decode": {
+            "type": "boolean",
+            "default": false,
+            "description": "Set up a hardware device for this stream when the platform has one."
+          },
+          "max_retry_attempts": {
+            "type": "integer",
+            "default": 5,
+            "description": "Consecutive failed connects before giving up; 0 or negative retries forever."
+          },
+          "retry_delay_ms": {
+            "type": "integer",
+            "default": 2000,
+            "description": "Parsed but unused; the built-in reconnect backoff sets retry timing."
+          },
+          "forward_audio": {
+            "type": "boolean",
+            "default": true,
+            "description": "Forward compressed audio packets downstream."
+          },
+          "username": {
+            "type": "string",
+            "default": "",
+            "x-secret": true,
+            "description": "Camera username, joined to the URL only when the stream is opened."
+          },
+          "password": {
+            "type": "string",
+            "default": "",
+            "x-secret": true,
+            "description": "Camera password, joined to the URL only when the stream is opened."
+          }
+        }
+      }
+    },
+    "url": {
+      "type": "string",
+      "description": "RTSP URL for the single-stream form, used when streams is absent."
+    },
+    "stream_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Stream id stamped on frames; defaults to the entry's position in the list."
+    },
+    "transport": {
+      "type": "string",
+      "enum": [
+        "tcp",
+        "udp"
+      ],
+      "default": "tcp",
+      "description": "RTSP transport passed to FFmpeg as rtsp_transport."
+    },
+    "hw_decode": {
+      "type": "boolean",
+      "default": false,
+      "description": "Set up a hardware device for this stream when the platform has one."
+    },
+    "max_retry_attempts": {
+      "type": "integer",
+      "default": 5,
+      "description": "Consecutive failed connects before giving up; 0 or negative retries forever."
+    },
+    "retry_delay_ms": {
+      "type": "integer",
+      "default": 2000,
+      "description": "Parsed but unused; the built-in reconnect backoff sets retry timing."
+    },
+    "forward_audio": {
+      "type": "boolean",
+      "default": true,
+      "description": "Forward compressed audio packets downstream."
+    },
+    "username": {
+      "type": "string",
+      "default": "",
+      "x-secret": true,
+      "description": "Camera username, joined to the URL only when the stream is opened."
+    },
+    "password": {
+      "type": "string",
+      "default": "",
+      "x-secret": true,
+      "description": "Camera password, joined to the URL only when the stream is opened."
+    }
+  },
+  "x-not-config": [
+    "attempt",
+    "error",
+    "retry_in_sec"
+  ]
+}

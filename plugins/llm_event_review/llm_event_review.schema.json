@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "llm_event_review",
+  "description": "Sends frames or multi-frame montages of tracked objects to an OpenAI-compatible vision LLM when trigger events fire, and publishes the captions and per-track summaries as reasoning events.",
+  "x-plugin-kind": "llm_event_review",
+  "x-plugin-version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "provider": {
+      "type": "string",
+      "description": "Provider name; every value currently uses the OpenAI-compatible backend, and names other than local or openai log a warning.",
+      "default": "local"
+    },
+    "server_url": {
+      "type": "string",
+      "description": "OpenAI-compatible chat completions endpoint.",
+      "default": "http://localhost:8080/v1/chat/completions"
+    },
+    "model": {
+      "type": "string",
+      "description": "Model name sent in each request.",
+      "default": "Qwen/Qwen3-VL-8B-Instruct-FP8"
+    },
+    "api_key": {
+      "type": "string",
+      "description": "API key sent to the server; empty sends none.",
+      "default": "",
+      "x-secret": true
+    },
+    "frame_width": {
+      "type": "integer",
+      "description": "Width of incoming RGB24 frames; frames cannot be captured for review while this is 0.",
+      "default": 0,
+      "minimum": 0
+    },
+    "frame_height": {
+      "type": "integer",
+      "description": "Height of incoming RGB24 frames; frames cannot be captured for review while this is 0.",
+      "default": 0,
+      "minimum": 0
+    },
+    "prompt": {
+      "type": "string",
+      "description": "Prompt used for a single-frame review; [label], [reason] and [trigger_reason] are substituted.",
+      "default": "You are a security camera analyst. Describe the security event in this image in one sentence, noting anything unusual."
+    },
+    "max_pixels": {
+      "type": "integer",
+      "description": "Pixel area cap for a single-frame review image; larger frames are downscaled, and 0 disables the cap.",
+      "default": 1003520,
+      "minimum": 0
+    },
+    "timeout_sec": {
+      "type": "integer",
+      "description": "HTTP request timeout in seconds.",
+      "default": 30,
+      "minimum": 0
+    },
+    "enable_thinking": {
+      "type": "boolean",
+      "description": "Sets chat_template_kwargs.enable_thinking on requests; false keeps reasoning models in caption mode.",
+      "default": false
+    },
+    "montage": {
+      "type": "boolean",
+      "description": "Build a multi-frame montage per event instead of reviewing one frame.",
+      "default": true
+    },
+    "montage_frames": {
+      "type": "integer",
+      "description": "Number of tiles in the montage; values below 1 become 1.",
+      "default": 6,
+      "minimum": 1
+    },
+    "montage_cols": {
+      "type": "integer",
+      "description": "Number of grid columns in the montage; values below 1 become 1.",
+      "default": 3,
+      "minimum": 1
+    },
+    "montage_window_sec": {
+      "type": "number",
+      "description": "How many seconds of recent frames the per-stream ring keeps.",
+      "default": 6.0,
+      "minimum": 0
+    },
+    "montage_sample_fps": {
+      "type": "number",
+      "description": "Rate at which frames are sampled into the ring, in frames per second.",
+      "default": 2.0,
+      "minimum": 0
+    },
+    "montage_max_pixels": {
+      "type": "integer",
+      "description": "Pixel area cap for the whole montage image.",
+      "default": 400000,
+      "minimum": 0
+    },
+    "store_max_pixels": {
+      "type": "integer",
+      "description": "Pixel area cap for each frame stored in the ring.",
+      "default": 230400,
+      "minimum": 0
+    },
+    "montage_crop": {
+      "type": "boolean",
+      "description": "Crop each montage tile around the tracked object's bounding box.",
+      "default": true
+    },
+    "montage_crop_margin": {
+      "type": "number",
+      "description": "Scale factor from the bounding box to the crop window.",
+      "default": 2.0,
+      "minimum": 0
+    },
+    "montage_crop_min_frac": {
+      "type": "number",
+      "description": "Smallest crop window as a fraction of the frame.",
+      "default": 0.25,
+      "minimum": 0,
+      "maximum": 1
+    },
+    "montage_prompt": {
+      "type": "string",
+      "description": "Prompt used for montage reviews; [n], [span_sec], [label], [reason] and [trigger_reason] are substituted.",
+      "default": "You are a security camera analyst reviewing a sequence of [n] frames from one event, shown in chronological order (left to right, top to bottom) spanning about [span_sec] seconds. The framing follows one [label]. In one or two sentences, describe only what is visually observable about how the [label] moves across the sequence — direction of travel, entering or leaving, stopping, or carrying a clearly visible object. Report only what the frames actually show: do NOT guess the subject's motive, intent, or destination, and do NOT invent details that are not plainly visible. If nothing notable happens, say so plainly."
+    },
+    "narrate": {
+      "type": "boolean",
+      "description": "Publish a narrative summary when a track goes quiet.",
+      "default": true
+    },
+    "narrator_idle_sec": {
+      "type": "number",
+      "description": "Seconds a track must be silent before its summary is written.",
+      "default": 8.0,
+      "minimum": 0
+    },
+    "narrator_min_captions": {
+      "type": "integer",
+      "description": "Minimum number of captions a track needs before it is summarized.",
+      "default": 2,
+      "minimum": 0
+    },
+    "narrator_prompt": {
+      "type": "string",
+      "description": "Prompt used for the track summary; [label] is substituted.",
+      "default": "You are a security analyst. Below are sequential observations of a single tracked [label] over time, plus its movement path — the path is the factual record of where it went. Write a 2-3 sentence factual summary of what this [label] did, grounded in the movement path and the observations. Describe only observable movement: direction, entering or leaving, stopping, and how long it lingered. Do NOT infer motive, intent, or destination, and do NOT add details not present in the observations. Do not mention frame numbers or raw coordinates."
+    },
+    "debounce_sec": {
+      "type": "number",
+      "description": "Seconds before the same track can be reviewed again; 0 disables the debounce.",
+      "default": 10.0,
+      "minimum": 0
+    },
+    "classes": {
+      "type": "array",
+      "description": "Object labels to review; empty reviews all labels.",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "stream_filter": {
+      "type": "array",
+      "description": "Stream ids to review; empty accepts all streams.",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "default": []
+    },
+    "trigger_events": {
+      "type": "array",
+      "description": "Event types that start a review; an empty list keeps the default.",
+      "items": {
+        "type": "string"
+      },
+      "default": [
+        "alert"
+      ]
+    }
+  },
+  "x-not-config": [
+    "bbox",
+    "caption_count",
+    "chat_template_kwargs",
+    "cropped",
+    "detections",
+    "frame_count",
+    "inference_time_ms",
+    "label",
+    "max_tokens",
+    "messages",
+    "mode",
+    "pts_usec",
+    "reason",
+    "span_sec",
+    "stream_id",
+    "text",
+    "track_id",
+    "trigger_event",
+    "trigger_reason",
+    "type"
+  ]
+}

@@ -135,6 +135,9 @@ int main(int argc, char** argv) {
                     ++bye;
                     std::cout << "BYE\n";
                     break;
+                case ss::MessageType::WorkerHello:
+                    std::cout << "WORKER_HELLO " << std::string(reinterpret_cast<const char*>(body), payload_len) << "\n";
+                    break;
                 case ss::MessageType::Response:
                     std::cout << "RESPONSE " << std::string(reinterpret_cast<const char*>(body), payload_len) << "\n";
                     break;

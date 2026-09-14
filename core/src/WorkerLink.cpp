@@ -146,6 +146,12 @@ void WorkerLink::setTalkbackHandler(TalkbackHandler handler) {
     talkbackHandler_ = std::move(handler);
 }
 
+void WorkerLink::setWorkerHello(const std::string& public_json, const std::string& control_extra_json) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    hello_public_json_ = public_json;
+    hello_control_extra_json_ = control_extra_json;
+}
+
 bool WorkerLink::start() {
     std::signal(SIGPIPE, SIG_IGN);
 
@@ -396,6 +402,22 @@ void WorkerLink::acceptClient() {
         c.queue.push_back(m);
         c.queued_bytes += m->wire_size();
     };
+    // Worker hello first, tailored to whether this peer may control the worker.
+    if (!hello_public_json_.empty()) {
+        json hello = json::parse(hello_public_json_, nullptr, false);
+        if (hello.is_object()) {
+            if (c.control) {
+                json extra = json::parse(hello_control_extra_json_, nullptr, false);
+                if (extra.is_object()) hello.update(extra);
+            }
+            hello["control_peer"] = c.control;
+            const std::string body = hello.dump();
+            push(makeControl(static_cast<uint8_t>(ss::MessageType::WorkerHello),
+                             static_cast<uint8_t>(ss::StreamId::Monitor),
+                             /*flags=*/0, /*sequence=*/0, /*pts_us=*/0,
+                             std::vector<uint8_t>(body.begin(), body.end())));
+        }
+    }
     push(hello_video_);
     push(hello_audio_);
     push(snapshot_);

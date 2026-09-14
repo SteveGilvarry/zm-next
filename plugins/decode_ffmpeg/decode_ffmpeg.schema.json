@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "decode_ffmpeg",
+  "description": "Decodes compressed video with FFmpeg, optionally on the GPU, and forwards raw frames in the chosen pixel format.",
+  "x-plugin-kind": "decode_ffmpeg",
+  "x-plugin-version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "threads": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "FFmpeg decoder thread count; 0 lets FFmpeg choose."
+    },
+    "stream_filter": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "default": [],
+      "description": "Stream ids to decode; empty decodes every stream."
+    },
+    "scale": {
+      "type": "string",
+      "default": "orig",
+      "description": "Output size: orig, 720p, or WxH."
+    },
+    "output_format": {
+      "type": "string",
+      "enum": [
+        "yuv420p",
+        "rgb24",
+        "gray",
+        "gray8"
+      ],
+      "default": "yuv420p",
+      "description": "Output pixel format; unknown values fall back to yuv420p."
+    },
+    "codec": {
+      "type": "string",
+      "description": "FFmpeg decoder name that overrides the codec detected from StreamMetadata."
+    },
+    "hw_decode": {
+      "type": "boolean",
+      "default": false,
+      "description": "Parsed but unused; hardware decode is controlled by hwaccel."
+    },
+    "hwaccel": {
+      "type": "string",
+      "enum": [
+        "none",
+        "auto",
+        "cuda",
+        "videotoolbox",
+        "vaapi",
+        "qsv",
+        "d3d11va",
+        "dxva2"
+      ],
+      "default": "none",
+      "description": "Hardware decode device; frames are downloaded to CPU unless gpu_output is set, and unknown values mean none."
+    },
+    "gpu_output": {
+      "type": "boolean",
+      "default": false,
+      "description": "Emit CUDA or VideoToolbox frames as GPU descriptors valid only during the on_frame call."
+    }
+  },
+  "x-not-config": [
+    "codec_id",
+    "event",
+    "extradata",
+    "media"
+  ]
+}

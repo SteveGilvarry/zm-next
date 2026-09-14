@@ -38,7 +38,7 @@ endif()
 # One macOS SDK for compiler, linker and find modules; follows xcode-select /
 # DEVELOPER_DIR and re-configures when the SDK changes. Must precede project().
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/AppleSdk.cmake)
-project(zm-next-core LANGUAGES CXX)
+project(zm-next-core VERSION 0.1.0 LANGUAGES CXX)
 
 # ========================================
 # SIMD CONFIGURATION
@@ -103,8 +103,36 @@ add_subdirectory(plugins)
 # MAIN EXECUTABLE
 # ========================================
 # Main runner for ZM pipelines
+find_package(nlohmann_json REQUIRED)
 add_executable(zm-core src/zm-core.cpp)
-target_link_libraries(zm-core PRIVATE zmcore)
+target_link_libraries(zm-core PRIVATE zmcore nlohmann_json::nlohmann_json)
+
+# Facts the worker hello reports. The commit is taken at configure time, so it
+# goes stale until CMake re-runs; hardware backends follow the build options.
+execute_process(COMMAND git rev-parse --short HEAD WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                OUTPUT_VARIABLE ZM_NEXT_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT ZM_NEXT_COMMIT)
+    set(ZM_NEXT_COMMIT "unknown")
+endif()
+set(ZM_HW_BACKEND_LIST "")
+if(ZM_WITH_CUDA)
+    list(APPEND ZM_HW_BACKEND_LIST cuda)
+endif()
+if(APPLE AND ZM_WITH_METAL)
+    list(APPEND ZM_HW_BACKEND_LIST metal)
+endif()
+if(ZM_WITH_VAAPI)
+    list(APPEND ZM_HW_BACKEND_LIST vaapi)
+endif()
+if(ZM_WITH_VULKAN)
+    list(APPEND ZM_HW_BACKEND_LIST vulkan)
+endif()
+if(ZM_WITH_OPENVINO)
+    list(APPEND ZM_HW_BACKEND_LIST openvino)
+endif()
+list(JOIN ZM_HW_BACKEND_LIST "," ZM_HW_BACKENDS)
+target_compile_definitions(zm-core PRIVATE
+    ZM_NEXT_VERSION="${PROJECT_VERSION}" ZM_NEXT_COMMIT="${ZM_NEXT_COMMIT}" ZM_HW_BACKENDS="${ZM_HW_BACKENDS}")
 target_include_directories(zm-core PRIVATE ${Boost_INCLUDE_DIRS} /opt/homebrew/include)
 
 # ========================================

@@ -61,6 +61,9 @@ enum class MessageType : uint8_t {
   Command   = 0x11,
   Response  = 0x12,
   Talkback  = 0x13,
+
+  // zm-next worker->client control extension (docs/Worker_Control_Protocol.md).
+  WorkerHello = 0x14,  // JSON: versions, plugins, state, pipeline_hash; sent first on connect
 };
 
 enum class StreamId : uint8_t {

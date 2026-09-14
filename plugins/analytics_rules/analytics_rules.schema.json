@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "analytics_rules",
+  "description": "Evaluates intrusion, line-crossing, loitering and fall rules against tracked detections and pose events and publishes analytics events.",
+  "x-plugin-kind": "analytics_rules",
+  "x-plugin-version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "rules": {
+      "type": "array",
+      "description": "Rules to evaluate; rules with an unknown type or missing geometry are skipped.",
+      "default": [],
+      "items": {
+        "type": "object",
+        "description": "One rule. Which keys apply depends on type.",
+        "additionalProperties": false,
+        "required": ["type"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Rule name reported in the rule field of events (all types).",
+            "default": "rule"
+          },
+          "type": {
+            "type": "string",
+            "description": "Rule kind.",
+            "enum": ["intrusion", "linecross", "loiter", "fall"]
+          },
+          "polygon": {
+            "type": "array",
+            "description": "Zone as at least three [x, y] points in frame pixels; required for intrusion and loiter, optional for fall.",
+            "items": {
+              "type": "array",
+              "description": "An [x, y] point.",
+              "items": {
+                "type": "number",
+                "description": "Coordinate in pixels."
+              }
+            }
+          },
+          "line": {
+            "type": "array",
+            "description": "Tripwire as two [x, y] points; required for linecross.",
+            "items": {
+              "type": "array",
+              "description": "An [x, y] point.",
+              "items": {
+                "type": "number",
+                "description": "Coordinate in pixels."
+              }
+            }
+          },
+          "direction": {
+            "type": "string",
+            "description": "Crossing direction that fires a linecross rule, relative to the line drawn from its first to its second point.",
+            "default": "any",
+            "enum": ["any", "lr", "rl"]
+          },
+          "seconds": {
+            "type": "number",
+            "description": "Dwell time before a loiter rule fires (default 0), or time a person must stay down before a fall rule fires (default 2.0).",
+            "minimum": 0
+          },
+          "classes": {
+            "type": "array",
+            "description": "Detection labels the rule applies to; empty or absent means all.",
+            "default": [],
+            "items": {
+              "type": "string",
+              "description": "A detection label."
+            }
+          },
+          "stream_id": {
+            "type": "integer",
+            "description": "Only evaluate events from this stream; absent means all streams (all types)."
+          },
+          "tilt_deg": {
+            "type": "number",
+            "description": "Torso angle from vertical, in degrees, that counts as tilted (fall).",
+            "default": 55
+          },
+          "aspect": {
+            "type": "number",
+            "description": "Box width-to-height ratio at or above which the body counts as wide (fall).",
+            "default": 1
+          },
+          "min_signals": {
+            "type": "integer",
+            "description": "How many of the tilt, wide-box and head-low signals must agree for a person to count as down (fall).",
+            "default": 2,
+            "minimum": 1,
+            "maximum": 3
+          },
+          "keypoint_conf": {
+            "type": "number",
+            "description": "Keypoint confidence needed to use a keypoint (fall).",
+            "default": 0.5,
+            "minimum": 0,
+            "maximum": 1
+          },
+          "max_drift": {
+            "type": "number",
+            "description": "Movement allowed while down, in box heights, before the timer restarts (fall).",
+            "default": 0.5,
+            "minimum": 0
+          },
+          "require_upright": {
+            "type": "boolean",
+            "description": "Only fire if the person was seen upright within upright_window_sec before going down (fall).",
+            "default": true
+          },
+          "upright_window_sec": {
+            "type": "number",
+            "description": "How recently the person must have been upright when require_upright is set (fall).",
+            "default": 5,
+            "minimum": 0
+          }
+        }
+      }
+    }
+  },
+  "x-not-config": [
+    "bbox",
+    "detections",
+    "down_sec",
+    "drift",
+    "dwell_sec",
+    "keypoints",
+    "label",
+    "persons",
+    "pts_usec",
+    "rule",
+    "rule_type",
+    "track_id",
+    "v",
+    "x",
+    "y"
+  ]
+}

@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "store",
+  "description": "Records compressed media to disk as continuous segments, event clips, or both, and registers each file as a ZoneMinder event with zm-api.",
+  "x-plugin-kind": "store",
+  "x-plugin-version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": [
+        "continuous",
+        "event",
+        "both"
+      ],
+      "default": "continuous",
+      "description": "Recording mode; unknown values fall back to continuous."
+    },
+    "root": {
+      "type": "string",
+      "description": "Directory media is written under; defaults to /Shared/zm/media on macOS, C:/ZM/media on Windows and /lib/zm/media elsewhere."
+    },
+    "monitor_id": {
+      "type": "integer",
+      "default": 0,
+      "description": "Monitor id used in file paths and clip tokens."
+    },
+    "max_secs": {
+      "type": "integer",
+      "default": 300,
+      "description": "Continuous mode: segment length in seconds before rotating at the next keyframe."
+    },
+    "pre_roll_sec": {
+      "type": "integer",
+      "default": 5,
+      "description": "Event mode: seconds of media kept before the trigger."
+    },
+    "post_roll_sec": {
+      "type": "integer",
+      "default": 10,
+      "description": "Event mode: seconds recorded after the last trigger."
+    },
+    "max_buffer_sec": {
+      "type": "integer",
+      "default": 15,
+      "description": "Event mode: rolling buffer cap in seconds; raised to pre_roll_sec + 2 if smaller than pre_roll_sec."
+    },
+    "trigger_types": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": [],
+      "description": "Event types that start or extend a clip; empty means motion, detection, audio_event and tracked_detection."
+    },
+    "stream_filter": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "default": [],
+      "description": "Stream ids to record; empty records every stream."
+    }
+  },
+  "x-not-config": [
+    "cause",
+    "channels",
+    "clip",
+    "clip_token",
+    "cmd",
+    "codec_id",
+    "descriptions",
+    "dir",
+    "duration_usec",
+    "event",
+    "event_id",
+    "extradata",
+    "height",
+    "level",
+    "media",
+    "path",
+    "pix_fmt",
+    "profile",
+    "sample_rate",
+    "stream_id",
+    "text",
+    "type",
+    "video_name",
+    "width"
+  ]
+}

@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "tracker",
+  "description": "Assigns persistent track ids to detection events and republishes them as tracked_detection events.",
+  "x-plugin-kind": "tracker",
+  "x-plugin-version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "iou_threshold": {
+      "type": "number",
+      "description": "Minimum box overlap (IoU) to match a detection to an existing track.",
+      "default": 0.3,
+      "minimum": 0,
+      "maximum": 1
+    },
+    "max_age": {
+      "type": "integer",
+      "description": "Frames a track survives without a matching detection before it is dropped.",
+      "default": 30,
+      "minimum": 0
+    },
+    "min_hits": {
+      "type": "integer",
+      "description": "Matched detections a track needs before its id is reported.",
+      "default": 3,
+      "minimum": 0
+    },
+    "class_gated": {
+      "type": "boolean",
+      "description": "Only match detections to tracks of the same class.",
+      "default": true
+    },
+    "appearance_threshold": {
+      "type": "number",
+      "description": "Minimum embedding similarity for an appearance match; 0 turns appearance matching off.",
+      "default": 0,
+      "minimum": 0
+    },
+    "appearance_weight": {
+      "type": "number",
+      "description": "Weight of appearance similarity in the match cost when appearance matching is on.",
+      "default": 0.3,
+      "minimum": 0,
+      "maximum": 1
+    },
+    "embed_alpha": {
+      "type": "number",
+      "description": "Smoothing factor for updating a track's stored appearance embedding.",
+      "default": 0.1,
+      "minimum": 0,
+      "maximum": 1
+    },
+    "det_high_thresh": {
+      "type": "number",
+      "description": "Confidence splitting high and low detections for two-stage matching; 0 uses a single stage.",
+      "default": 0.5,
+      "minimum": 0,
+      "maximum": 1
+    },
+    "low_iou_threshold": {
+      "type": "number",
+      "description": "Minimum IoU for matching low-confidence detections in the second stage.",
+      "default": 0.2,
+      "minimum": 0,
+      "maximum": 1
+    },
+    "ocm_weight": {
+      "type": "number",
+      "description": "Weight of the direction-consistency term in the match cost.",
+      "default": 0.2,
+      "minimum": 0
+    }
+  },
+  "x-not-config": [
+    "bbox",
+    "class_id",
+    "confidence",
+    "detections",
+    "embedding",
+    "pts_usec",
+    "stream_id",
+    "track_id",
+    "type"
+  ]
+}

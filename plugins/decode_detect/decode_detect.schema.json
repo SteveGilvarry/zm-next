@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "decode_detect",
+  "description": "Decodes video on the GPU, applies an optional motion gate and runs object detection in a single stage, publishing detection events.",
+  "x-plugin-kind": "decode_detect",
+  "x-plugin-version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "model_path": {
+      "type": "string",
+      "description": "Path to the detection model loaded by the hardware backend."
+    },
+    "input_size": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "default": 640,
+      "description": "Square network input size in pixels."
+    },
+    "conf_threshold": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.25,
+      "description": "Minimum confidence for a detection to be reported."
+    },
+    "roi_motion": {
+      "type": "boolean",
+      "default": false,
+      "description": "Run the motion gate and infer only on frames or regions that moved."
+    },
+    "motion": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Motion gate tunables; 0 or absent keeps the backend default.",
+      "properties": {
+        "downsample": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Motion grid cell size in pixels."
+        },
+        "pixel_threshold": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Per-cell luma difference that counts as changed."
+        },
+        "min_cells": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Changed cells needed to count as motion."
+        },
+        "luma_jump": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Suppress whole-scene brightness jumps above this value."
+        },
+        "max_regions": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Maximum motion regions inferred per frame."
+        }
+      }
+    },
+    "class_filter": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "default": [],
+      "description": "Class ids to report; empty reports all classes."
+    },
+    "stream_filter": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "default": [],
+      "description": "Stream ids to process; empty processes every stream."
+    },
+    "hw": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "cuda",
+        "metal",
+        "vaapi",
+        "vulkan",
+        "openvino"
+      ],
+      "default": "auto",
+      "description": "Hardware backend; auto picks metal on Apple and tries cuda, vaapi, vulkan, openvino elsewhere."
+    },
+    "decode_path": {
+      "type": "string",
+      "description": "Path to the inner decode_ffmpeg library; defaults to plugins/decode_ffmpeg/decode_ffmpeg.dylib on macOS and .so elsewhere."
+    },
+    "codec": {
+      "type": "string",
+      "description": "Codec override passed to the inner decoder."
+    }
+  },
+  "required": [
+    "model_path"
+  ],
+  "x-not-config": [
+    "detections",
+    "gpu_output",
+    "hwaccel",
+    "output_format",
+    "pts_usec",
+    "scale",
+    "stream_id",
+    "type"
+  ]
+}

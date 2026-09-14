@@ -31,6 +31,7 @@ add_library(zmcore STATIC
     src/StageRunner.cpp
     src/plugin_utils.cpp
     src/WorkerLink.cpp
+    src/WorkerHello.cpp
 )
 
 target_include_directories(zmcore PUBLIC include)
@@ -66,6 +67,11 @@ add_executable(test_plugin_manager tests/test_plugin_manager.cpp)
 target_compile_definitions(test_plugin_manager PRIVATE TEST_CMAKE_BINARY_DIR="${CMAKE_BINARY_DIR}")
 target_link_libraries(test_plugin_manager PRIVATE zmcore GTest::gtest_main Threads::Threads dl)
 add_test(NAME PluginManagerTest COMMAND $<TARGET_FILE:test_plugin_manager>)
+
+# Worker hello: SHA-256 vectors, plugin catalog, secret redaction, describe_plugins
+add_executable(test_worker_hello tests/test_worker_hello.cpp)
+target_link_libraries(test_worker_hello PRIVATE zmcore nlohmann_json::nlohmann_json GTest::gtest_main Threads::Threads)
+add_test(NAME WorkerHelloTest COMMAND $<TARGET_FILE:test_worker_hello>)
 
 # Unit tests for PipelineLoader
 add_executable(test_pipeloader tests/test_pipeloader.cpp)

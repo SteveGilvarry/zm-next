@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "zones",
+  "description": "Loads ZoneMinder zone definitions into a spatial index and passes frames through unchanged.",
+  "x-plugin-kind": "zones",
+  "x-plugin-version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "monitor_id": {
+      "type": "integer",
+      "description": "Monitor id recorded in the zone metadata.",
+      "default": 0
+    },
+    "frame_width": {
+      "type": "integer",
+      "description": "Frame width recorded in the zone metadata; 0 means take it from the frame header.",
+      "default": 0,
+      "minimum": 0
+    },
+    "frame_height": {
+      "type": "integer",
+      "description": "Frame height recorded in the zone metadata; 0 means take it from the frame header.",
+      "default": 0,
+      "minimum": 0
+    },
+    "zones": {
+      "type": "object",
+      "description": "Wrapper object holding the zone list; the plugin looks for a zones array inside this value, so a bare array loads nothing.",
+      "additionalProperties": false,
+      "properties": {
+        "zones": {
+          "type": "array",
+          "description": "ZoneMinder Zones table rows.",
+          "items": {
+            "type": "object",
+            "description": "One ZoneMinder zone row with PascalCase keys: Id, Name, Type, CheckMethod, Coords (\"x,y x,y ...\"), MinPixelThreshold (25), MaxPixelThreshold (255), MinAlarmPixels, MaxAlarmPixels, FilterX (3), FilterY (3), MinFilterPixels, MaxFilterPixels, MinBlobPixels, MaxBlobPixels, MinBlobs (1), MaxBlobs, AlarmRGB (16711680). Coords must have at least one point.",
+            "additionalProperties": true
+          }
+        }
+      }
+    }
+  },
+  "x-not-config": [
+    "alarmRGB",
+    "checkMethod",
+    "coords",
+    "filterX",
+    "filterY",
+    "frameHeight",
+    "frameWidth",
+    "id",
+    "maxAlarmPixels",
+    "maxBlobPixels",
+    "maxBlobs",
+    "maxFilterPixels",
+    "maxPixelThreshold",
+    "minAlarmPixels",
+    "minBlobPixels",
+    "minBlobs",
+    "minFilterPixels",
+    "minPixelThreshold",
+    "monitorId",
+    "name",
+    "type"
+  ]
+}

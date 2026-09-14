@@ -75,6 +75,12 @@ public:
     void setCommandHandler(CommandHandler handler);
     void setTalkbackHandler(TalkbackHandler handler);
 
+    // Worker hello (message type 0x14), sent as the first frame to every peer that
+    // connects after this call. `public_json` goes to every peer; the members of
+    // `control_extra_json` (an object) are merged in only for control peers; both
+    // get "control_peer": true|false. Empty public_json = send no hello.
+    void setWorkerHello(const std::string& public_json, const std::string& control_extra_json = "{}");
+
     // --- events ---------------------------------------------------------------
     // Publish a lifecycle/detection event from the in-process EventBus. For the
     // first slice we accept the raw plugin JSON and map it onto an Event frame;
@@ -165,6 +171,8 @@ private:
     // back into publishEventJson — which takes mutex_. Running handlers under the
     // lock self-deadlocked the worker thread. Guarded by mutex_.
     std::vector<std::function<void()>> deferred_;
+    std::string hello_public_json_;          // guarded by mutex_
+    std::string hello_control_extra_json_;   // guarded by mutex_
 
     uint32_t event_sequence_{0};
     uint32_t sequence_[2]{0, 0};     // per-stream media counter, indexed by wire StreamId (Video, Audio)

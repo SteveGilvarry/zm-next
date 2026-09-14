@@ -713,6 +713,43 @@ TEST(WorkerLinkTest, OwnUidIsControlByDefault) {
     link.stop();
 }
 
+// The worker hello is the first frame; control peers see the control-only
+// fields and control_peer=true, observers see neither.
+TEST(WorkerLinkTest, WorkerHelloFirstAndTailoredToPeer) {
+    const std::string path = temp_socket_path(950);
+    const std::string pub = R"({"state":"running","monitor_id":20,"pipeline_hash":"sha256:ab"})";
+    const std::string extra = R"({"secrets_fingerprint":"sha256:cd"})";
+
+    auto first_frame = [&](const zm::WorkerLink::Config& cfg) {
+        zm::WorkerLink link(/*monitor_id=*/20, path, cfg);
+        link.setSnapshotJson(R"({"type":"state_changed","state":"IDLE"})");  // must come after the hello
+        link.setWorkerHello(pub, extra);
+        EXPECT_TRUE(link.start());
+        int client = connect_client(path);
+        EXPECT_GE(client, 0);
+        EXPECT_TRUE(wait_readable(client, 2000));
+        ss::Header h;
+        std::vector<uint8_t> body;
+        EXPECT_TRUE(read_msg(client, h, &body));
+        ::close(client);
+        link.stop();
+        EXPECT_EQ(h.type, static_cast<uint8_t>(ss::MessageType::WorkerHello));
+        return json::parse(body.begin(), body.end(), nullptr, false);
+    };
+
+    const json asControl = first_frame(zm::WorkerLink::Config{});
+    EXPECT_EQ(asControl["state"], "running");
+    EXPECT_EQ(asControl["control_peer"], true);
+    EXPECT_EQ(asControl["secrets_fingerprint"], "sha256:cd");
+
+    zm::WorkerLink::Config observer;
+    observer.control_uids = {static_cast<uint32_t>(::geteuid()) + 4242};
+    const json asObserver = first_frame(observer);
+    EXPECT_EQ(asObserver["control_peer"], false);
+    EXPECT_FALSE(asObserver.contains("secrets_fingerprint"));
+    EXPECT_EQ(asObserver["pipeline_hash"], "sha256:ab");
+}
+
 TEST(WorkerLinkTest, PeriodicStats) {
     const std::string path = temp_socket_path();
     zm::WorkerLink::Config cfg;

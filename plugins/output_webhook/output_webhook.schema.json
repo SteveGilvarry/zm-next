@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "output_webhook",
+  "description": "POSTs each pipeline event as JSON to an HTTP(S) webhook URL.",
+  "x-plugin-kind": "output_webhook",
+  "x-plugin-version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "url": {
+      "type": "string",
+      "description": "Webhook URL that receives the POSTs; nothing is sent when empty."
+    },
+    "timeout_ms": {
+      "type": "integer",
+      "description": "Timeout for each POST in milliseconds.",
+      "default": 2000,
+      "minimum": 0
+    },
+    "auth_header": {
+      "type": "string",
+      "description": "Full extra header line added to each request, for example \"Authorization: Bearer X\".",
+      "x-secret": true
+    },
+    "event_types": {
+      "type": "array",
+      "description": "Event types to forward; empty forwards every event.",
+      "items": { "type": "string" },
+      "default": []
+    }
+  },
+  "required": ["url"],
+  "x-not-config": ["type"]
+}

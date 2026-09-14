@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "privacy_mask",
+  "description": "Obscures fixed regions and detected objects in decoded RGB24 or grayscale frames before they reach later plugins.",
+  "x-plugin-kind": "privacy_mask",
+  "x-plugin-version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["frame_width", "frame_height"],
+  "properties": {
+    "frame_width": {
+      "type": "integer",
+      "description": "Width in pixels of incoming frames; frames pass unmasked while this is 0.",
+      "default": 0,
+      "minimum": 0
+    },
+    "frame_height": {
+      "type": "integer",
+      "description": "Height in pixels of incoming frames; frames pass unmasked while this is 0.",
+      "default": 0,
+      "minimum": 0
+    },
+    "mode": {
+      "type": "string",
+      "description": "How masked areas are drawn; unrecognised values fall back to black.",
+      "default": "black",
+      "enum": ["black", "blur", "pixelate"]
+    },
+    "blur_size": {
+      "type": "integer",
+      "description": "Blur radius or pixelate block size in pixels; values below 1 are raised to 1.",
+      "default": 16,
+      "minimum": 1
+    },
+    "stream_filter": {
+      "type": "array",
+      "description": "Stream ids to mask; empty or absent means all streams.",
+      "default": [],
+      "items": {
+        "type": "integer",
+        "description": "A stream id."
+      }
+    },
+    "regions": {
+      "type": "array",
+      "description": "Fixed polygons to mask on every frame; polygons with fewer than three points are ignored.",
+      "default": [],
+      "items": {
+        "type": "array",
+        "description": "A polygon as a list of [x, y] points in frame pixels.",
+        "items": {
+          "type": "array",
+          "description": "An [x, y] point.",
+          "items": {
+            "type": "number",
+            "description": "Coordinate in pixels."
+          }
+        }
+      }
+    },
+    "dynamic": {
+      "type": "object",
+      "description": "Masks boxes reported by upstream detector events; absent means dynamic masking is off.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Turn dynamic masking on when the dynamic object is present.",
+          "default": true
+        },
+        "sources": {
+          "type": "array",
+          "description": "Event types whose boxes are masked.",
+          "default": ["detection", "tracked_detection", "face", "lpr"],
+          "items": {
+            "type": "string",
+            "description": "An event type.",
+            "enum": ["detection", "tracked_detection", "face", "lpr"]
+          }
+        },
+        "classes": {
+          "type": "array",
+          "description": "Detection labels to mask for detection and tracked_detection events; empty means all labels.",
+          "default": ["person"],
+          "items": {
+            "type": "string",
+            "description": "A detection label."
+          }
+        },
+        "min_confidence": {
+          "type": "number",
+          "description": "Minimum detection confidence to mask; face and plate boxes are always masked.",
+          "default": 0.25,
+          "minimum": 0,
+          "maximum": 1
+        },
+        "padding": {
+          "type": "number",
+          "description": "Extra margin added on each side of a box, as a fraction of its size; negative values become 0.",
+          "default": 0.15,
+          "minimum": 0
+        },
+        "hold_ms": {
+          "type": "number",
+          "description": "Reuse boxes from frames up to this many milliseconds away; negative values become 0.",
+          "default": 400,
+          "minimum": 0
+        },
+        "person_region": {
+          "type": "string",
+          "description": "Mask the whole person box or only its top part; any value other than head means body.",
+          "default": "body",
+          "enum": ["body", "head"]
+        },
+        "head_fraction": {
+          "type": "number",
+          "description": "Top fraction of a person box masked when person_region is head.",
+          "default": 0.3,
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        }
+      }
+    }
+  },
+  "x-not-config": [
+    "bbox",
+    "confidence",
+    "label",
+    "pts_usec",
+    "stream_id",
+    "type"
+  ]
+}

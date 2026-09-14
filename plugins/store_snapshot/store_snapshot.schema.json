@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "store_snapshot",
+  "description": "Writes a JPEG of the latest RGB24 frame when a matching event arrives or a snapshot_now command is received, and passes frames through unchanged.",
+  "x-plugin-kind": "store_snapshot",
+  "x-plugin-version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "root": {
+      "type": "string",
+      "description": "Directory snapshots are written under; defaults to /Shared/zm/media on macOS, C:/ZM/media on Windows and /lib/zm/media elsewhere."
+    },
+    "trigger_types": {
+      "type": "array",
+      "description": "Event types that trigger a snapshot; empty uses the built-in list, and a list like [\"none\"] means snapshots only on command.",
+      "items": { "type": "string" },
+      "default": ["detection", "motion", "face", "lpr", "analytics", "audio_event"]
+    },
+    "min_interval_ms": {
+      "type": "integer",
+      "description": "Minimum time between event-triggered snapshots in milliseconds; negative values are treated as 0.",
+      "default": 2000,
+      "minimum": 0
+    },
+    "jpeg_quality": {
+      "type": "integer",
+      "description": "FFmpeg JPEG quality scale where lower is better; values outside 2-31 are clamped.",
+      "default": 5,
+      "minimum": 2,
+      "maximum": 31
+    },
+    "frame_width": {
+      "type": "integer",
+      "description": "Width of incoming RGB24 frames; snapshots fail while this is 0.",
+      "default": 0,
+      "minimum": 0
+    },
+    "frame_height": {
+      "type": "integer",
+      "description": "Height of incoming RGB24 frames; snapshots fail while this is 0.",
+      "default": 0,
+      "minimum": 0
+    },
+    "stream_filter": {
+      "type": "array",
+      "description": "Stream ids to snapshot; empty accepts all streams.",
+      "items": { "type": "integer", "minimum": 0 },
+      "default": []
+    }
+  },
+  "x-not-config": ["inline", "jpeg_base64", "stream_id", "type"]
+}

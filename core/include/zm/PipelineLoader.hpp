@@ -20,11 +20,16 @@ public:
     // Get parsed pipeline (vector of PluginConfig)
     const std::vector<PluginConfig>& getPipeline() const;
 
+    // The whole pipeline document as loaded (compact JSON), e.g. for the worker
+    // hello's pipeline_hash. Contains secrets: never log it.
+    const std::string& rawJson() const { return raw_json_; }
+
     // Progress info for last load
     void printProgress() const;
 private:
     std::string path_;
     std::vector<PluginConfig> pipeline_;
+    std::string raw_json_;
     // For progress/debug
     std::vector<std::string> progress_msgs_;
 };

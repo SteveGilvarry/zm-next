@@ -2,7 +2,9 @@
 #include "zm/PipelineLoader.hpp"
 #include "zm/PluginManager.hpp"
 #include "zm/EventBus.hpp"
+#include "zm/WorkerHello.hpp"
 #include "zm/WorkerLink.hpp"
+#include "zm_plugin.h"
 #include <nlohmann/json.hpp>
 #include <iostream>
 #include <filesystem>
@@ -96,6 +98,14 @@ int main(int argc, char** argv) {
     }
     loader.printProgress();
 
+    // Worker hello inputs: this build's plugin catalog (resolved like plugin
+    // libraries, relative to the working directory) and the loaded pipeline.
+    const worker::Catalog catalog = worker::load_catalog("plugins");
+    if (!catalog.error.empty())
+        std::cerr << "[zm-core] plugin catalog: " << catalog.error
+                  << " (hello will list no plugins; describe_plugins returns nothing)" << std::endl;
+    const nlohmann::json pipelineDoc = nlohmann::json::parse(loader.rawJson(), nullptr, false);
+
     PluginManager pm;
     // Use new API: pass vector<PluginConfig> from loader
     if (!pm.loadPipeline(loader.getPipeline())) {
@@ -113,7 +123,24 @@ int main(int argc, char** argv) {
             linkCfg.control_uids.push_back(static_cast<uint32_t>(::geteuid()));
         }
         link = std::make_unique<WorkerLink>(static_cast<uint32_t>(monitorId), socketPath, linkCfg);
-        link->setCommandHandler([&pm](const std::string& name, const std::string& args)
+        {
+            worker::HelloFacts facts;
+            facts.version = ZM_NEXT_VERSION;
+            facts.commit = ZM_NEXT_COMMIT;
+            facts.plugin_abi = ZM_PLUGIN_ABI_VERSION;
+            facts.monitor_id = monitorId;
+            facts.state = "running";  // started with --pipeline; "unconfigured" arrives with configure
+            for (std::string b, all = ZM_HW_BACKENDS; !all.empty();) {
+                const auto comma = all.find(',');
+                b = all.substr(0, comma);
+                all = comma == std::string::npos ? "" : all.substr(comma + 1);
+                if (!b.empty()) facts.hw_backends.push_back(b);
+            }
+            const nlohmann::json* doc = pipelineDoc.is_object() ? &pipelineDoc : nullptr;
+            link->setWorkerHello(worker::hello_public(facts, catalog, doc).dump(),
+                                 worker::hello_control_extra(catalog, doc, /*salt=*/"").dump());
+        }
+        link->setCommandHandler([&pm, &catalog](const std::string& name, const std::string& args)
                                     -> WorkerLink::CommandResult {
             (void)args;
             WorkerLink::CommandResult r;
@@ -124,6 +151,16 @@ int main(int argc, char** argv) {
                 r.ok = true; r.message = "status";
                 r.data_json = "{\"plugins\":" + std::to_string(pm.pluginCount()) +
                               ",\"running\":" + (g_shutdown.load() ? "false" : "true") + "}";
+            } else if (name == "describe_plugins") {
+                // {"cmd":"describe_plugins","kinds":["tracker",...]} (omit kinds = all
+                // plugins with a schema) -> data {"<kind>": {"version", "schema"} | null}.
+                std::vector<std::string> kinds;
+                const auto j = nlohmann::json::parse(args, nullptr, false);
+                if (j.is_object() && j.contains("kinds") && j["kinds"].is_array())
+                    for (const auto& k : j["kinds"])
+                        if (k.is_string()) kinds.push_back(k.get<std::string>());
+                r.ok = true; r.message = "plugins";
+                r.data_json = worker::describe_plugins(catalog, kinds).dump();
             } else if (name == "reload") {
                 // Hot reload is Phase 2 — daemon should restart the process for now.
                 r.ok = false; r.message = "not_implemented";

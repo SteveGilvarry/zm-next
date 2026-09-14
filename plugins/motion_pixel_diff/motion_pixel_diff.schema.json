@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "motion_pixel_diff",
+  "description": "Detects motion in grayscale frames by differencing each frame against a running background model and publishes motion events.",
+  "x-plugin-kind": "motion_pixel_diff",
+  "x-plugin-version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "frame_width": {
+      "type": "integer",
+      "description": "Width in pixels of the grayscale frames the plugin receives.",
+      "default": 1280,
+      "minimum": 1
+    },
+    "frame_height": {
+      "type": "integer",
+      "description": "Height in pixels of the grayscale frames the plugin receives.",
+      "default": 720,
+      "minimum": 1
+    },
+    "threshold": {
+      "type": "integer",
+      "description": "Per-pixel absolute difference from the background above which a pixel counts as changed.",
+      "default": 25,
+      "minimum": 0,
+      "maximum": 255
+    },
+    "min_pixels": {
+      "type": "integer",
+      "description": "Number of changed pixels at or above which a global motion event is published.",
+      "default": 800,
+      "minimum": 0
+    },
+    "downscale": {
+      "type": "integer",
+      "description": "Analysis resolution: 1 keeps the source size, 2 halves it, 0 uses out_width and out_height.",
+      "default": 1,
+      "enum": [0, 1, 2]
+    },
+    "out_width": {
+      "type": "integer",
+      "description": "Analysis width when downscale is 0.",
+      "default": 0,
+      "minimum": 0
+    },
+    "out_height": {
+      "type": "integer",
+      "description": "Analysis height when downscale is 0.",
+      "default": 0,
+      "minimum": 0
+    },
+    "zone_aware": {
+      "type": "boolean",
+      "description": "Evaluate per-zone motion and publish zone_motion events when zones are available.",
+      "default": true
+    },
+    "enable_background_update": {
+      "type": "boolean",
+      "description": "Blend each frame into the background model.",
+      "default": true
+    },
+    "background_learning_rate": {
+      "type": "number",
+      "description": "Weight of the new frame when updating the background model.",
+      "default": 0.03125,
+      "minimum": 0,
+      "maximum": 1
+    },
+    "enable_motion_map": {
+      "type": "boolean",
+      "description": "Build a motion visualization map for each frame.",
+      "default": false
+    },
+    "enable_filtering": {
+      "type": "boolean",
+      "description": "Apply spatial filtering to the motion mask.",
+      "default": true
+    },
+    "plate_export": {
+      "type": "boolean",
+      "description": "Write the background model to disk as a JPEG plate and publish a background_plate event.",
+      "default": false
+    },
+    "plate_refresh_secs": {
+      "type": "integer",
+      "description": "Minimum seconds between plate writes.",
+      "default": 120,
+      "minimum": 0
+    },
+    "plate_dir": {
+      "type": "string",
+      "description": "Directory plate JPEGs are written to; plate export is off while this is empty.",
+      "default": ""
+    },
+    "plate_on_illum_change": {
+      "type": "boolean",
+      "description": "Also write a plate when the mean brightness shifts noticeably.",
+      "default": true
+    },
+    "monitor_id": {
+      "type": "integer",
+      "description": "Monitor id included in published motion events.",
+      "default": 0
+    }
+  },
+  "x-not-config": [
+    "algorithm",
+    "alarmRGB",
+    "blobs",
+    "checkMethod",
+    "coords",
+    "filterX",
+    "filterY",
+    "frameHeight",
+    "frameWidth",
+    "frame_count",
+    "id",
+    "maxAlarmPixels",
+    "maxBlobPixels",
+    "maxBlobs",
+    "maxFilterPixels",
+    "maxPixelThreshold",
+    "minAlarmPixels",
+    "minBlobPixels",
+    "minBlobs",
+    "minFilterPixels",
+    "minPixelThreshold",
+    "monitor",
+    "monitorId",
+    "name",
+    "pixels",
+    "type",
+    "zone",
+    "zones"
+  ]
+}
