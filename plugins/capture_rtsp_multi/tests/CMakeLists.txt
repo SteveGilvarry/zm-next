@@ -33,7 +33,7 @@ add_dependencies(test_capture_rtsp_multi capture_rtsp_multi)
 # URL credential join/redaction (pure header).
 add_executable(test_url_credentials test_url_credentials.cpp)
 set_property(TARGET test_url_credentials PROPERTY CXX_STANDARD 17)
-target_include_directories(test_url_credentials PRIVATE ${CMAKE_SOURCE_DIR}/plugins/capture_rtsp_multi)
+target_include_directories(test_url_credentials PRIVATE ${CMAKE_SOURCE_DIR}/plugins/capture_rtsp_multi ${CMAKE_SOURCE_DIR}/core/include)
 target_link_libraries(test_url_credentials gtest gtest_main)
 add_test(NAME CaptureUrlCredentialsTest COMMAND test_url_credentials)
 

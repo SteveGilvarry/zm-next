@@ -1,4 +1,5 @@
 #include "zm/WorkerLink.hpp"
+#include "zm/Redactor.hpp"
 #include "zm/stream_socket_protocol.hpp"
 
 #include <nlohmann/json.hpp>
@@ -420,6 +421,7 @@ void WorkerLink::acceptClient() {
     }
     push(hello_video_);
     push(hello_audio_);
+    push(worker_state_);
     push(snapshot_);
     push(keyframe_);
     auto [it, _] = clients_.emplace(cfd, std::move(c));
@@ -580,8 +582,9 @@ void WorkerLink::reapDead() {
     }
 }
 
-void WorkerLink::publishEventJson(const std::string& raw_event_json) {
+void WorkerLink::publishEventJson(const std::string& unredacted_event_json) {
     if (!running_.load()) return;
+    const std::string raw_event_json = Redactor::instance().apply(unredacted_event_json);
 
     json j = json::parse(raw_event_json, nullptr, /*allow_exceptions=*/false);
     const bool obj = !j.is_discarded() && j.is_object();
@@ -631,7 +634,9 @@ void WorkerLink::publishEventJson(const std::string& raw_event_json) {
                                  /*flags=*/0, event_sequence_++, /*pts_us=*/0,
                                  ss::BuildEvent(ev));
     enqueue(msg, /*video=*/false, /*audio=*/false, /*events=*/true);
-    if (is_health) snapshot_ = msg;
+    // worker_state has its own slot so it doesn't hide the latest stream health.
+    if (ev.code == ss::kEventWorkerState) worker_state_ = msg;
+    else if (is_health) snapshot_ = msg;
 }
 
 void WorkerLink::setSnapshotJson(const std::string& raw_event_json) {

@@ -17,6 +17,10 @@ public:
     // Parse the pipeline file into a flat vector of PluginConfig.
     bool load();
 
+    // Same, from a JSON document already in memory (the configure command's
+    // pipeline). `path` is unused.
+    bool loadText(const std::string& json_text);
+
     // Get parsed pipeline (vector of PluginConfig)
     const std::vector<PluginConfig>& getPipeline() const;
 

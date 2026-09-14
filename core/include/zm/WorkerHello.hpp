@@ -43,36 +43,44 @@ const std::set<std::string>& default_secret_keys();
 // <plugins_dir>/<kind>/<kind>.schema.json that exists.
 Catalog load_catalog(const std::string& plugins_dir);
 
-// Copy of `pipeline` (the {"plugins":[...]} tree) with every secret value under
-// a node's cfg/config replaced by "<secret>"; the removed values are appended to
-// `secrets` as {path, value} pairs in a stable order.
-nlohmann::json redact_pipeline(const nlohmann::json& pipeline, const Catalog& catalog,
-                               std::vector<std::pair<std::string, std::string>>* secrets = nullptr);
+// Secret locations in a pipeline beyond the key names above: JSON pointers of
+// values that arrived as {"$secret": name} references in configure.
+using SecretPaths = std::set<std::string>;
 
-// "sha256:<hex>" of the redacted pipeline (keys sorted, compact).
-std::string pipeline_hash(const nlohmann::json& pipeline, const Catalog& catalog);
+// Copy of `pipeline` (the {"plugins":[...]} tree) with every secret value under
+// a node's cfg/config, and at each of `extra`, replaced by "<secret>"; the
+// removed values are appended to `secrets` as {path, value} pairs.
+nlohmann::json redact_pipeline(const nlohmann::json& pipeline, const Catalog& catalog,
+                               std::vector<std::pair<std::string, std::string>>* secrets = nullptr,
+                               const SecretPaths* extra = nullptr);
+
+// "sha256:<hex>" of the redacted pipeline (keys sorted, compact). A pipeline
+// configured with references and the same pipeline with literal values at
+// x-secret keys hash the same.
+std::string pipeline_hash(const nlohmann::json& pipeline, const Catalog& catalog,
+                          const SecretPaths* extra = nullptr);
 
 // "sha256:<hex>" of salt + the pipeline's secrets in stable order; "" when the
 // pipeline has none.
 std::string secrets_fingerprint(const nlohmann::json& pipeline, const Catalog& catalog,
-                                const std::string& salt);
+                                const std::string& salt, const SecretPaths* extra = nullptr);
 
 struct HelloFacts {
     std::string version;
     std::string commit;
     uint32_t plugin_abi = 0;
     int64_t monitor_id = 0;
-    std::string state;                   // unconfigured | configuring | running | stopping
+    std::string state;                   // unconfigured | configuring | running | failed
     std::vector<std::string> hw_backends;
 };
 
 // Hello fields every peer may see.
 nlohmann::json hello_public(const HelloFacts& facts, const Catalog& catalog,
-                            const nlohmann::json* pipeline);
+                            const nlohmann::json* pipeline, const SecretPaths* extra = nullptr);
 
 // Fields added for control peers only (currently secrets_fingerprint).
 nlohmann::json hello_control_extra(const Catalog& catalog, const nlohmann::json* pipeline,
-                                   const std::string& salt);
+                                   const std::string& salt, const SecretPaths* extra = nullptr);
 
 // describe_plugins command result: {"<kind>": {"version":..., "schema": {...}}}.
 // Empty `kinds` = every plugin with a schema. Unknown kinds map to null.

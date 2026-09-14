@@ -1,6 +1,7 @@
 # Worker control protocol (zm-api ↔ zm-core)
 
-Status: **Phase 1 in progress** (zm-next), 2026-09-14. Proposed 2026-09-13. Sections marked
+Status: **Phase 1 in progress** (zm-next), 2026-09-14: authentication, hello, schemas, configure,
+redaction, status codes and exit codes are built; contract transcripts remain. Proposed 2026-09-13. Sections marked
 *Implemented* are built; the rest is still proposal. It replaces how zm-api configures,
 supervises and talks to zm-next workers; media and analysis events keep the canonical stream-socket
 protocol unchanged.
@@ -20,8 +21,8 @@ socket into a proper control session:
    separate map. The worker answers with structured errors or applies it.
 5. The worker reports typed **status** (streaming, auth failed, camera unreachable, degraded) on the
    canonical health codes.
-6. Workers **outlive zm-api**: a zm-api restart or upgrade reconnects to running workers instead of
-   killing them.
+6. zm-api **owns worker lifetime**: workers are its children, not services of their own, and stop
+   with it (decided 2026-09-14, see Worker lifetime).
 
 ## How it works today
 
@@ -34,7 +35,7 @@ Checked against zm-api `03e30b2` and zm-next `9217bdf`.
 | Files | `store` writes clips into the ZoneMinder events tree after the `recording_opening` → `assign_recording` handshake. |
 | Reload | "Reload" regenerates the graph from the database and restarts the worker. There is no in-process reconfigure. |
 | Errors | zm-core exits `1`–`5` for bad arguments or a pipeline that fails to load. zm-api logs the status and restarts with 5 s – 15 min backoff. |
-| Lifetime | zm-api's systemd unit has `KillMode=mixed`, and `kill_orphan_daemons()` runs `pkill -9` on `zm-core` (and zmc etc.) at startup. **Restarting or upgrading zm-api stops recording on every camera.** |
+| Lifetime | zm-api's systemd unit has `KillMode=mixed`, and `kill_orphan_daemons()` runs `pkill -9` on `zm-core` (and zmc etc.) at startup, so restarting zm-api restarts every worker. |
 
 ## Problems this fixes
 
@@ -58,17 +59,17 @@ Each of these is a property of the interface, not a one-off bug.
 - **Secrets are redacted by pattern.** zm-next scrubs `scheme://user:pass@` from logs, but the MQTT
   password, webhook `auth_header` and LLM `api_key` have no protection, and any plugin that logs its
   config would leak them.
-- **zm-api restarts stop cameras** (see Lifetime above).
 
 ## Goals and non-goals
 
 Goals: one authoritative contract that both sides test against; configuration errors reported, not
-crash-looped; typed worker and camera status; secrets scrubbed by value everywhere; recording that
-survives zm-api restarts; room for in-place reconfiguration.
+crash-looped; typed worker and camera status; secrets scrubbed by value everywhere; room for in-place
+reconfiguration.
 
 Not goals: changing the media or analysis event wire (zmc and zm-api must keep sharing it); moving
 the database into zm-next; putting several monitors in one worker (rejected in
-`zm-api/docs/ZMNEXT_SHARED_INFERENCE_PLAN.md` for fault isolation); a network API on the worker.
+`zm-api/docs/ZMNEXT_SHARED_INFERENCE_PLAN.md` for fault isolation); a network API on the worker;
+running zm-next as a service of its own, outside zm-api.
 
 ## Design
 
@@ -102,7 +103,7 @@ The socket stays `0660`; the uid check is what separates observing from controll
 
 *Implemented 2026-09-14:* `WorkerLink::Config::control_uids` (empty = own euid) and
 `zm-core --control-uid <uid>` (repeatable; own euid always included). A peer whose uid can't be read
-is an observer. Configure doesn't exist yet, so today this gates Command and Talkback.
+is an observer. It gates every Command, including configure, and Talkback.
 
 ### Worker hello
 
@@ -125,11 +126,12 @@ Sent to every peer right after accept, before the cached HELLO/snapshot/keyframe
 }
 ```
 
-- `state`: `unconfigured` | `configuring` | `running` | `stopping`.
+- `state`: `unconfigured` | `configuring` | `running` | `failed` (the last configure validated but
+  its pipeline would not load; the worker has no pipeline until the next configure).
 - `pipeline_hash`: SHA-256 of the active pipeline (keys sorted, compact) with every secret value
-  replaced by `"<secret>"`. Secret keys are those marked `x-secret` in the plugin's schema plus
-  `password`, `username`, `auth_header`, `api_key`, `token`, `secret` for any plugin. Safe for any
-  peer; unchanged by a password change.
+  replaced by `"<secret>"`. Secret values are those at keys marked `x-secret` in the plugin's schema,
+  at `password`, `username`, `auth_header`, `api_key`, `token`, `secret` for any plugin, and wherever
+  configure gave a `$secret` reference. Safe for any peer; unchanged by a password change.
 - `secrets_fingerprint` (**control peers only**): SHA-256 of `salt` + the pipeline's secret values
   in a stable order, or `null` if the pipeline has none. It tells zm-api whether a running worker
   already has the secrets it would send. The salt is `secrets_salt` from the last configure (empty
@@ -143,9 +145,10 @@ Sent to every peer right after accept, before the cached HELLO/snapshot/keyframe
   `openvino`). Available decoders aren't reported yet.
 - `catalog_error`: present only if `manifest.json` couldn't be read.
 
-*Implemented 2026-09-14:* message type `0x14`, `zm/WorkerHello.{hpp,cpp}`, `WorkerLink::setWorkerHello`,
-zm-core sends it with `state: "running"` (configure doesn't exist yet). `commit` is taken when
-CMake configures, so it can lag a rebuild without reconfiguring.
+*Implemented 2026-09-14:* message type `0x14`, `zm/WorkerHello.{hpp,cpp}`, `WorkerLink::setWorkerHello`.
+zm-core rebuilds it on every state change; peers already connected see the change as a
+`worker_state` event. `commit` is taken when CMake configures, so it can lag a rebuild without
+reconfiguring.
 
 ### Plugin schemas
 
@@ -208,6 +211,24 @@ The worker:
 
 The same message rotates a password: configure again with a new `secrets` map.
 
+*Implemented 2026-09-14* (`zm/WorkerConfig.{hpp,cpp}`, `src/zm-core.cpp`), with these specifics:
+
+- `zm-core --socket <path> --monitor-id <id>` without `--pipeline` starts `unconfigured`.
+  `--pipeline <file|->` still starts `running`; a later configure replaces that pipeline.
+- The validator covers the keywords the plugin schemas use (`type`, `enum`, `minimum`, `maximum`,
+  `exclusiveMinimum`, `exclusiveMaximum`, `properties`, `required`, `additionalProperties`,
+  `items`); others are ignored. A plugin without a schema only has its `$secret` references checked.
+  Node keys are limited to `id`, `kind`, `cfg`/`config`, `children`, `queue_depth`; `path` is
+  rejected, so a control peer can't make the worker load an arbitrary library. Error messages never
+  include the rejected value.
+- Other failures: `message` `"apply_failed"` with `data.error` when the pipeline validates but a
+  plugin library won't load (state becomes `failed`), and `"stopping"` if a stop is in progress.
+- Events: `worker_state` `configuring` (reason `configure`), then `running` (reason `configured`)
+  or `failed` (reason = the error). They are enqueued before the Response.
+- Apply restarts the plugins in the same process; the socket and its clients stay connected. The
+  capture connection and pre-event buffer do not survive yet (Open questions).
+- `apply` accepts only `"restart"`.
+
 ### Secret redaction
 
 Core already sits on every plugin output path: the host `log` function, `publish_evt`, and
@@ -219,6 +240,16 @@ Core already sits on every plugin output path: the host `log` function, `publish
 This covers all plugins, including ones not written yet, and the MQTT, webhook and LLM keys. The
 per-call-site redaction in `capture_rtsp_multi` stays as a second layer.
 
+*Implemented 2026-09-14:* `zm/Redactor.{hpp,cpp}`, applied in the host `log` and `publish_evt`
+(`PluginManager.cpp`) and `WorkerLink::publishEventJson`. Registered values: every secret the
+pipeline holds by key name or reference, from configure or `--pipeline`, each in raw,
+percent-encoded and JSON-escaped form, replaced by `***`. Limits:
+
+- Values shorter than 4 characters are not matched in free text (replacing every `"1"` would
+  corrupt events). They still never reach the hello, and URL userinfo is still scrubbed.
+- Text written straight to stdout/stderr instead of through the host log is not filtered. Plugins
+  log through the host; the remaining source is libraries such as FFmpeg's own `av_log` output.
+
 ### Status
 
 EVENT frames, `StreamId::Monitor`. The detail is a JSON object: in the JSON detail TLV `0x10` for
@@ -227,8 +258,10 @@ zmc-compatible consumers already read them). Status codes, unlike `0x03xx` analy
 the on-connect snapshot.
 
 *Implemented 2026-09-14:* the `0x0101`/`0x0102`/`0x0105`/`0x0106`/`0x0402` rows, emitted by
-`capture_rtsp_multi` (`plugins/capture_rtsp_multi/reconnect_policy.hpp`), and the `0x0401`–`0x0403`
-constants and WorkerLink mapping. `connection_failed` also carries `attempt`; it is sent once per
+`capture_rtsp_multi` (`plugins/capture_rtsp_multi/reconnect_policy.hpp`), the `0x0401`–`0x0403`
+constants and WorkerLink mapping, and `0x0401` worker_state from zm-core (reasons `started`,
+`command_line`, `configure`, `configured`, or the apply error). A connecting client gets the latest
+worker_state and then the latest other status event, so one doesn't hide the other. `connection_failed` also carries `attempt`; it is sent once per
 outage and then at most once a minute.
 
 | Code | Name | When | Detail |
@@ -250,17 +283,19 @@ the network backoff would have made one every 1-30 s.
 
 ### Worker lifetime
 
-Workers must not live in zm-api's cgroup. zm-api starts each worker as its own transient systemd
-unit (`systemd-run --unit=zm-next-<id> --property=KillMode=control-group …`) or a template unit
-`zm-next@<id>.service`, outside systemd (macOS, containers) as its own session (`setsid`). On
-startup zm-api:
+zm-next is not a service of its own. zm-api spawns each worker as its child and is its only
+supervisor; a zm-api restart or upgrade restarts the workers, and recording pauses for that long.
+An earlier draft of this document proposed separate systemd units that outlive zm-api and are
+adopted on restart; that was dropped on 2026-09-14.
 
-1. connects to each monitor's socket;
-2. reads the worker hello; if `pipeline_hash` matches what it would send, adopts the worker;
-3. otherwise sends configure; a worker that does not answer within a timeout is stopped by unit (or
-   pid from a pidfile), never by `pkill` pattern.
+What the protocol still provides within that model:
 
-`kill_orphan_daemons()` then only removes workers for monitors that no longer use zm-next.
+- `pipeline_hash` and `secrets_fingerprint` let zm-api check that a running worker has the
+  configuration it expects (after a configure, or when a monitor's settings change) without
+  restarting it.
+- `configure` changes a running worker's pipeline in place, so a settings change no longer needs a
+  new process.
+- zm-api stops workers it spawned by pid (`stop` command, then a signal), not by `pkill` pattern.
 
 ### Exit codes
 
@@ -270,9 +305,12 @@ error. Fixed codes so a supervisor can decide whether a restart can help:
 | Code | Meaning | Restart? |
 |---|---|---|
 | 0 | stopped on request | no |
-| 64 | bad command line | no |
+| 64 | bad command line, or a `--pipeline` that doesn't parse or whose plugins don't load | no |
 | 69 | socket path unusable (permissions, in use) | after operator action |
 | 70 | internal error / crash | yes, with backoff |
+
+*Implemented 2026-09-14.* Unknown command-line arguments are now an error (64) instead of being
+ignored. A crash by signal still shows as a signal, not 70.
 
 ## Migration
 
@@ -288,7 +326,7 @@ error. Fixed codes so a supervisor can decide whether a restart can help:
 - read the worker hello; validate graphs against schemas; drop `KNOWN_KINDS`;
 - send `configure` instead of stdin, falling back to `--pipeline -` when no hello arrives (older zm-next);
 - surface `worker_state`, `stream_auth_failed`, `worker_degraded` in the API and UI;
-- spawn workers outside its cgroup and adopt them on restart.
+- stop workers by the pid it spawned, not by `pkill` pattern.
 
 **Phase 3:** hot reconfigure for plugins that support it; remove the stdin path.
 
@@ -300,8 +338,8 @@ error. Fixed codes so a supervisor can decide whether a restart can help:
 - zm-api's CI replays the transcripts against its client and runs its generated graphs through
   schema validation. zm-next's CI runs the same graphs through a real `zm-core` against a
   password-protected test camera.
-- Integration (see the ZoneMinder-install CI discussion): restart zm-api while a zm-next monitor
-  records; the clip must have no gap longer than the restart itself.
+- Integration (see the ZoneMinder-install CI discussion): reconfigure a recording zm-next monitor
+  through zm-api; the socket stays connected and recording resumes without a new worker process.
 
 ## ZoneMinder upstream
 

@@ -178,6 +178,7 @@ private:
     uint32_t sequence_[2]{0, 0};     // per-stream media counter, indexed by wire StreamId (Video, Audio)
     uint32_t generation_{0};
     MessagePtr snapshot_;            // current-status EVENT, replayed on connect
+    MessagePtr worker_state_;        // latest worker_state EVENT, replayed on connect before snapshot_
     // Cached HELLOs (per stream) + the most recent keyframe, replayed to each
     // new consumer on connect so it can init its decoder and render immediately
     // without waiting for the next generation bump / GOP.

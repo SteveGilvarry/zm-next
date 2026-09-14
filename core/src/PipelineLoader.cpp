@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 #include "zm/platform.hpp"
 #include <fstream>
+#include <iterator>
 
 
 using namespace zm;
@@ -19,21 +20,34 @@ PipelineLoader::PipelineLoader(const std::string& path)
 PipelineLoader::~PipelineLoader() {}
 
 bool PipelineLoader::load() {
-    pipeline_.clear();
     try {
         // "-" reads the pipeline from stdin: zm-api delivers it in memory so the
         // camera credentials inside never touch disk.
-        nlohmann::json root;
+        // Read one JSON value, not to EOF: the writer may keep the pipe open.
+        std::string text;
         if (path_ == "-") {
+            nlohmann::json root;
             std::cin >> root;
+            text = root.dump();
         } else {
             std::ifstream f(path_);
             if (!f) {
                 std::cerr << "Cannot open file: " << path_ << std::endl;
                 return false;
             }
-            f >> root;
+            text.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
         }
+        return loadText(text);
+    } catch (const std::exception& e) {
+        std::cerr << "Exception reading pipeline " << path_ << ": " << e.what() << std::endl;
+        return false;
+    }
+}
+
+bool PipelineLoader::loadText(const std::string& json_text) {
+    pipeline_.clear();
+    try {
+        nlohmann::json root = nlohmann::json::parse(json_text);
         if (!root.is_object()) {
             std::cerr << "JSON root is not an object in " << path_ << std::endl;
             return false;
@@ -61,8 +75,8 @@ bool PipelineLoader::load() {
             if (plugin.contains("path")) {
                 pcfg.path = plugin["path"].get<std::string>();
             } else if (plugin.contains("kind")) {
-                // Use build/plugins/ as the plugin path when running from build dir
-                pcfg.path = std::string("plugins/") + plugin["kind"].get<std::string>() + "/" + plugin["kind"].get<std::string>() + ZM_PLUGIN_EXT;
+                const auto kind = plugin["kind"].get<std::string>();
+                pcfg.path = plugins_dir() + "/" + kind + "/" + kind + ZM_PLUGIN_EXT;
             }
             if (plugin.contains("config"))
                 pcfg.config_json = plugin["config"].dump();

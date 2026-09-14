@@ -44,11 +44,13 @@ subdirs. Tests use GoogleTest, fetched automatically via CMake `FetchContent`.
 ### Running the engine
 
 ```bash
-# Run from the build/ directory — plugin paths are resolved relative to CWD as
-# plugins/<kind>/<kind>.dylib (see path resolution note below).
+# Plugins resolve as <dir of zm-core>/plugins/<kind>/<kind>.dylib (falling back to
+# ./plugins when that directory doesn't exist), so any working directory works.
 cd build
 ./zm-core --pipeline ../pipelines/e2e_file_cascade.template.json --socket /tmp/zm.sock --monitor-id 1
 ./wl_dump /tmp/zm.sock 7                      # watch Hello/Media/Event on the worker socket
+./zm-core --socket /tmp/zm.sock --monitor-id 1  # no pipeline: starts unconfigured, waits for
+./wl_dump /tmp/zm.sock 3 '{"cmd":"configure","request_id":1,"pipeline":{...},"secrets":{...}}'  # this
 ./zm-core --pipelines-dir ../pipelines        # picks first .json found
 ```
 
@@ -81,8 +83,9 @@ Plugin logging/event helpers (`zm_plugin_log_info`, `ZM_LOG_*` C++ macros, `zm_p
   has no DB connection). JSON uses a recursive
   tree of plugin nodes, each with `id`, `kind` (or explicit `path`), `cfg` (or `config`), and `children`;
   the loader **flattens** this tree into an ordered `vector<PluginConfig>`. When `kind` is given (not an
-  explicit `path`), the `.so`/`.dylib` is resolved as `plugins/<kind>/<kind><ext>` **relative to the
-  working directory** — hence run `zm-core` from `build/`.
+  explicit `path`), the `.so`/`.dylib` is resolved as `plugins/<kind>/<kind><ext>` next to the
+  executable (`zm::plugins_dir()` in `core/src/platform.cpp`), or relative to the working directory
+  if there's no `plugins/` beside the binary.
 - **PluginManager** — `dlopen`s each plugin, calls `zm_plugin_init`, owns the `ShmRing` and
   `CaptureThread`, and drives `startAll()` / `stopAll()`.
 - **CaptureThread** — runs the input plugin, pushes captured frames into a `ShmRing`, and fans them out
@@ -92,6 +95,10 @@ Plugin logging/event helpers (`zm_plugin_log_info`, `ZM_LOG_*` C++ macros, `zm_p
 - **EventBus** — thread-safe in-process singleton pub/sub (`EventBus::instance()`) for metadata events.
 - **WorkerLink** (`core/src/WorkerLink.cpp`) — the per-monitor Unix-socket server speaking the canonical
   stream-socket protocol (`core/src/stream_socket_protocol.cpp`): media + EVENT push, optional control.
+- **WorkerHello / WorkerConfig / Redactor** — the control session in `docs/Worker_Control_Protocol.md`:
+  the hello (0x14) and plugin catalog, `configure` validation against `plugins/<kind>/<kind>.schema.json`
+  with `$secret` resolution, and the secret filter on host log, `publish_evt` and the worker link.
+  Adding or renaming a plugin config key means updating its schema (`PluginSchemaCheck` fails otherwise).
 
 ### Plugins (`plugins/`, each builds a `SHARED`/`MODULE` lib with `PREFIX ""`)
 

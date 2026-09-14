@@ -32,6 +32,9 @@ add_library(zmcore STATIC
     src/plugin_utils.cpp
     src/WorkerLink.cpp
     src/WorkerHello.cpp
+    src/WorkerConfig.cpp
+    src/Redactor.cpp
+    src/platform.cpp
 )
 
 target_include_directories(zmcore PUBLIC include)
@@ -72,6 +75,11 @@ add_test(NAME PluginManagerTest COMMAND $<TARGET_FILE:test_plugin_manager>)
 add_executable(test_worker_hello tests/test_worker_hello.cpp)
 target_link_libraries(test_worker_hello PRIVATE zmcore nlohmann_json::nlohmann_json GTest::gtest_main Threads::Threads)
 add_test(NAME WorkerHelloTest COMMAND $<TARGET_FILE:test_worker_hello>)
+
+# Configure: schema validation, $secret resolution, redaction
+add_executable(test_worker_config tests/test_worker_config.cpp)
+target_link_libraries(test_worker_config PRIVATE zmcore nlohmann_json::nlohmann_json GTest::gtest_main Threads::Threads)
+add_test(NAME WorkerConfigTest COMMAND $<TARGET_FILE:test_worker_config>)
 
 # Unit tests for PipelineLoader
 add_executable(test_pipeloader tests/test_pipeloader.cpp)

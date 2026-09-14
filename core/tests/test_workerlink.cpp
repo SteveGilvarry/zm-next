@@ -638,6 +638,34 @@ TEST(WorkerLinkTest, StreamAuthFailedIsJsonStatusAndSnapshot) {
     link.stop();
 }
 
+// worker_state and stream health are replayed side by side: publishing one must
+// not hide the other from a client that connects later.
+TEST(WorkerLinkTest, WorkerStateAndHealthBothReplayedOnConnect) {
+    const std::string path = temp_socket_path(966);
+    zm::WorkerLink link(/*monitor_id=*/19, path);
+    ASSERT_TRUE(link.start());
+
+    link.publishEventJson(R"({"type":"connection_failed","stream_id":0,"error":"no such file"})");
+    link.publishEventJson(R"({"type":"worker_state","state":"running","reason":"configured","pipeline_hash":null})");
+    link.publishEventJson(R"({"type":"detection","detections":[]})");
+
+    int fd = connect_client(path);
+    ASSERT_GE(fd, 0);
+    ASSERT_TRUE(wait_readable(fd, 2000));
+    std::vector<uint16_t> codes;
+    ss::Header h;
+    std::vector<uint8_t> body;
+    for (int i = 0; i < 2 && read_msg(fd, h, &body); ++i) {
+        ss::MonitorEvent ev;
+        ASSERT_TRUE(ss::ParseEvent(body.data(), body.size(), ev));
+        codes.push_back(ev.code);
+    }
+    EXPECT_EQ(codes, (std::vector<uint16_t>{ss::kEventWorkerState, ss::kEventConnectionFailed}));
+
+    ::close(fd);
+    link.stop();
+}
+
 // A peer whose uid is not a control uid still gets events, but its Commands are
 // answered "forbidden" without reaching the handler and its Talkback is dropped.
 TEST(WorkerLinkTest, ObserverCannotCommandOrTalk) {

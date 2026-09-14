@@ -58,7 +58,11 @@ int main(int argc, char** argv) {
             std::cerr << "failed to send command\n";
             return 1;
         }
-        std::cout << "COMMAND sent " << command << "\n";
+        // A configure carries secrets: name it without echoing the body.
+        if (command.find("\"secrets\"") != std::string::npos)
+            std::cout << "COMMAND sent (" << command.size() << " bytes, contains secrets)\n";
+        else
+            std::cout << "COMMAND sent " << command << "\n";
     }
 
     std::string buf;

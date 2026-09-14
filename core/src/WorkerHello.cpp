@@ -118,19 +118,30 @@ Catalog load_catalog(const std::string& plugins_dir) {
 }
 
 json redact_pipeline(const json& pipeline, const Catalog& catalog,
-                     std::vector<std::pair<std::string, std::string>>* secrets) {
+                     std::vector<std::pair<std::string, std::string>>* secrets, const SecretPaths* extra) {
     json copy = pipeline;
     if (copy.is_object() && copy.contains("plugins")) redact_nodes(copy["plugins"], catalog, "/plugins", secrets);
+    if (extra) {
+        for (const auto& pointer : *extra) {
+            const json::json_pointer ptr(pointer);
+            if (!copy.contains(ptr)) continue;
+            json& v = copy[ptr];
+            if (v.is_string() && v.get<std::string>() == "<secret>") continue;  // already taken by key name
+            if (secrets) secrets->emplace_back(pointer, v.is_string() ? v.get<std::string>() : v.dump());
+            v = "<secret>";
+        }
+    }
     return copy;
 }
 
-std::string pipeline_hash(const json& pipeline, const Catalog& catalog) {
-    return "sha256:" + Sha256::hex(redact_pipeline(pipeline, catalog).dump());
+std::string pipeline_hash(const json& pipeline, const Catalog& catalog, const SecretPaths* extra) {
+    return "sha256:" + Sha256::hex(redact_pipeline(pipeline, catalog, nullptr, extra).dump());
 }
 
-std::string secrets_fingerprint(const json& pipeline, const Catalog& catalog, const std::string& salt) {
+std::string secrets_fingerprint(const json& pipeline, const Catalog& catalog, const std::string& salt,
+                                const SecretPaths* extra) {
     std::vector<std::pair<std::string, std::string>> secrets;
-    redact_pipeline(pipeline, catalog, &secrets);
+    redact_pipeline(pipeline, catalog, &secrets, extra);
     if (secrets.empty()) return "";
     std::sort(secrets.begin(), secrets.end());
     json list = json::array();
@@ -138,7 +149,8 @@ std::string secrets_fingerprint(const json& pipeline, const Catalog& catalog, co
     return "sha256:" + Sha256::hex(salt + list.dump());
 }
 
-json hello_public(const HelloFacts& facts, const Catalog& catalog, const json* pipeline) {
+json hello_public(const HelloFacts& facts, const Catalog& catalog, const json* pipeline,
+                  const SecretPaths* extra) {
     json plugins = json::array();
     for (const auto& p : catalog.plugins) {
         json entry = {{"kind", p.kind}};
@@ -154,18 +166,19 @@ json hello_public(const HelloFacts& facts, const Catalog& catalog, const json* p
         {"plugins", std::move(plugins)},
         {"hw", {{"backends", facts.hw_backends}}},
     };
-    hello["pipeline_hash"] = pipeline ? json(pipeline_hash(*pipeline, catalog)) : json(nullptr);
+    hello["pipeline_hash"] = pipeline ? json(pipeline_hash(*pipeline, catalog, extra)) : json(nullptr);
     if (!catalog.error.empty()) hello["catalog_error"] = catalog.error;
     return hello;
 }
 
-json hello_control_extra(const Catalog& catalog, const json* pipeline, const std::string& salt) {
-    json extra = json::object();
+json hello_control_extra(const Catalog& catalog, const json* pipeline, const std::string& salt,
+                         const SecretPaths* extra) {
+    json out = json::object();
     if (pipeline) {
-        const std::string fp = secrets_fingerprint(*pipeline, catalog, salt);
-        extra["secrets_fingerprint"] = fp.empty() ? json(nullptr) : json(fp);
+        const std::string fp = secrets_fingerprint(*pipeline, catalog, salt, extra);
+        out["secrets_fingerprint"] = fp.empty() ? json(nullptr) : json(fp);
     }
-    return extra;
+    return out;
 }
 
 json describe_plugins(const Catalog& catalog, const std::vector<std::string>& kinds) {

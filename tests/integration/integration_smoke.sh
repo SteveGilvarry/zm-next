@@ -215,6 +215,41 @@ PF=$(find "$WORK/plates708" -name 'plate-*.jpg' -type f 2>/dev/null | head -1)
                                                        || fail "plate not a valid image"
 
 # ---------------------------------------------------------------------------
+echo "[9] unconfigured start + configure over the socket"
+# docs/Worker_Control_Protocol.md "Configure": no --pipeline, the pipeline and its
+# secrets arrive as a command; a rejected configure changes nothing; the secret
+# never reaches the log or the socket; stop exits 0.
+SECRET="smoke-Secret-9f3"
+"$ZMCORE" --socket "$WORK/s709.sock" --monitor-id 709 >"$WORK/c709.log" 2>&1 &
+WPID=$!; PIDS+=("$WPID")
+if wait_sock "$WORK/s709.sock"; then
+  "$WLDUMP" "$WORK/s709.sock" 1 >"$WORK/wl709a.log" 2>&1
+  grep -q '"state":"unconfigured"' "$WORK/wl709a.log" && pass "hello says unconfigured" || fail "no unconfigured hello"
+  "$WLDUMP" "$WORK/s709.sock" 1 '{"cmd":"configure","request_id":1,"pipeline":{"plugins":[{"kind":"store","cfg":{"mode":"sometimes"}}]}}' \
+    >"$WORK/wl709b.log" 2>&1
+  grep -q '"message":"invalid_config"' "$WORK/wl709b.log" && grep -q 'plugins\[0\].cfg.mode' "$WORK/wl709b.log" \
+    && pass "invalid configure rejected with path" || fail "invalid configure not rejected"
+  CFG=$(cat <<JSON
+{"cmd":"configure","request_id":2,"secrets":{"mq":"$SECRET"},"secrets_salt":"s","pipeline":{"plugins":[
+ {"id":"cap","kind":"capture_file","cfg":{"path":"$WORK/h264.mp4","stream_id":0,"loop":true,"realtime":true},
+  "children":[
+   {"id":"mq","kind":"output_mqtt","cfg":{"host":"127.0.0.1","port":1,"username":{"\$secret":"mq"},"password":{"\$secret":"mq"}}},
+   {"id":"st","kind":"store","cfg":{"mode":"continuous","root":"$WORK/cfg_rec","monitor_id":709},"queue_depth":120}]}]}}
+JSON
+)
+  "$WLDUMP" "$WORK/s709.sock" 3 "$CFG" >"$WORK/wl709c.log" 2>&1
+  grep -q '"message":"configured","ok":true' "$WORK/wl709c.log" && pass "configure accepted" || fail "configure not accepted"
+  grep -q '"state":"running"' "$WORK/wl709c.log" && pass "worker_state running published" || fail "no worker_state running"
+  grep -q "^MEDIA" "$WORK/wl709c.log" && pass "media flows after configure" || fail "no media after configure"
+  "$WLDUMP" "$WORK/s709.sock" 1 '{"cmd":"stop","request_id":3}' >/dev/null 2>&1
+  wait $WPID; RC=$?
+  [ "$RC" = "0" ] && pass "stop exits 0" || fail "stop exit code $RC"
+  [ -n "$(rec_file "$WORK/cfg_rec")" ] && pass "configured pipeline recorded" || fail "no recording from configured pipeline"
+  if grep -q "$SECRET" "$WORK"/c709.log "$WORK"/wl709*.log; then fail "secret leaked to log or socket"
+  else pass "secret absent from log and socket"; fi
+else fail "unconfigured worker socket never came up"; fi
+
+# ---------------------------------------------------------------------------
 echo "----------------------------------------"
 if [ "$fails" -eq 0 ]; then echo "INTEGRATION SMOKE: ALL PASS"; exit 0
 else echo "INTEGRATION SMOKE: $fails FAILURE(S)"; exit 1; fi

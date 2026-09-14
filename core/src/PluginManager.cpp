@@ -4,6 +4,7 @@
 #include "zm/PluginManager.hpp"
 #include "zm_plugin.h"
 #include "zm/EventBus.hpp"
+#include "zm/Redactor.hpp"
 #include "zm/StageRunner.hpp"
 #include <dlfcn.h>
 #include <iostream>
@@ -16,7 +17,8 @@ extern "C" void host_log(void* /*host_ctx*/, zm_log_level_t level, const char* m
     if (level == ZM_LOG_DEBUG) lvl = "DEBUG";
     else if (level == ZM_LOG_WARN) lvl = "WARN";
     else if (level == ZM_LOG_ERROR) lvl = "ERROR";
-    std::cout << "[PLUGIN][" << lvl << "] " << (msg ? msg : "(null)") << std::endl;
+    std::cout << "[PLUGIN][" << lvl << "] "
+              << (msg ? zm::Redactor::instance().apply(msg) : std::string("(null)")) << std::endl;
 }
 // Routes a plugin's output frame to its downstream stages. host_ctx is the
 // plugin's StageRunner; forwarding copies the frame into each child stage's
@@ -43,11 +45,16 @@ extern "C" void host_unsubscribe_evt(void* /*host_ctx*/, void* handle) {
         static_cast<zm::EventBus::SubscriptionId>(reinterpret_cast<uintptr_t>(handle)));
 }
 
+// Plugin events pass the redactor before any subscriber (other plugins, the
+// worker link) sees them.
+extern "C" void host_publish_evt(void* /*host_ctx*/, const char* json_event) {
+    if (!json_event) return;
+    zm::EventBus::instance().publish("plugin_event", zm::Redactor::instance().apply(json_event));
+}
+
 zm_host_api_t gHost = {
     /* log */ host_log,
-    /* publish_evt */ [](void* host_ctx, const char* json_event) -> void {
-        zm::EventBus::instance().publish("plugin_event", json_event);
-    },
+    /* publish_evt */ host_publish_evt,
     /* on_frame        */ chain_on_frame,
     /* subscribe_evt   */ host_subscribe_evt,
     /* unsubscribe_evt */ host_unsubscribe_evt,
@@ -56,12 +63,7 @@ zm_host_api_t gHost = {
 
 namespace zm {
 
-PluginManager::PluginManager() {
-    // Set up global host API for plugins (log and on_frame can be set elsewhere)
-    gHost.publish_evt = [](void* host_ctx, const char* json_event) -> void {
-        zm::EventBus::instance().publish("plugin_event", json_event);
-    };
-}
+PluginManager::PluginManager() {}
 
 PluginManager::~PluginManager() {
     for (auto &handle : handles_) {
