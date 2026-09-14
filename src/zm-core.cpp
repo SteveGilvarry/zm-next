@@ -11,6 +11,8 @@
 #include <chrono>
 #include <atomic>
 #include <csignal>
+#include <unistd.h>
+#include <vector>
 
 using namespace zm;
 namespace fs = std::filesystem;
@@ -33,6 +35,9 @@ void print_usage(const char* prog) {
     std::cout << "Options:\n";
     std::cout << "  --socket <path>      Unix socket for the worker link (media+events+control)\n";
     std::cout << "  --monitor-id <id>    Monitor id for this worker (per-monitor socket)\n";
+    std::cout << "  --control-uid <uid>  Also accept commands from this uid (repeatable; e.g. zm-api's\n"
+                 "                       service user). This process's own uid is always accepted;\n"
+                 "                       other peers may read media and events only.\n";
 }
 
 int main(int argc, char** argv) {
@@ -40,12 +45,21 @@ int main(int argc, char** argv) {
     std::string pipelinesDir;
     std::string socketPath;
     int64_t monitorId = 0;
+    std::vector<uint32_t> controlUids;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--pipeline" && i + 1 < argc) pipelineFile = argv[++i];
         else if (arg == "--pipelines-dir" && i + 1 < argc) pipelinesDir = argv[++i];
         else if (arg == "--socket" && i + 1 < argc) socketPath = argv[++i];
         else if (arg == "--monitor-id" && i + 1 < argc) monitorId = std::stoll(argv[++i]);
+        else if (arg == "--control-uid" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (v.empty() || v.find_first_not_of("0123456789") != std::string::npos) {
+                std::cerr << "--control-uid needs a numeric uid, got '" << v << "'" << std::endl;
+                return 1;
+            }
+            controlUids.push_back(static_cast<uint32_t>(std::stoul(v)));
+        }
         else if (arg == "-h" || arg == "--help") { print_usage(argv[0]); return 0; }
     }
     if (pipelineFile.empty() && pipelinesDir.empty()) {
@@ -93,7 +107,12 @@ int main(int argc, char** argv) {
     // (push) and control (pull) to the orchestrating local zm-api.
     std::unique_ptr<WorkerLink> link;
     if (!socketPath.empty()) {
-        link = std::make_unique<WorkerLink>(static_cast<uint32_t>(monitorId), socketPath);
+        WorkerLink::Config linkCfg;
+        if (!controlUids.empty()) {
+            linkCfg.control_uids = controlUids;
+            linkCfg.control_uids.push_back(static_cast<uint32_t>(::geteuid()));
+        }
+        link = std::make_unique<WorkerLink>(static_cast<uint32_t>(monitorId), socketPath, linkCfg);
         link->setCommandHandler([&pm](const std::string& name, const std::string& args)
                                     -> WorkerLink::CommandResult {
             (void)args;

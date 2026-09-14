@@ -35,7 +35,11 @@ class WorkerLink {
 public:
     struct Config {
         std::string group;                 // socket group for chmod 0660; empty = leave default
-        std::vector<uint32_t> allowed_uids;// empty = allow all (filesystem perms still apply)
+        // Peers allowed to control the worker (Command, Talkback), checked by kernel
+        // peer credentials (SO_PEERCRED / getpeereid). Empty = only this process's
+        // own euid. Any other peer the socket's file mode admits is an observer: it
+        // gets media and events, and its Commands are answered "forbidden".
+        std::vector<uint32_t> control_uids;
         size_t max_clients = 8;
         size_t queue_max_bytes = 8 * 1024 * 1024;
         size_t queue_max_msgs = 256;
@@ -123,8 +127,8 @@ private:
         bool want_events = true;     // events on by default until a Subscribe arrives
         bool dead = false;           // marked on fatal I/O; reaped after iteration
         std::string inbuf;           // partial inbound wire unit
-        uint32_t uid = 0;
-        uint32_t pid = 0;
+        uint32_t uid = 0;            // peer uid from kernel credentials
+        bool control = false;        // uid is in control_uids (see Config)
     };
 
     void runLoop();

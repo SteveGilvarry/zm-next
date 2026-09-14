@@ -638,6 +638,81 @@ TEST(WorkerLinkTest, StreamAuthFailedIsJsonStatusAndSnapshot) {
     link.stop();
 }
 
+// A peer whose uid is not a control uid still gets events, but its Commands are
+// answered "forbidden" without reaching the handler and its Talkback is dropped.
+TEST(WorkerLinkTest, ObserverCannotCommandOrTalk) {
+    const std::string path = temp_socket_path(960);
+    zm::WorkerLink::Config cfg;
+    cfg.control_uids = {static_cast<uint32_t>(::geteuid()) + 4242};  // not us
+    zm::WorkerLink link(/*monitor_id=*/18, path, cfg);
+    std::atomic<int> commands{0}, talkback{0};
+    link.setCommandHandler([&](const std::string&, const std::string&) {
+        commands++;
+        return zm::WorkerLink::CommandResult{true, "ran", ""};
+    });
+    link.setTalkbackHandler([&](uint32_t, int64_t, const std::string&) { talkback++; });
+    ASSERT_TRUE(link.start());
+
+    int client = connect_client(path);
+    ASSERT_GE(client, 0);
+    write_msg(client, ss::MessageType::Talkback, ss::StreamId::Audio, 0, std::string("\x56\x56\x00\x00audio", 9));
+    write_msg(client, ss::MessageType::Command, ss::StreamId::Monitor, 0,
+              R"({"cmd":"stop","request_id":9})");
+
+    bool gotForbidden = false;
+    for (int i = 0; i < 10 && !gotForbidden; ++i) {
+        ASSERT_TRUE(wait_readable(client, 2000));
+        ss::Header h;
+        std::vector<uint8_t> body;
+        ASSERT_TRUE(read_msg(client, h, &body));
+        if (h.type != static_cast<uint8_t>(ss::MessageType::Response)) continue;
+        json resp = json::parse(body.begin(), body.end());
+        EXPECT_EQ(resp["request_id"], 9);
+        EXPECT_FALSE(resp["ok"]);
+        EXPECT_EQ(resp["message"], "forbidden");
+        gotForbidden = true;
+    }
+    EXPECT_TRUE(gotForbidden);
+    EXPECT_EQ(commands.load(), 0);
+    EXPECT_EQ(talkback.load(), 0);
+
+    // Still an observer of events.
+    link.publishEventJson(R"({"type":"motion","pixels":7})");
+    ASSERT_TRUE(wait_readable(client, 2000));
+    ss::Header h;
+    std::vector<uint8_t> body;
+    ASSERT_TRUE(read_msg(client, h, &body));
+    EXPECT_EQ(h.type, static_cast<uint8_t>(ss::MessageType::Event));
+
+    ::close(client);
+    link.stop();
+}
+
+// The default (no control_uids) accepts this process's own uid, which is what
+// every other test in this file relies on; make that explicit.
+TEST(WorkerLinkTest, OwnUidIsControlByDefault) {
+    const std::string path = temp_socket_path(955);
+    zm::WorkerLink link(/*monitor_id=*/19, path);
+    std::atomic<int> commands{0};
+    link.setCommandHandler([&](const std::string&, const std::string&) {
+        commands++;
+        return zm::WorkerLink::CommandResult{true, "ran", ""};
+    });
+    ASSERT_TRUE(link.start());
+    int client = connect_client(path);
+    ASSERT_GE(client, 0);
+    write_msg(client, ss::MessageType::Command, ss::StreamId::Monitor, 0, R"({"name":"status","request_id":1})");
+    ASSERT_TRUE(wait_readable(client, 2000));
+    ss::Header h;
+    std::vector<uint8_t> body;
+    ASSERT_TRUE(read_msg(client, h, &body));
+    ASSERT_EQ(h.type, static_cast<uint8_t>(ss::MessageType::Response));
+    EXPECT_TRUE(json::parse(body.begin(), body.end())["ok"]);
+    EXPECT_EQ(commands.load(), 1);
+    ::close(client);
+    link.stop();
+}
+
 TEST(WorkerLinkTest, PeriodicStats) {
     const std::string path = temp_socket_path();
     zm::WorkerLink::Config cfg;

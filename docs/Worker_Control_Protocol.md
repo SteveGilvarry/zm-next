@@ -99,6 +99,10 @@ On accept, zm-core reads the peer's uid with `SO_PEERCRED` (Linux) / `getpeereid
 
 The socket stays `0660`; the uid check is what separates observing from controlling.
 
+*Implemented 2026-09-14:* `WorkerLink::Config::control_uids` (empty = own euid) and
+`zm-core --control-uid <uid>` (repeatable; own euid always included). A peer whose uid can't be read
+is an observer. Configure doesn't exist yet, so today this gates Command and Talkback.
+
 ### Worker hello
 
 Sent to every peer right after accept, before the cached HELLO/snapshot/keyframe replay.

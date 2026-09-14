@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/un.h>
 #include <sys/uio.h>
 #include <sys/stat.h>
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <ctime>
 #include <chrono>
+#include <algorithm>
 #include <iostream>
 
 namespace zm {
@@ -105,6 +107,23 @@ bool carries_json_detail(uint16_t code) {
 // on-connect snapshot; analysis events (0x03xx) are a stream of happenings.
 bool is_status_code(uint16_t code) {
     return code != 0 && code != ss::kEventSnapshot && (code & 0xFF00) != 0x0300;
+}
+
+// The connecting process's uid from kernel credentials; false if unavailable.
+bool peer_uid(int fd, uint32_t& uid) {
+#if defined(__linux__)
+    ucred cred{};
+    socklen_t len = sizeof(cred);
+    if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) return false;
+    uid = static_cast<uint32_t>(cred.uid);
+    return true;
+#else
+    uid_t u = 0;
+    gid_t g = 0;
+    if (::getpeereid(fd, &u, &g) != 0) return false;
+    uid = static_cast<uint32_t>(u);
+    return true;
+#endif
 }
 
 } // namespace
@@ -357,6 +376,14 @@ void WorkerLink::acceptClient() {
     }
     Client c;
     c.fd = cfd;
+    // Control is decided once, from kernel credentials, when the peer connects.
+    // A peer whose uid can't be read is an observer.
+    if (peer_uid(cfd, c.uid)) {
+        const auto& allowed = cfg_.control_uids;
+        c.control = allowed.empty()
+                        ? c.uid == static_cast<uint32_t>(::geteuid())
+                        : std::find(allowed.begin(), allowed.end(), c.uid) != allowed.end();
+    }
     // Canonical consumers (zm-api, zmc-style) send no client->server messages, so
     // fan out everything by default; the optional Subscribe extension can narrow
     // it later. New consumers get HELLO(s), then the current-status snapshot, then
@@ -427,10 +454,13 @@ void WorkerLink::onClientReadable(Client& c) {
                 }
                 // Run the handler after runLoop drops mutex_ (see deferred_), then
                 // queue the Response for this client if it is still connected.
-                deferred_.push_back([this, fd = c.fd, valid, name, request_id,
+                // Observers are answered "forbidden" and never reach the handler.
+                deferred_.push_back([this, fd = c.fd, valid, control = c.control, name, request_id,
                                      raw = std::string(body, payload_len)] {
                     CommandResult r{false, "bad command", ""};
-                    if (valid) {
+                    if (!control) {
+                        r = {false, "forbidden", ""};
+                    } else if (valid) {
                         if (handler_) r = handler_(name, raw);
                         else r = {false, "no command handler", ""};
                     }
@@ -452,8 +482,9 @@ void WorkerLink::onClientReadable(Client& c) {
             }
             case ss::MessageType::Talkback: {
                 // Payload = [u32 codec_le][raw audio]; pts in the header. Deferred
-                // like commands: the handler may publish events.
-                if (talkbackHandler_ && payload_len >= 4) {
+                // like commands: the handler may publish events. Observers can't
+                // talk through the camera speaker; their audio is dropped.
+                if (talkbackHandler_ && c.control && payload_len >= 4) {
                     uint32_t codec = get_u32_le(reinterpret_cast<const uint8_t*>(body));
                     deferred_.push_back([this, codec, pts = static_cast<int64_t>(h.pts_us),
                                          data = std::string(body + 4, payload_len - 4)] {
