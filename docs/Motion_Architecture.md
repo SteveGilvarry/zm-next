@@ -123,15 +123,18 @@ Frame Input → Zones Plugin → Motion Algorithm Plugin → Output Plugin
 }
 ```
 
-## 📊 **Performance Improvements**
+## 📊 **Expected Improvements (not measured)**
 
-| Metric | Old Architecture | New Architecture | Improvement |
+These are design expectations, not benchmark results; no measurement behind them exists in the
+repository history. Measured numbers live in [Performance.md](Performance.md).
+
+| Metric | Old Architecture | New Architecture | Expected |
 |--------|-----------------|------------------|-------------|
-| Zone Processing | O(n) linear scan | O(log n) R-tree | 10-100x faster |
-| Memory Usage | Monolithic buffers | Optimized per-plugin | 30-50% reduction |
-| SIMD Utilization | Basic vectorization | Advanced xsimd | 2-4x faster |
-| Code Modularity | Monolithic | Clean separation | ∞% better |
-| Algorithm Flexibility | Fixed | Pluggable | Unlimited |
+| Zone Processing | O(n) linear scan | O(log n) R-tree | faster with many zones |
+| Memory Usage | Monolithic buffers | Per-plugin buffers | lower, unmeasured |
+| SIMD Utilization | Basic vectorization | xsimd | faster pixel diff, unmeasured |
+| Code Modularity | Monolithic | Clean separation | — |
+| Algorithm Flexibility | Fixed | Pluggable | — |
 
 ## 🚀 **Migration from Old Plugins**
 
