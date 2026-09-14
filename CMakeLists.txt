@@ -35,6 +35,9 @@ if(CMAKE_TOOLCHAIN_FILE AND EXISTS "${CMAKE_TOOLCHAIN_FILE}")
 else()
     message(STATUS "vcpkg not found; using system/Homebrew packages (vcpkg is only needed for e.g. a VAAPI FFmpeg on Linux).")
 endif()
+# One macOS SDK for compiler, linker and find modules; follows xcode-select /
+# DEVELOPER_DIR and re-configures when the SDK changes. Must precede project().
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/AppleSdk.cmake)
 project(zm-next-core LANGUAGES CXX)
 
 # ========================================

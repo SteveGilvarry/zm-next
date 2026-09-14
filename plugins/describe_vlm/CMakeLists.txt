@@ -3,7 +3,6 @@ project(describe_vlm LANGUAGES CXX)
 
 # Dependencies
 find_package(nlohmann_json REQUIRED)
-find_package(CURL REQUIRED)
 
 # Use FFmpeg settings from parent (cached vars set in the top-level CMakeLists).
 include_directories(${ZM_FFMPEG_INCLUDES})
@@ -33,7 +32,6 @@ target_link_libraries(describe_vlm PRIVATE
     ${ZM_FFMPEG_LIBS}
     ${SWSCALE_LIBRARIES}
     zmcore
-    CURL::libcurl
     nlohmann_json::nlohmann_json
 )
 
@@ -50,3 +48,6 @@ target_compile_options(describe_vlm PRIVATE "-fvisibility=hidden")
 
 # Unit tests for the pure helpers.
 add_subdirectory(tests)
+
+# System curl: -lcurl from the pinned macOS SDK, CURL::libcurl elsewhere (cmake/AppleSdk.cmake).
+zm_link_system_curl(describe_vlm)

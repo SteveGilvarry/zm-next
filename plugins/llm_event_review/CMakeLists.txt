@@ -3,7 +3,6 @@ project(llm_event_review LANGUAGES CXX)
 
 # Dependencies
 find_package(nlohmann_json REQUIRED)
-find_package(CURL REQUIRED)
 
 # Use FFmpeg settings from parent (cached vars set in the top-level CMakeLists).
 include_directories(${ZM_FFMPEG_INCLUDES})
@@ -34,7 +33,6 @@ target_link_libraries(llm_event_review PRIVATE
     ${ZM_FFMPEG_LIBS}
     ${SWSCALE_LIBRARIES}
     zmcore
-    CURL::libcurl
     nlohmann_json::nlohmann_json
 )
 
@@ -48,3 +46,6 @@ set_target_properties(llm_event_review PROPERTIES
 )
 
 target_compile_options(llm_event_review PRIVATE "-fvisibility=hidden")
+
+# System curl: -lcurl from the pinned macOS SDK, CURL::libcurl elsewhere (cmake/AppleSdk.cmake).
+zm_link_system_curl(llm_event_review)

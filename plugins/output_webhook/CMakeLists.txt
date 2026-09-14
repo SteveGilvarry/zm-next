@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(output_webhook LANGUAGES CXX)
 
-find_package(CURL REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
 if(APPLE)
@@ -18,7 +17,6 @@ target_include_directories(output_webhook PRIVATE
 target_link_libraries(output_webhook PRIVATE
     zmcore
     nlohmann_json::nlohmann_json
-    CURL::libcurl
 )
 
 set_target_properties(output_webhook PROPERTIES
@@ -38,3 +36,6 @@ target_include_directories(test_webhook_util PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 target_link_libraries(test_webhook_util PRIVATE GTest::gtest_main)
 set_target_properties(test_webhook_util PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 add_test(NAME OutputWebhookTest COMMAND $<TARGET_FILE:test_webhook_util>)
+
+# System curl: -lcurl from the pinned macOS SDK, CURL::libcurl elsewhere (cmake/AppleSdk.cmake).
+zm_link_system_curl(output_webhook)

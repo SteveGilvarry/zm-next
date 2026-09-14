@@ -14,8 +14,12 @@ shared libraries communicating through a stable C ABI.
 The project uses CMake and depends on Homebrew packages (FFmpeg ≥ 7.0, onnxruntime, xsimd,
 nlohmann-json, Boost, mosquitto). vcpkg is optional: the build uses it when `VCPKG_ROOT` is set or
 `~/vcpkg` exists (on Linux it supplies an FFmpeg built with VAAPI for the VAAPI backend).
-After an Xcode or Homebrew FFmpeg upgrade, a stale `build/CMakeCache.txt` can pin old SDK or library
-paths; `./build.sh clean` fixes it.
+On macOS, `cmake/AppleSdk.cmake` pins one SDK (from `xcrun --show-sdk-path`) for compiler, linker
+and find modules, re-runs CMake when that SDK is updated or `xcode-select -s` switches it, and clears
+cached paths from any other SDK. Link system curl with `zm_link_system_curl(<target>)`, not
+`find_package(CURL)` (Homebrew pkg-config's libcurl.pc points at the Command Line Tools SDK). After
+changing `DEVELOPER_DIR` in the environment, re-run cmake. A Homebrew FFmpeg major upgrade still needs
+`./build.sh clean`.
 
 ```bash
 ./build.sh            # configure (Debug) + build into build/
