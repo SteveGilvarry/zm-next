@@ -210,6 +210,7 @@ gracefully when FFmpeg isn't on the host. See **[docs/End_To_End_Proof.md](docs/
 | [Plugin_Config_Reference.md](docs/Plugin_Config_Reference.md) | Every plugin's JSON config keys |
 | [AI_Architecture.md](docs/AI_Architecture.md) | The detection/VLM tier and runtime choices |
 | [GPU_Pipeline.md](docs/GPU_Pipeline.md) | Zero-copy decode → motion → inference on CUDA, Apple Metal/ANE, VAAPI/Vulkan; measured gate numbers |
+| [Worker_Control_Protocol.md](docs/Worker_Control_Protocol.md) | Proposal: authenticated worker hello, schema-validated configure, typed status and zm-api-independent worker lifetime |
 | [Motion_Architecture.md](docs/Motion_Architecture.md) | Modular `zones → motion → output` design |
 | [Two_Way_Audio.md](docs/Two_Way_Audio.md) | Talkback to camera speakers |
 | [ONVIF_Integration.md](docs/ONVIF_Integration.md) | Discovery / camera management (a control-plane concern) |
